@@ -429,6 +429,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         self.step = step
         super.init()
     }
+    
+    public var keepTokens: Int { keep }
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
@@ -1054,6 +1056,10 @@ public class ArraysCache: BaseKVCache {
             cache = newValue.map { $0 as MLXArray? }
         }
     }
+    
+    public func setLeftPadding(_ padding: [Int]) {
+        leftPadding = MLXArray(padding)
+    }
 
     /// In-place filter to keep just the given indices in the cache
     public func filter(batchIndices: MLXArray) {
@@ -1099,10 +1105,17 @@ public class CacheList: BaseKVCache {
         self.caches = caches
         super.init()
     }
+    
+    public init(_ caches: [KVCache]) {
+        self.caches = caches
+        super.init()
+    }
 
     public override func innerState() -> [MLXArray] {
         caches.flatMap { $0.innerState() }
     }
+    
+    public var count: Int { caches.count }
 
     public subscript(index: Int) -> KVCache {
         return caches[index]
@@ -1136,6 +1149,40 @@ public class CacheList: BaseKVCache {
             result = cache.trim(n)
         }
         return result
+    }
+    
+    /// Mirror Python: for c in self.caches: c.filter(batch_indices)
+    public func filter(batchIndices: MLXArray) {
+        for cache in caches {
+            if let batchCache = cache as? BatchKVCache {
+                batchCache.filter(batchIndices: batchIndices)
+            } else if let rotatingCache = cache as? BatchRotatingKVCache {
+                rotatingCache.filter(batchIndices: batchIndices)
+            } else if let arraysCache = cache as? ArraysCache {
+                arraysCache.filter(batchIndices: batchIndices)
+            } else if let listCache = cache as? CacheList {
+                listCache.filter(batchIndices: batchIndices)
+            } else {
+                fatalError("\(type(of: cache)) does not support batched filtering")
+            }
+        }
+    }
+
+    /// Mirror Python: for c, o in zip(self.caches, other.caches): c.extend(o)
+    public func extend(other: CacheList) {
+        for (c, o) in zip(caches, other.caches) {
+            if let lhs = c as? BatchKVCache, let rhs = o as? BatchKVCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = c as? BatchRotatingKVCache, let rhs = o as? BatchRotatingKVCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = c as? ArraysCache, let rhs = o as? ArraysCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = c as? CacheList, let rhs = o as? CacheList {
+                lhs.extend(other: rhs)
+            } else {
+                fatalError("\(type(of: c)) does not support batched extension")
+            }
+        }
     }
 }
 
@@ -1492,16 +1539,6 @@ public func quantizedScaledDotProductAttention(
             scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
         } else {
             scores = scores + maskArray
-        }
-
-    case .arrays(let maskArrays):
-        // Handle multiple mask arrays - just use the first one for simplicity
-        if let maskArray = maskArrays.first {
-            if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else {
-                scores = scores + maskArray
-            }
         }
 
     case .none:
