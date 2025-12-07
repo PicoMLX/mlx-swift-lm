@@ -36,6 +36,21 @@ private class DynamicNTKScalingRoPE: Module {
         return MLXFast.RoPE(
             x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
+    
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        // Use max offset for dynamic base calculation (conservative approach)
+        let maxOffset = offset.max().item(Int.self)
+        let seqLen = x.dim(1) + maxOffset
+        var base = originalBase
+        if seqLen > maxPositionEmbeddings {
+            base *= pow(
+                (scale * Float(seqLen) / Float(maxPositionEmbeddings)) - (scale - 1),
+                Float(dims) / Float(dims - 2))
+        }
+        return MLXFast.RoPE(
+            x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+    }
 }
 
 private class Attention: Module {

@@ -93,6 +93,19 @@ private class DynamicNTKScalingRoPE: Module {
             freqs: freqs
         )
     }
+    
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: base,
+            scale: scale,
+            offset: offset,
+            freqs: freqs
+        )
+    }
 }
 
 // MARK: - Attention

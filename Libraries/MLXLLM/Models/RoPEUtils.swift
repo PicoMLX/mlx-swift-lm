@@ -73,6 +73,19 @@ class Llama3RoPE: Module {
             freqs: freqs
         )
     }
+    
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            x,
+            dimensions: dims,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: freqs
+        )
+    }
 }
 
 public class YarnRoPE: Module {
@@ -167,6 +180,25 @@ public class YarnRoPE: Module {
     }
 
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
+        var x = x
+
+        if _mscale != 1.0 {
+            x[.ellipsis, 0 ..< dimensions] = _mscale * x[.ellipsis, 0 ..< dimensions]
+        }
+
+        return MLXFast.RoPE(
+            x,
+            dimensions: dimensions,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: self._freqs
+        )
+    }
+    
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         var x = x
 
         if _mscale != 1.0 {

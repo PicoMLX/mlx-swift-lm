@@ -150,6 +150,19 @@ private class DeepseekV3YarnRotaryEmbedding: Module {
             freqs: self._freqs
         )
     }
+    
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        MLXFast.RoPE(
+            self.mscale != 1.0 ? self.mscale * x : x,
+            dimensions: x.shape.last ?? 0,
+            traditional: true,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: self._freqs
+        )
+    }
 }
 
 private func clippedSilu(_ x: MLXArray) -> MLXArray {
