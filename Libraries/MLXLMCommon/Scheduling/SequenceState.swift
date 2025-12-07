@@ -11,6 +11,9 @@ import MLX
 /// - Prefill progress
 /// - Streaming continuation
 /// - Cancellation/completion status
+///
+/// NOTE: This type is @unchecked Sendable but must only be accessed
+/// from within the InferenceScheduler actor.
 final class SequenceState: @unchecked Sendable {
     
     // MARK: - Identity
@@ -39,6 +42,10 @@ final class SequenceState: @unchecked Sendable {
     
     /// For future prefix cache support
     var inheritedPrefixLength: Int
+    
+    var ropeOffset: Int {
+        inheritedPrefixLength + prefillIndex + generatedTokens.count
+    }
     
     // MARK: - Limits
     
