@@ -125,7 +125,7 @@ public enum SchedulerError: Error, Sendable, Equatable {
     case queueFull
     
     /// Model inference failed
-    case modelFailed(String, underlying: Error?)
+    case modelFailed(String, error: MLXError?)
     
     /// Cache allocation failed
     case cacheAllocationFailed
