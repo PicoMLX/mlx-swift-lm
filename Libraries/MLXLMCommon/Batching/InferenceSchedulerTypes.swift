@@ -125,7 +125,7 @@ public enum SchedulerError: Error, Sendable, Equatable {
     case queueFull
     
     /// Model inference failed
-    case modelFailed(String, error: MLXError?)
+    case modelFailed(String)
     
     /// Cache allocation failed
     case cacheAllocationFailed
@@ -156,9 +156,6 @@ public struct SchedulerConfig: Sendable {
     /// Number of prompt tokens per prefill chunk
     public var prefillStepSize: Int
     
-    /// Number of decode ticks between prefill opportunities (fairness)
-    public var decodeTicksBetweenPrefill: Int
-    
     /// Whether to compute and return log probabilities
     public var returnLogProbs: Bool
     
@@ -170,7 +167,6 @@ public struct SchedulerConfig: Sendable {
         maxQueuedRequests: Int = 64,
         prefillBatchSize: Int = 8,
         prefillStepSize: Int = 2048,
-        decodeTicksBetweenPrefill: Int = 3,
         returnLogProbs: Bool = false,
         shutdownGracePeriod: TimeInterval = 30
     ) {
@@ -178,7 +174,6 @@ public struct SchedulerConfig: Sendable {
         self.maxQueuedRequests = maxQueuedRequests
         self.prefillBatchSize = prefillBatchSize
         self.prefillStepSize = prefillStepSize
-        self.decodeTicksBetweenPrefill = decodeTicksBetweenPrefill
         self.returnLogProbs = returnLogProbs
         self.shutdownGracePeriod = shutdownGracePeriod
     }
@@ -231,6 +226,18 @@ public struct AggregatedStats: Sendable {
     /// Average time per prefill chunk
     public let avgPrefillChunkLatency: TimeInterval
     
+    /// Total time spent on prefill operations
+    public let totalPrefillTime: TimeInterval
+    
+    /// Total tokens prefilled
+    public let prefillTokenCount: Int
+    
+    /// Prefill tokens per second (computed)
+    public var prefillTokensPerSecond: Double {
+        guard totalPrefillTime > 0 else { return 0 }
+        return Double(prefillTokenCount) / totalPrefillTime
+    }
+    
     /// Total requests processed since scheduler start
     public let totalRequestsProcessed: Int
     
@@ -252,6 +259,8 @@ public struct AggregatedStats: Sendable {
         prefillPending: Int = 0,
         avgDecodeTickLatency: TimeInterval = 0,
         avgPrefillChunkLatency: TimeInterval = 0,
+        totalPrefillTime: TimeInterval = 0,
+        prefillTokenCount: Int = 0,
         totalRequestsProcessed: Int = 0,
         outcomeSuccess: Int = 0,
         outcomeCancelled: Int = 0,
@@ -263,6 +272,8 @@ public struct AggregatedStats: Sendable {
         self.prefillPending = prefillPending
         self.avgDecodeTickLatency = avgDecodeTickLatency
         self.avgPrefillChunkLatency = avgPrefillChunkLatency
+        self.totalPrefillTime = totalPrefillTime
+        self.prefillTokenCount = prefillTokenCount
         self.totalRequestsProcessed = totalRequestsProcessed
         self.outcomeSuccess = outcomeSuccess
         self.outcomeCancelled = outcomeCancelled

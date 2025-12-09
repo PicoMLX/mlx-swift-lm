@@ -290,6 +290,24 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     private var promptTime: TimeInterval = 0
     private var generationTokenCount = 0
     private var generationTime: TimeInterval = 0
+    
+    // MARK: - Observability Hooks
+    
+    /// Called once per prefill chunk before processing it.
+    /// `promptCount` is the number of prompts in this chunk.
+    /// `tokenCount` is the total number of tokens across all prompts in this chunk.
+    public var onPrefillStart: (@Sendable (_ promptCount: Int, _ tokenCount: Int) -> Void)?
+    
+    /// Called once per prefill chunk after processing it.
+    /// `elapsed` is wall-clock seconds spent in `processPrompts(chunk)`.
+    /// `tokenCount` is the total number of tokens prefilled in this chunk.
+    public var onPrefillComplete: (@Sendable (_ elapsed: TimeInterval, _ tokenCount: Int) -> Void)?
+    
+    /// Number of prompts waiting to be prefilled.
+    public var pendingPrefillCount: Int { unprocessedPrompts.count }
+    
+    /// Number of sequences currently in the active decode batch.
+    public var activeBatchCount: Int { activeBatch?.count ?? 0 }
 
     public init(
         model: any LanguageModel,
@@ -447,7 +465,19 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
                 tic = now
             }
 
+            // Calculate token count for this chunk
+            let chunkTokenCount = chunk.reduce(0) { $0 + $1.tokens.count }
+            
+            // Prefill callback - notify before starting
+            onPrefillStart?(chunk.count, chunkTokenCount)
+            let prefillStart = Date.timeIntervalSinceReferenceDate
+            
             let newBatch = processPrompts(chunk)
+            
+            // Prefill callback - notify after completion
+            let prefillElapsed = Date.timeIntervalSinceReferenceDate - prefillStart
+            onPrefillComplete?(prefillElapsed, chunkTokenCount)
+            
             unprocessedPrompts.removeFirst(chunk.count)
             promptProcessing = true
 
@@ -556,7 +586,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             promptTime: promptTime,
             generationTokenCount: generationTokenCount,
             generationTime: generationTime,
-            peakMemoryGB: Double(GPU.peakMemory) / 1_000_000_000.0
+            peakMemoryGB: Double(Memory.peakMemory) / 1_000_000_000.0
         )
     }
 
@@ -595,7 +625,7 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
             }
             let length = remaining.dim(1)
             remaining = remaining[0..., nToProcess..<length]
-            GPU.clearCache()
+            Memory.clearCache()
         }
 
         let samplers = prompts.map(\.sampler)
@@ -696,6 +726,14 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         }
     }
 }
+
+// MARK: - Sendable Conformance
+
+/// BatchTokenIterator is marked @unchecked Sendable because:
+/// - It holds non-Sendable types (model, caches)
+/// - But we guarantee it's only mutated within DeviceEngine.runForward calls
+/// - DeviceEngine serializes all access globally, preventing concurrent mutation
+extension BatchTokenIterator: @unchecked Sendable {}
 
 /// High-level API mirroring the Python `batch_generate` helper.
 @discardableResult
