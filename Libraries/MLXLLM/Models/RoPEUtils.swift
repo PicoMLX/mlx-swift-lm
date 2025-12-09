@@ -270,6 +270,41 @@ func initializeRope(
             mscale: mscale,
             mscaleAllDim: mscaleAllDim
         )
+    } else if ropeType == "longrope" {
+        guard let config = scalingConfig else {
+            fatalError("longrope requires scaling_config")
+        }
+        guard let origMax = config["original_max_position_embeddings"]?.asInt() else {
+            fatalError("longrope requires original_max_position_embeddings")
+        }
+        guard let shortFactor = config["short_factor"]?.asFloats() else {
+            fatalError("longrope requires short_factor")
+        }
+        guard let longFactor = config["long_factor"]?.asFloats() else {
+            fatalError("longrope requires long_factor")
+        }
+
+        return SuScaledRoPE(
+            dimensions: dims,
+            base: base,
+            maxPositionEmbeddings: maxPositionEmbeddings ?? 131072,
+            originalMaxPositionEmbeddings: origMax,
+            shortFactor: shortFactor,
+            longFactor: longFactor
+        )
+    } else if ropeType == "mrope" {
+        // MRoPE returns basic RoPE here. The actual multi-modal rotary embedding logic
+        // (applying different embeddings per modality) is handled in the attention layer
+        // of multimodal models like Qwen2VL, not in the RoPE module itself.
+        if let config = scalingConfig,
+            let mropeSection = config["mrope_section"]?.asInts()
+        {
+            precondition(
+                mropeSection.count == 3,
+                "MRoPE currently only supports 3 sections, got \(mropeSection.count)"
+            )
+        }
+        return RoPE(dimensions: dims, traditional: traditional, base: base, scale: 1.0)
     } else {
         fatalError("Unsupported RoPE type: \(ropeType)")
     }

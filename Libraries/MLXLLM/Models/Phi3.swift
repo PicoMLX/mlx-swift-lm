@@ -20,14 +20,14 @@ private class Attention: Module {
 
     enum PositionalEncoding {
         case rope(RoPE)
-        case suScaledRotaryEmbedding(SuScaledRotaryEmbedding)
+        case suScaledRoPE(SuScaledRoPE)
 
         func applyEncoding(_ x: MLXArray, offset: Int = 0) -> MLXArray {
             switch self {
             case .rope(let rope):
                 return rope.callAsFunction(x, offset: offset)
-            case .suScaledRotaryEmbedding(let suScaledRotaryEmbedding):
-                return suScaledRotaryEmbedding.callAsFunction(x, offset: offset)
+            case .suScaledRoPE(let suScaledRoPE):
+                return suScaledRoPE(x, offset: offset)
             }
         }
     }
@@ -62,11 +62,12 @@ private class Attention: Module {
             ropeScaling.type == "su" || ropeScaling.type == "longrope",
             let shortFactor = ropeScaling.shortFactor, let longFactor = ropeScaling.longFactor
         {
-            self.rope = .suScaledRotaryEmbedding(
-                SuScaledRotaryEmbedding(
+            self.rope = .suScaledRoPE(
+                SuScaledRoPE(
                     dimensions: ropeDim, base: args.ropeTheta,
                     maxPositionEmbeddings: args.maxPositionEmbeddings,
                     originalMaxPositionEmbeddings: args.originalMaxPositionEmbeddings,
+                    shortFactor: shortFactor,
                     longFactor: longFactor))
 
         } else {

@@ -48,7 +48,7 @@ private class Attention: Module {
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
-    let rope: SuScaledRotaryEmbedding
+    let rope: SuScaledRoPE
 
     init(_ args: PhiMoEConfiguration) {
         self.args = args
@@ -65,13 +65,15 @@ private class Attention: Module {
         self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
         self._wo.wrappedValue = Linear(heads * headDim, dim, bias: true)
 
-        self.rope = SuScaledRotaryEmbedding(
+        self.rope = SuScaledRoPE(
             dimensions: headDim,
             base: args.ropeTheta,
             maxPositionEmbeddings: args.maxPositionEmbeddings,
             originalMaxPositionEmbeddings: args.originalMaxPositionEmbeddings,
-            longFactor: args.ropeScaling?.longFactor as? [Float] ?? [1.0],
-            longMScale: args.ropeScaling?.longMScale as? Float
+            shortFactor: args.ropeScaling?.shortFactor ?? [1.0],
+            longFactor: args.ropeScaling?.longFactor ?? [1.0],
+            shortMScale: args.ropeScaling?.shortMScale,
+            longMScale: args.ropeScaling?.longMScale
         )
     }
 

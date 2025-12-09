@@ -69,6 +69,7 @@ public class LLMTypeRegistry: ModelTypeRegistry, @unchecked Sendable {
             "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
+            "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         ]
     }
 }
