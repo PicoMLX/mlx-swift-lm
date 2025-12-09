@@ -291,8 +291,8 @@ private class DeepseekV3Attention: Module {
 
         var keys: MLXArray
         if let cache = cache {
-            qPe = self.rope(qPe, offset: cache.offset)
-            kPe = self.rope(kPe, offset: cache.offset)
+            qPe = self.rope(qPe, offset: ropeOffset(cache))
+            kPe = self.rope(kPe, offset: ropeOffset(cache))
             kPe = repeated(kPe, count: numHeads, axis: 1)
             (keys, values) = cache.update(
                 keys: concatenated([kNope, kPe], axis: -1), values: values)

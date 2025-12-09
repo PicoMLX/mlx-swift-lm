@@ -206,8 +206,8 @@ private class Attention: Module {
 
         // Apply rotary position embedding
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: ropeOffset(cache))
+            keys = rope(keys, offset: ropeOffset(cache))
         } else {
             queries = rope(queries)
             keys = rope(keys)

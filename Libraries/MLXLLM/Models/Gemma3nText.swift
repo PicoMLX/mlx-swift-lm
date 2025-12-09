@@ -223,13 +223,6 @@ private class Gemma3nAttention: Module {
         queries = queries.reshaped(B, L, -1, headDim)
         queries = qNorm(queries)
 
-        let offset =
-            if isKvSharedLayer && cache != nil {
-                cache!.offset
-            } else {
-                cache?.offset ?? 0
-            }
-
         var keys: MLXArray
         var values: MLXArray
 
@@ -242,7 +235,7 @@ private class Gemma3nAttention: Module {
                 keys = kProj(x).reshaped(B, L, -1, headDim)
                 keys = kNorm(keys)
                 keys = keys.transposed(0, 2, 1, 3)
-                keys = rope(keys, offset: offset)
+                keys = rope(keys, offset: ropeOffset(cache))
 
                 values = vProj(x).reshaped(B, L, -1, headDim)
                 values = vNorm(values)
@@ -256,7 +249,7 @@ private class Gemma3nAttention: Module {
             keys = kProj(x).reshaped(B, L, -1, headDim)
             keys = kNorm(keys)
             keys = keys.transposed(0, 2, 1, 3)
-            keys = rope(keys, offset: offset)
+            keys = rope(keys, offset: ropeOffset(cache))
 
             values = vProj(x).reshaped(B, L, -1, headDim)
             values = vNorm(values)
@@ -268,7 +261,7 @@ private class Gemma3nAttention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = rope(queries, offset: offset)
+        queries = rope(queries, offset: ropeOffset(cache))
 
         var adjustedMask = mask
         if case .array(let maskArray) = mask {

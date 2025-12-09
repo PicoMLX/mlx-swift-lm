@@ -210,8 +210,8 @@ private class Attention: Module {
         // Apply RoPE only for local (sliding window) attention
         if isLocalAttention, let rope = rope {
             if let cache = cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
+                queries = rope(queries, offset: ropeOffset(cache))
+                keys = rope(keys, offset: ropeOffset(cache))
             } else {
                 queries = rope(queries)
                 keys = rope(keys)

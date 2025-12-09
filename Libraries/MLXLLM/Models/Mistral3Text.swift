@@ -89,6 +89,19 @@ private class Attention: Module {
         return x
     }
 
+    private func applyRoPE(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        if let ropeModule = rope as? RoPE {
+            return ropeModule(x, offset: offset)
+        } else if let llama3Rope = rope as? Llama3RoPE {
+            return llama3Rope(x, offset: offset)
+        } else if let yarnRope = rope as? YarnRoPE {
+            return yarnRope(x, offset: offset)
+        } else if let suScaledRope = rope as? SuScaledRoPE {
+            return suScaledRope(x, offset: offset)
+        }
+        return x
+    }
+
     func callAsFunction(
         _ x: MLXArray, attnScale: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
@@ -105,9 +118,13 @@ private class Attention: Module {
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
         // Apply RoPE
-        let offset = cache?.offset ?? 0
-        queries = applyRoPE(queries, offset: offset)
-        keys = applyRoPE(keys, offset: offset)
+        if let cache {
+            queries = applyRoPE(queries, offset: ropeOffset(cache))
+            keys = applyRoPE(keys, offset: ropeOffset(cache))
+        } else {
+            queries = applyRoPE(queries, offset: 0)
+            keys = applyRoPE(keys, offset: 0)
+        }
 
         // Apply attention scaling
         queries = queries * attnScale

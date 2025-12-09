@@ -201,6 +201,12 @@ private class Attention: Module {
         return x
     }
 
+    func applyRoPE(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        if let ropeYarn { return ropeYarn(x, offset: offset) }
+        if let ropeDynamic { return ropeDynamic(x, offset: offset) }
+        return x
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -215,8 +221,8 @@ private class Attention: Module {
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = applyRoPE(queries, offset: cache.offset)
-            keys = applyRoPE(keys, offset: cache.offset)
+            queries = applyRoPE(queries, offset: ropeOffset(cache))
+            keys = applyRoPE(keys, offset: ropeOffset(cache))
         } else {
             queries = applyRoPE(queries, offset: nil)
             keys = applyRoPE(keys, offset: nil)

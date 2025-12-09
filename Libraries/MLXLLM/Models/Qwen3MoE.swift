@@ -77,8 +77,8 @@ private class Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = rope(queries, offset: ropeOffset(cache))
+            keys = rope(keys, offset: ropeOffset(cache))
         } else {
             queries = rope(queries)
             keys = rope(keys)

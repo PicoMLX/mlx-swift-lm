@@ -55,7 +55,37 @@ public class SuScaledRoPE: Module {
         }
 
         // Apply scaling only to the dimensions that will be rotated
-        var scaledX = x
+        let scaledX = x
+        scaledX[.ellipsis, 0 ..< dimensions] = scale * scaledX[.ellipsis, 0 ..< dimensions]
+
+        return MLXFast.RoPE(
+            scaledX,
+            dimensions: dimensions,
+            traditional: false,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: freqs
+        )
+    }
+
+    /// Evaluate with array offset for batched inference with different positions per sequence.
+    public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        // Use max offset for deciding long vs short freqs (conservative approach)
+        let maxOffset = offset.max().item(Int.self)
+        let seqLen = maxOffset + x.dim(-2)
+        let freqs: MLXArray
+        let scale: Float
+        if seqLen > originalMaxPositionEmbeddings {
+            freqs = _longFreqs
+            scale = _longScale
+        } else {
+            freqs = _shortFreqs
+            scale = _shortScale
+        }
+
+        // Apply scaling only to the dimensions that will be rotated
+        let scaledX = x
         scaledX[.ellipsis, 0 ..< dimensions] = scale * scaledX[.ellipsis, 0 ..< dimensions]
 
         return MLXFast.RoPE(

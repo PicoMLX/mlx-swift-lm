@@ -125,9 +125,7 @@ public actor InferenceScheduler {
     /// The stream completes with `.done` or `.error` when generation finishes.
     public func enqueue(_ request: InferenceRequest) -> AsyncStream<TokenEvent> {
         AsyncStream { continuation in
-            Task {
-                await self.handleEnqueue(request, continuation: continuation)
-            }
+            self.handleEnqueue(request, continuation: continuation)
         }
     }
     

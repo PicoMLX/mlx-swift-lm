@@ -115,6 +115,25 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// Returns the RoPE offset as an MLXArray for batch-compatible inference.
+///
+/// For batch caches (BatchKVCache, BatchRotatingKVCache), returns per-sequence offsets.
+/// For regular caches, returns a single-element array with the cache offset.
+/// This allows models to use the same RoPE call signature for both batched and non-batched inference.
+///
+/// - Parameter cache: The KV cache (can be nil)
+/// - Returns: MLXArray of RoPE position offsets
+public func ropeOffset(_ cache: KVCache?) -> MLXArray {
+    switch cache {
+    case let batch as BatchKVCache:
+        return batch.offsets
+    case let batch as BatchRotatingKVCache:
+        return batch.offsets
+    default:
+        return MLXArray([Int32(cache?.offset ?? 0)])
+    }
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0

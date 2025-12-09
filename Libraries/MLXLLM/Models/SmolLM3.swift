@@ -78,7 +78,10 @@ private class Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let cache {
+        if let cache, let ropeModule = rope as? RoPE {
+            queries = ropeModule(queries, offset: ropeOffset(cache))
+            keys = ropeModule(keys, offset: ropeOffset(cache))
+        } else if let cache {
             queries = rope(queries, offset: cache.offset)
             keys = rope(keys, offset: cache.offset)
         } else {

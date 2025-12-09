@@ -293,8 +293,8 @@ private class AttentionBlock: Module {
                 k = concatenated([zeros, k], axis: 2)
                 v = concatenated([zeros, v], axis: 2)
             } else {
-                q = rope(q, offset: qcache.offset - 1)
-                k = rope(k, offset: qcache.offset - 1)
+                q = rope(q, offset: ropeOffset(qcache) - 1)
+                k = rope(k, offset: ropeOffset(qcache) - 1)
             }
 
             let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
@@ -323,8 +323,8 @@ private class AttentionBlock: Module {
                 (k, v) = cache.update(keys: k, values: v)
             }
         } else {
-            q = rope(q, offset: cache!.offset - 1)
-            k = rope(k, offset: cache!.offset - 1)
+            q = rope(q, offset: ropeOffset(cache) - 1)
+            k = rope(k, offset: ropeOffset(cache) - 1)
             (k, v) = cache!.update(keys: k, values: v)
         }
 
