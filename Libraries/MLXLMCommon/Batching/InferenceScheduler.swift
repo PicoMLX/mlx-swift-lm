@@ -35,21 +35,21 @@ private final class PrefillStatsAccumulator: @unchecked Sendable {
 /// Each `InferenceScheduler` is bound to a single model and manages:
 /// - Request queuing and admission
 /// - Prefill/decode scheduling with fairness
-/// - Per-request streaming via `AsyncStream<TokenEvent>`
+/// - Per-request streaming via `AsyncStream<Generation>`
 /// - Graceful shutdown and cancellation
 ///
 /// Usage:
 /// ```swift
 /// let scheduler = InferenceScheduler(model: model, tokenizer: tokenizer)
-/// let stream = await scheduler.enqueue(request)
+/// let stream = try await scheduler.enqueue(request)
 /// for await event in stream {
 ///     switch event {
-///     case .token(let token, let delta, _):
-///         print(delta ?? "")
-///     case .done(let reason):
-///         print("Finished: \(reason)")
-///     case .error(let error):
-///         print("Error: \(error)")
+///     case .chunk(let text):
+///         print(text, terminator: "")
+///     case .info(let info):
+///         print("\nFinished: \(info.finishReason ?? .stop)")
+///     case .toolCall(let toolCall):
+///         print("Tool call: \(toolCall)")
 ///     }
 /// }
 /// ```
@@ -63,7 +63,7 @@ public actor InferenceScheduler {
     
     // MARK: - State
     
-    private var queuedRequests: [(InferenceRequest, AsyncStream<TokenEvent>.Continuation)] = []
+    private var queuedRequests: [(InferenceRequest, AsyncStream<Generation>.Continuation)] = []
     private var activeSequences: [UUID: SequenceState] = [:]
     private var isShuttingDown = false
     private var loopTask: Task<Void, Never>?
@@ -121,10 +121,23 @@ public actor InferenceScheduler {
     
     /// Enqueue a request for processing.
     ///
-    /// Returns an `AsyncStream` that yields `TokenEvent`s as tokens are generated.
-    /// The stream completes with `.done` or `.error` when generation finishes.
-    public func enqueue(_ request: InferenceRequest) -> AsyncStream<TokenEvent> {
-        AsyncStream { continuation in
+    /// Returns an `AsyncStream` that yields `Generation` events as tokens are generated.
+    /// The stream completes with `.info` when generation finishes.
+    ///
+    /// - Throws: `SchedulerError.shutdownInProgress` if the scheduler is shutting down.
+    /// - Throws: `SchedulerError.queueFull` if the request queue is at capacity.
+    public func enqueue(_ request: InferenceRequest) throws -> AsyncStream<Generation> {
+        // Reject if shutting down
+        guard !isShuttingDown else {
+            throw SchedulerError.shutdownInProgress
+        }
+        
+        // Reject if queue full
+        guard queuedRequests.count < config.maxQueuedRequests else {
+            throw SchedulerError.queueFull
+        }
+        
+        return AsyncStream { continuation in
             self.handleEnqueue(request, continuation: continuation)
         }
     }
@@ -166,9 +179,8 @@ public actor InferenceScheduler {
     public func shutdown() async {
         isShuttingDown = true
         
-        // Reject all queued requests
+        // Reject all queued requests (finish streams without yielding - error was thrown at enqueue)
         for (_, continuation) in queuedRequests {
-            continuation.yield(.error(.shutdownInProgress))
             continuation.finish()
         }
         queuedRequests.removeAll()
@@ -200,21 +212,9 @@ public actor InferenceScheduler {
     
     private func handleEnqueue(
         _ request: InferenceRequest,
-        continuation: AsyncStream<TokenEvent>.Continuation
+        continuation: AsyncStream<Generation>.Continuation
     ) {
-        // Reject if shutting down
-        guard !isShuttingDown else {
-            continuation.yield(.error(.shutdownInProgress))
-            continuation.finish()
-            return
-        }
-        
-        // Reject if queue full
-        guard queuedRequests.count < config.maxQueuedRequests else {
-            continuation.yield(.error(.queueFull))
-            continuation.finish()
-            return
-        }
+        // Note: shutdownInProgress and queueFull checks are done in enqueue() which throws
         
         // Set up cancellation handler
         continuation.onTermination = { @Sendable [weak self] _ in
@@ -395,11 +395,11 @@ public actor InferenceScheduler {
             // Record token
             seq.addGeneratedToken(response.token)
             
-            // Decode text
-            let textDelta = tokenizer.decode(tokens: [response.token])
-            
-            // Emit token event
-            seq.emitToken(response.token, textDelta: textDelta, logProbs: response.logProbs)
+            // Decode and emit text chunk
+            let text = tokenizer.decode(tokens: [response.token])
+            if !text.isEmpty {
+                seq.emitChunk(text)
+            }
             
             // Handle finish
             if let finishReason = response.finishReason {

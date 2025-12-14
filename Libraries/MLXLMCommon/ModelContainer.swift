@@ -34,9 +34,21 @@ import Tokenizers
 public actor ModelContainer {
     var context: ModelContext
     public var configuration: ModelConfiguration { context.configuration }
-
-    public init(context: ModelContext) {
+    /// Optional batched inference scheduler for this model.
+    public var scheduler: InferenceScheduler?
+    
+    public init(context: ModelContext, schedulerConfig: SchedulerConfig? = nil) {
         self.context = context
+        
+        if let schedulerConfig {
+            self.scheduler = InferenceScheduler(
+                model: context.model,
+                tokenizer: context.tokenizer,
+                config: schedulerConfig
+            )
+        } else {
+            self.scheduler = nil
+        }
     }
 
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
@@ -78,5 +90,71 @@ public actor ModelContainer {
     /// - Parameter action: update action
     public func update(_ action: @Sendable (inout ModelContext) -> Void) {
         action(&context)
+    }
+}
+
+extension ModelContainer {
+    public struct ChatGenerationRequest {
+        public let prompt: String
+        public let maxTokens: Int
+        public let temperature: Float
+        public let topP: Float
+        public let topK: Int
+        public let stopSequences: [String]?
+        public let timeout: TimeInterval?
+
+        public init(
+            prompt: String,
+            maxTokens: Int = 256,
+            temperature: Float = 0.7,
+            topP: Float = 0.9,
+            topK: Int = 40,
+            stopSequences: [String]? = nil,
+            timeout: TimeInterval? = nil
+        ) {
+            self.prompt = prompt
+            self.maxTokens = maxTokens
+            self.temperature = temperature
+            self.topP = topP
+            self.topK = topK
+            self.stopSequences = stopSequences
+            self.timeout = timeout
+        }
+    }
+
+    /// Convenience batched generation API using the optional scheduler.
+    /// If `scheduler` is nil, this will `fatalError` or you can choose to fall back
+    /// to the non-batched path.
+    public func generateStream(
+        _ request: ChatGenerationRequest
+    ) async throws -> AsyncStream<Generation> {
+        guard let scheduler else {
+            fatalError("ModelContainer.scheduler is not configured")
+        }
+
+        // Tokenization happens under ModelContainer actor isolation.
+        let tokens = try await perform { context in
+            try context.tokenizer.encode(text: request.prompt)
+        }
+
+        let params = GenerateParameters(
+            temperature: request.temperature,
+            topP: request.topP
+        )
+
+        let now = Date()
+        let deadline = request.timeout.map { now.addingTimeInterval($0) }
+
+        let inferenceReq = InferenceRequest(
+            id: UUID(),
+            tokens: tokens,
+            params: params,
+            maxTokens: request.maxTokens,
+            stopTokens: nil,   // or map stopSequences → IDs if you want
+            deadline: deadline,
+            createdAt: now
+        )
+
+        return try await scheduler.enqueue(inferenceReq)
     }
 }

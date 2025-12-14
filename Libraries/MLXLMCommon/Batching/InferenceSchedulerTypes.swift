@@ -1,7 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
-import MLX
 
 // MARK: - Requests
 
@@ -80,38 +79,6 @@ public struct InferenceRequest: Sendable, Identifiable {
         self.deadline = deadline
         self.createdAt = createdAt
     }
-}
-
-// MARK: - Events
-
-/// Events emitted by the scheduler for each token generated.
-public enum TokenEvent: Sendable {
-    /// A token was generated
-    case token(Int, textDelta: String?, logProbs: MLXArray?)
-    
-    /// Generation completed
-    case done(finishReason: FinishReason)
-    
-    /// An error occurred
-    case error(SchedulerError)
-}
-
-/// Reason why generation finished.
-public enum FinishReason: String, Sendable, Equatable {
-    /// Hit a stop token (EOS or custom)
-    case stop
-    
-    /// Hit maxTokens limit
-    case length
-    
-    /// Request was cancelled by client
-    case cancelled
-    
-    /// Request exceeded its deadline
-    case timeout
-    
-    /// An error occurred during generation
-    case error
 }
 
 // MARK: - Errors

@@ -877,6 +877,24 @@ public func generate(
     }
 }
 
+/// Reason why generation finished.
+public enum FinishReason: String, Sendable, Equatable {
+    /// Hit a stop token (EOS or custom)
+    case stop
+    
+    /// Hit maxTokens limit
+    case length
+    
+    /// Request was cancelled by client
+    case cancelled
+    
+    /// Request exceeded its deadline
+    case timeout
+    
+    /// An error occurred during generation
+    case error
+}
+
 /// Represents metadata and statistics related to token generation.
 ///
 /// Provides information about the number of tokens processed during both the prompt and generation phases, as well as the time taken for each phase.
@@ -893,6 +911,9 @@ public struct GenerateCompletionInfo: Sendable {
     /// The time interval (in seconds) taken to generate the output tokens.
     public let generateTime: TimeInterval
 
+    /// The reason generation finished (optional for backward compatibility).
+    public let finishReason: FinishReason?
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -907,12 +928,14 @@ public struct GenerateCompletionInfo: Sendable {
         promptTokenCount: Int,
         generationTokenCount: Int,
         promptTime: TimeInterval,
-        generationTime: TimeInterval
+        generationTime: TimeInterval,
+        finishReason: FinishReason? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
+        self.finishReason = finishReason
     }
 
     public func summary() -> String {

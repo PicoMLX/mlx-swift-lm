@@ -64,10 +64,21 @@ final class SequenceState: @unchecked Sendable {
     /// When this request was created
     let createdAt: Date
     
+    // MARK: - Timing
+    
+    /// When prefill started
+    var prefillStartTime: Date?
+    
+    /// Time spent in prefill phase
+    var prefillTime: TimeInterval = 0
+    
+    /// When decode started (after prefill completes)
+    var decodeStartTime: Date?
+    
     // MARK: - Streaming
     
-    /// Continuation to yield TokenEvents back to the client
-    let continuation: AsyncStream<TokenEvent>.Continuation
+    /// Continuation to yield Generation events back to the client
+    let continuation: AsyncStream<Generation>.Continuation
     
     // MARK: - Status
     
@@ -111,7 +122,7 @@ final class SequenceState: @unchecked Sendable {
         params: GenerateParameters,
         deadline: Date?,
         createdAt: Date,
-        continuation: AsyncStream<TokenEvent>.Continuation
+        continuation: AsyncStream<Generation>.Continuation
     ) {
         self.id = id
         self.inputTokens = inputTokens
@@ -149,7 +160,8 @@ final class SequenceState: @unchecked Sendable {
         guard !isFinished else { return }
         isCancelled = true
         isFinished = true
-        continuation.yield(.done(finishReason: .cancelled))
+        let info = buildCompletionInfo(finishReason: .cancelled)
+        continuation.yield(.info(info))
         continuation.finish()
     }
     
@@ -157,7 +169,8 @@ final class SequenceState: @unchecked Sendable {
     func timeout() {
         guard !isFinished else { return }
         isFinished = true
-        continuation.yield(.done(finishReason: .timeout))
+        let info = buildCompletionInfo(finishReason: .timeout)
+        continuation.yield(.info(info))
         continuation.finish()
     }
     
@@ -165,20 +178,40 @@ final class SequenceState: @unchecked Sendable {
     func complete(reason: FinishReason) {
         guard !isFinished else { return }
         isFinished = true
-        continuation.yield(.done(finishReason: reason))
+        let info = buildCompletionInfo(finishReason: reason)
+        continuation.yield(.info(info))
         continuation.finish()
     }
     
-    /// Emit an error and finish the stream
+    /// Emit an error and finish the stream (Generation doesn't have an error case)
     func fail(error: SchedulerError) {
         guard !isFinished else { return }
         isFinished = true
-        continuation.yield(.error(error))
+        let info = buildCompletionInfo(finishReason: .error)
+        continuation.yield(.info(info))
         continuation.finish()
     }
     
-    /// Emit a token event
-    func emitToken(_ token: Int, textDelta: String?, logProbs: MLXArray?) {
-        continuation.yield(.token(token, textDelta: textDelta, logProbs: logProbs))
+    /// Emit a text chunk
+    func emitChunk(_ text: String) {
+        continuation.yield(.chunk(text))
+    }
+    
+    /// Build completion info with timing stats
+    private func buildCompletionInfo(finishReason: FinishReason) -> GenerateCompletionInfo {
+        let generateTime: TimeInterval
+        if let decodeStart = decodeStartTime {
+            generateTime = Date.timeIntervalSinceReferenceDate - decodeStart.timeIntervalSinceReferenceDate
+        } else {
+            generateTime = 0
+        }
+        
+        return GenerateCompletionInfo(
+            promptTokenCount: inputTokens.count,
+            generationTokenCount: generatedTokens.count,
+            promptTime: prefillTime,
+            generationTime: generateTime,
+            finishReason: finishReason
+        )
     }
 }
