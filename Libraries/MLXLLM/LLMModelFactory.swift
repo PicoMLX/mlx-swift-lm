@@ -47,6 +47,7 @@ public enum LLMTypeRegistry {
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
+        "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
         "acereason": create(Qwen2Configuration.self, Qwen2Model.init),
         "falcon_h1": create(FalconH1Configuration.self, FalconH1Model.init),
         "bitnet": create(BitnetConfiguration.self, BitnetModel.init),
