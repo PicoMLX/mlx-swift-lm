@@ -94,7 +94,7 @@ public protocol ModelFactory: Sendable {
     ) async throws -> sending ModelContext
 
     func _loadContainer(
-        hub: HubApi, configuration: ModelConfiguration,
+        hub: HubApi, configuration: ModelConfiguration, schedulerConfig: SchedulerConfig?,
         progressHandler: @Sendable @escaping (Progress) -> Void
     ) async throws -> ModelContainer
 
@@ -146,20 +146,20 @@ extension ModelFactory {
 
     /// Load a model identified by a ``ModelConfiguration`` and produce a ``ModelContainer``.
     public func loadContainer(
-        hub: HubApi = defaultHubApi, configuration: ModelConfiguration,
+        hub: HubApi = defaultHubApi, configuration: ModelConfiguration, schedulerConfig: SchedulerConfig? = nil,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> ModelContainer {
         try await _loadContainer(
-            hub: hub, configuration: configuration, progressHandler: progressHandler)
+            hub: hub, configuration: configuration, schedulerConfig: schedulerConfig, progressHandler: progressHandler)
     }
 
     public func _loadContainer(
-        hub: HubApi = defaultHubApi, configuration: ModelConfiguration,
+        hub: HubApi = defaultHubApi, configuration: ModelConfiguration, schedulerConfig: SchedulerConfig? = nil,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> ModelContainer {
         let context = try await _load(
             hub: hub, configuration: configuration, progressHandler: progressHandler)
-        return ModelContainer(context: context)
+        return ModelContainer(context: context, schedulerConfig: schedulerConfig)
     }
 
 }

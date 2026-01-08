@@ -703,6 +703,7 @@ public func generate(
 ) -> GenerateCompletionInfo {
     var start = Date.timeIntervalSinceReferenceDate
     var promptTime: TimeInterval = 0
+    let iteratorMaxTokens = iterator.maxTokens
 
     let additionalEOSTokenIds = Set(
         (context.configuration.extraEOSTokens ?? [])
@@ -711,6 +712,7 @@ public func generate(
             })
 
     var tokenCount = 0
+    var finishReason: FinishReason?
 
     for token in iterator {
         // Compute the timing for the prompt
@@ -724,6 +726,7 @@ public func generate(
         if token == context.tokenizer.unknownTokenId || token == context.tokenizer.eosTokenId
             || additionalEOSTokenIds.contains(token)
         {
+            finishReason = .stop
             break
         }
 
@@ -731,6 +734,7 @@ public func generate(
 
         // Invoke the callback with the current token
         if didGenerate(token) == .stop {
+            finishReason = .stop
             break
         }
     }
@@ -741,11 +745,18 @@ public func generate(
     // Synchronize with the stream to ensure tasks are completed
     Stream().synchronize()
 
+    if finishReason == nil, let iteratorMaxTokens,
+        tokenCount >= iteratorMaxTokens
+    {
+        finishReason = .length
+    }
+
     return GenerateCompletionInfo(
         promptTokenCount: input.text.tokens.size,
         generationTokenCount: tokenCount,
         promptTime: promptTime + iterator.promptPrefillTime,
-        generationTime: generateTime
+        generationTime: generateTime,
+        finishReason: finishReason
     )
 }
 
@@ -801,7 +812,9 @@ public func generate(
     iterator: TokenIterator
 ) -> AsyncStream<Generation> {
 
-    AsyncStream { continuation in
+    let iteratorMaxTokens = iterator.maxTokens
+
+    return AsyncStream { continuation in
 
         // Launch a Task to perform iteration asynchronously.
         let task = Task {
@@ -817,11 +830,15 @@ public func generate(
             var tokenCount = 0
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
             let toolCallProcessor = ToolCallProcessor()
+            var finishReason: FinishReason?
 
             for token in iterator {
 
                 // Check for cancellation on every loop iteration.
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    finishReason = .cancelled
+                    break
+                }
 
                 if promptTime == 0 {
                     let now = Date.timeIntervalSinceReferenceDate
@@ -833,6 +850,7 @@ public func generate(
                     || token == context.tokenizer.eosTokenId
                     || additionalEOSTokenIds.contains(token)
                 {
+                    finishReason = .stop
                     break
                 }
 
@@ -842,7 +860,7 @@ public func generate(
 
                     // Process chunk through the tool call processor
                     if let textToYield = toolCallProcessor.processChunk(chunk) {
-                        continuation.yield(.chunk(textToYield))
+                        continuation.yield(Generation.chunk(textToYield))
                     }
 
                     // Check if we have a complete tool call
@@ -855,11 +873,18 @@ public func generate(
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
 
+            if finishReason == nil, let iteratorMaxTokens,
+                tokenCount >= iteratorMaxTokens
+            {
+                finishReason = .length
+            }
+
             let info = GenerateCompletionInfo(
                 promptTokenCount: input.text.tokens.size,
                 generationTokenCount: tokenCount,
                 promptTime: promptTime + iterator.promptPrefillTime,
-                generationTime: generateTime
+                generationTime: generateTime,
+                finishReason: finishReason
             )
             continuation.yield(.info(info))
 
