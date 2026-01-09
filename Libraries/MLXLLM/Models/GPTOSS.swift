@@ -93,10 +93,10 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
     return outGlu * (xLinear + 1)
 }
 
-private func compileSwiglu() -> @Sendable (MLXArray, MLXArray) -> MLXArray {
-    compile(shapeless: true) { xLinear, xGlu in
-        swiglu(xLinear, xGlu)
-    }
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { xLinear, xGlu in
+    swiglu(xLinear, xGlu)
 }
 
 class SwiGLUSwitchGLU: Module {
@@ -131,7 +131,7 @@ class SwiGLUSwitchGLU: Module {
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
-        let doSort = indices.size > 64
+        let doSort = indices.size >= 64
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -143,7 +143,7 @@ class SwiGLUSwitchGLU: Module {
         let xUp = upProj(x, idx, sortedIndices: doSort)
         let xGate = gateProj(x, idx, sortedIndices: doSort)
         x = downProj(
-            compileSwiglu()(xUp, xGate),
+            compiledSwiglu(xUp, xGate),
             idx,
             sortedIndices: doSort)
 
@@ -169,8 +169,6 @@ class AttentionBlock: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     let rope: YarnRoPE
-
-    private var _previousMask: MLXArray?
 
     public init(_ config: GPTOSSConfiguration) {
         self.headDim = config.headDim
@@ -206,78 +204,13 @@ class AttentionBlock: Module {
         }
     }
 
-    func getCausalMask(_ x: MLXArray, cache: KVCache?) -> MLXArray {
-        let L = x.dim(1)
-        var offset = cache?.offset ?? 0
-        offset = max(1, offset)
-
-        func makeMask(_ L: Int, _ offset: Int) -> MLXArray {
-            let zero = MLXArray(0, dtype: x.dtype)
-            let neginf = MLXArray(-Float.infinity, dtype: x.dtype)
-            var mask = MLX.where(createCausalMask(n: L, offset: offset - 1), zero, neginf)
-            mask = mask.reshaped(1, 1, L, -1)
-            mask = tiled(mask, repetitions: [1, numAttentionHeads, 1, 1])
-            let sinks = tiled(sinks.reshaped(1, -1, 1, 1), repetitions: [1, 1, L, 1])
-            mask = concatenated([sinks, mask], axis: -1)
-            return mask
-        }
-
-        if L > 8 {
-            _previousMask = nil
-            return makeMask(L, offset)
-        }
-
-        let length = ((L + offset + 511) / 512) * 512
-        if _previousMask == nil || _previousMask!.dim(-1) < length
-            || _previousMask!.dim(-2) != L
-        {
-            _previousMask = makeMask(L, length - L)
-        }
-
-        return _previousMask![.ellipsis, 0 ..< L + offset]
-    }
-
-    func getSlidingWindowMask(_ x: MLXArray, cache: KVCache?, windowSize: Int) -> MLXArray {
-        let L = x.dim(1)
-        var offset = cache?.offset ?? 0
-        offset = max(1, offset)
-
-        func makeMask(_ L: Int, _ offset: Int) -> MLXArray {
-            let zero = MLXArray(0, dtype: x.dtype)
-            let neginf = MLXArray(-Float.infinity, dtype: x.dtype)
-            var mask = createCausalMask(n: L, offset: offset - 1, windowSize: windowSize)
-            mask = MLX.where(mask, zero, neginf)
-            mask = mask.reshaped(1, 1, L, -1)
-            mask = tiled(mask, repetitions: [1, numAttentionHeads, 1, 1])
-            let sinks = tiled(sinks.reshaped(1, -1, 1, 1), repetitions: [1, 1, L, 1])
-            mask = concatenated([sinks, mask], axis: -1)
-            return mask
-        }
-
-        if L > 1 {
-            _previousMask = nil
-            return makeMask(L, min(windowSize, offset))
-        }
-
-        if _previousMask == nil {
-            _previousMask = makeMask(L, windowSize)
-        }
-
-        return _previousMask![.ellipsis, 0 ..< min(L + offset, windowSize + 1)]
-    }
-
-    func getMask(_ x: MLXArray, cache: KVCache?, windowSize: Int?) -> MLXArray {
-        if let windowSize {
-            return getSlidingWindowMask(x, cache: cache, windowSize: windowSize)
-        } else {
-            return getCausalMask(x, cache: cache)
-        }
-    }
-
-    public func callAsFunction(_ x: MLXArray, mask: MLXArray, cache: KVCache? = nil) -> MLXArray {
+    public func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
+    ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         let D = headDim
-        let Hk = numKeyValueHeads
 
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
@@ -285,16 +218,15 @@ class AttentionBlock: Module {
 
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
+            if (sinks * sinks).max().item(Float.self) > 0 {
+                fatalError("Quantized attention does not support non-zero sinks.")
+            }
             if qcache.offset == 0 {
                 q = rope(q)
                 k = rope(k)
-
-                let zeros = MLXArray.zeros([B, Hk, 1, D]).asType(k.dtype)
-                k = concatenated([zeros, k], axis: 2)
-                v = concatenated([zeros, v], axis: 2)
             } else {
-                q = rope(q, offset: qcache.offset - 1)
-                k = rope(k, offset: qcache.offset - 1)
+                q = rope(q, offset: qcache.offset)
+                k = rope(k, offset: qcache.offset)
             }
 
             let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
@@ -303,7 +235,7 @@ class AttentionBlock: Module {
                 quantizedKeys: qKeys,
                 quantizedValues: qValues,
                 scale: smScale,
-                mask: .array(mask),
+                mask: mask,
                 groupSize: qcache.groupSize,
                 bits: qcache.bits,
                 mode: qcache.mode
@@ -312,26 +244,20 @@ class AttentionBlock: Module {
             return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
         }
 
-        if cache == nil || cache?.offset == 0 {
+        if let cache {
+            q = rope(q, offset: cache.offset)
+            k = rope(k, offset: cache.offset)
+            (k, v) = cache.update(keys: k, values: v)
+        } else {
             q = rope(q)
             k = rope(k)
-
-            let zeros = MLXArray.zeros([B, Hk, 1, D]).asType(k.dtype)
-            k = concatenated([zeros, k], axis: 2)
-            v = concatenated([zeros, v], axis: 2)
-            if let cache {
-                (k, v) = cache.update(keys: k, values: v)
-            }
-        } else {
-            q = rope(q, offset: cache!.offset - 1)
-            k = rope(k, offset: cache!.offset - 1)
-            (k, v) = cache!.update(keys: k, values: v)
         }
 
         let vHat = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v,
             scale: smScale,
-            mask: mask)
+            mask: mask,
+            sinks: sinks)
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -386,7 +312,11 @@ class GPTOSSTransformerBlock: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
-    public func callAsFunction(_ x: MLXArray, mask: MLXArray, cache: KVCache? = nil) -> MLXArray {
+    public func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
+    ) -> MLXArray {
         var residual = x
         var x = inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
@@ -406,6 +336,8 @@ public class GPTOSSModelInner: Module {
     let layerTypes: [String]
     fileprivate let layers: [GPTOSSTransformerBlock]
     let windowSize: Int
+    let slidingAttentionIndex: Int
+    let fullAttentionIndex: Int
 
     public init(_ config: GPTOSSConfiguration) {
         _embedTokens.wrappedValue = Embedding(
@@ -421,11 +353,15 @@ public class GPTOSSModelInner: Module {
             ).flatMap { $0 }
         self.layers = (0 ..< config.hiddenLayers).map { _ in GPTOSSTransformerBlock(config) }
         self.windowSize = config.slidingWindow
+        self.slidingAttentionIndex =
+            self.layerTypes.firstIndex(of: "sliding_attention") ?? 0
+        self.fullAttentionIndex =
+            self.layerTypes.firstIndex(of: "full_attention") ?? 0
     }
 
     public func callAsFunction(
         _ inputs: MLXArray,
-        mask: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache]? = nil,
         inputEmbeddings: MLXArray? = nil
     ) -> MLXArray {
@@ -438,20 +374,25 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
-        var masks: [MLXArray]
+        var masks: [MLXFast.ScaledDotProductAttentionMaskMode]
         if let mask {
-            masks = [MLXArray](repeating: mask, count: layers.count)
+            masks = [MLXFast.ScaledDotProductAttentionMaskMode](
+                repeating: mask,
+                count: layers.count
+            )
         } else {
-            masks = []
-            for (i, layer) in layers.enumerated() {
-                masks.append(
-                    layer.selfAttn.getMask(
-                        x,
-                        cache: cache[i],
-                        windowSize: layerTypes[i] == "sliding_attention" ? windowSize : nil
-                    )
-                )
-            }
+            let fullMask = makeAttentionMask(
+                n: x.dim(1),
+                cache: cache[fullAttentionIndex],
+                windowSize: nil
+            )
+            let slidingMask = makeAttentionMask(
+                n: x.dim(1),
+                cache: cache[slidingAttentionIndex],
+                windowSize: windowSize
+            )
+
+            masks = layerTypes.map { $0 == "full_attention" ? fullMask : slidingMask }
         }
 
         for (i, layer) in layers.enumerated() {
