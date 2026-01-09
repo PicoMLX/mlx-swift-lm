@@ -519,7 +519,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                 caches.append(StandardKVCache())
             } else {
                 caches.append(
-                    RotatingKVCache(maxSize: configuration.slidingWindow + 1, keep: 1)
+                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
                 )
             }
         }
