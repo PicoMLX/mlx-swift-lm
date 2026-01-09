@@ -286,9 +286,10 @@ class MLPBlock: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let g = router(x)
         let (experts, indices) = mlxTopK(g, k: numExpertsPerTok, axis: -1)
+        let stopIndices = MLX.stopGradient(indices)
         let expertWeights = softmax(experts, axis: -1, precise: true)
 
-        var x = self.experts(x, indices)
+        var x = self.experts(x, stopIndices)
 
         x = x * expandedDimensions(expertWeights, axis: -1)
         return x.sum(axis: -2)
@@ -482,25 +483,25 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             if k.contains("gate_up_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj", with: "gate_proj.weight")
-                ] = v[.ellipsis, .stride(by: 2), 0...]
+                ] = contiguous(v[.ellipsis, .stride(by: 2), 0...])
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj", with: "up_proj.weight")
-                ] = v[.ellipsis, .stride(from: 1, by: 2), 0...]
+                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2), 0...])
             } else if k.contains("down_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj", with: "down_proj.weight")
-                ] = v
+                ] = contiguous(v)
             } else if k.contains("gate_up_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_proj.bias")
-                ] = v[.ellipsis, .stride(by: 2)]
+                ] = contiguous(v[.ellipsis, .stride(by: 2)])
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj_bias", with: "up_proj.bias")
-                ] = v[.ellipsis, .stride(from: 1, by: 2)]
+                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2)])
             } else if k.contains("down_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj_bias", with: "down_proj.bias")
-                ] = v
+                ] = contiguous(v)
             } else {
                 finalWeights[k] = v
             }
