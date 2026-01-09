@@ -214,11 +214,13 @@ class AttentionBlock: Module {
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        let sinksActive = cachedSinksActive ?? {
-            let active = (sinks * sinks).max().item(Float.self) > 0
-            cachedSinksActive = active
-            return active
-        }()
+        let sinksActive =
+            cachedSinksActive
+            ?? {
+                let active = (sinks * sinks).max().item(Float.self) > 0
+                cachedSinksActive = active
+                return active
+            }()
 
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
