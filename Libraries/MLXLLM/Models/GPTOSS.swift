@@ -169,6 +169,7 @@ class AttentionBlock: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     let rope: YarnRoPE
+    private var cachedSinksActive: Bool?
 
     public init(_ config: GPTOSSConfiguration) {
         self.headDim = config.headDim
@@ -215,10 +216,15 @@ class AttentionBlock: Module {
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let sinksActive = cachedSinksActive ?? {
+            let active = (sinks * sinks).max().item(Float.self) > 0
+            cachedSinksActive = active
+            return active
+        }()
 
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
-            if (sinks * sinks).max().item(Float.self) > 0 {
+            if sinksActive {
                 fatalError("Quantized attention does not support non-zero sinks.")
             }
             if qcache.offset == 0 {
@@ -257,7 +263,7 @@ class AttentionBlock: Module {
             queries: q, keys: k, values: v,
             scale: smScale,
             mask: mask,
-            sinks: sinks)
+            sinks: sinksActive ? sinks : nil)
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -375,29 +381,35 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
-        var masks: [MLXFast.ScaledDotProductAttentionMaskMode]
-        if let mask {
-            masks = [MLXFast.ScaledDotProductAttentionMaskMode](
-                repeating: mask,
-                count: layers.count
-            )
-        } else {
-            let fullMask = makeAttentionMask(
-                n: x.dim(1),
-                cache: cache[fullAttentionIndex],
-                windowSize: nil
-            )
-            let slidingMask = makeAttentionMask(
-                n: x.dim(1),
-                cache: cache[slidingAttentionIndex],
-                windowSize: windowSize
-            )
-
-            masks = layerTypes.map { $0 == "full_attention" ? fullMask : slidingMask }
-        }
+        let seqLen = x.dim(1)
+        var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
+        var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
 
         for (i, layer) in layers.enumerated() {
-            x = layer(x, mask: masks[i], cache: cache[i])
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+            if let mask {
+                maskMode = mask
+            } else if layerTypes[i] == "full_attention" {
+                if fullMask == nil {
+                    fullMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[fullAttentionIndex],
+                        windowSize: nil
+                    )
+                }
+                maskMode = fullMask!
+            } else {
+                if slidingMask == nil {
+                    slidingMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[slidingAttentionIndex],
+                        windowSize: windowSize
+                    )
+                }
+                maskMode = slidingMask!
+            }
+
+            x = layer(x, mask: maskMode, cache: cache[i])
         }
 
         x = norm(x)
