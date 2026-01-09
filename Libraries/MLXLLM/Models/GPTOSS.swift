@@ -167,7 +167,6 @@ class AttentionBlock: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     let rope: YarnRoPE
-    private var cachedSinksActive: Bool?
 
     public init(_ config: GPTOSSConfiguration) {
         self.headDim = config.headDim
@@ -214,17 +213,10 @@ class AttentionBlock: Module {
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        let sinksActive =
-            cachedSinksActive
-            ?? {
-                let active = (sinks * sinks).max().item(Float.self) > 0
-                cachedSinksActive = active
-                return active
-            }()
 
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
-            if sinksActive {
+            if (sinks * sinks).max().item(Float.self) > 0 {
                 fatalError("Quantized attention does not support non-zero sinks.")
             }
             if qcache.offset == 0 {
@@ -263,7 +255,7 @@ class AttentionBlock: Module {
             queries: q, keys: k, values: v,
             scale: smScale,
             mask: mask,
-            sinks: sinksActive ? sinks : nil)
+            sinks: sinks)
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -294,10 +286,9 @@ class MLPBlock: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let g = router(x)
         let (experts, indices) = mlxTopK(g, k: numExpertsPerTok, axis: -1)
-        let stopIndices = MLX.stopGradient(indices)
         let expertWeights = softmax(experts, axis: -1, precise: true)
 
-        var x = self.experts(x, stopIndices)
+        var x = self.experts(x, indices)
 
         x = x * expandedDimensions(expertWeights, axis: -1)
         return x.sum(axis: -2)
@@ -381,35 +372,29 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
-        let seqLen = x.dim(1)
-        var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
-        var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
+        var masks: [MLXFast.ScaledDotProductAttentionMaskMode]
+        if let mask {
+            masks = [MLXFast.ScaledDotProductAttentionMaskMode](
+                repeating: mask,
+                count: layers.count
+            )
+        } else {
+            let fullMask = makeAttentionMask(
+                n: x.dim(1),
+                cache: cache[fullAttentionIndex],
+                windowSize: nil
+            )
+            let slidingMask = makeAttentionMask(
+                n: x.dim(1),
+                cache: cache[slidingAttentionIndex],
+                windowSize: windowSize
+            )
+
+            masks = layerTypes.map { $0 == "full_attention" ? fullMask : slidingMask }
+        }
 
         for (i, layer) in layers.enumerated() {
-            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
-                maskMode = mask
-            } else if layerTypes[i] == "full_attention" {
-                if fullMask == nil {
-                    fullMask = makeAttentionMask(
-                        n: seqLen,
-                        cache: cache[fullAttentionIndex],
-                        windowSize: nil
-                    )
-                }
-                maskMode = fullMask!
-            } else {
-                if slidingMask == nil {
-                    slidingMask = makeAttentionMask(
-                        n: seqLen,
-                        cache: cache[slidingAttentionIndex],
-                        windowSize: windowSize
-                    )
-                }
-                maskMode = slidingMask!
-            }
-
-            x = layer(x, mask: maskMode, cache: cache[i])
+            x = layer(x, mask: masks[i], cache: cache[i])
         }
 
         x = norm(x)
@@ -497,25 +482,25 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             if k.contains("gate_up_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj", with: "gate_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(by: 2), 0...])
+                ] = v[.ellipsis, .stride(by: 2), 0...]
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj", with: "up_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2), 0...])
+                ] = v[.ellipsis, .stride(from: 1, by: 2), 0...]
             } else if k.contains("down_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj", with: "down_proj.weight")
-                ] = contiguous(v)
+                ] = v
             } else if k.contains("gate_up_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(by: 2)])
+                ] = v[.ellipsis, .stride(by: 2)]
                 finalWeights[
                     k.replacingOccurrences(of: "gate_up_proj_bias", with: "up_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2)])
+                ] = v[.ellipsis, .stride(from: 1, by: 2)]
             } else if k.contains("down_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj_bias", with: "down_proj.bias")
-                ] = contiguous(v)
+                ] = v
             } else {
                 finalWeights[k] = v
             }
@@ -532,7 +517,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                 caches.append(StandardKVCache())
             } else {
                 caches.append(
-                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                    RotatingKVCache(maxSize: configuration.slidingWindow + 1, keep: 1)
                 )
             }
         }
