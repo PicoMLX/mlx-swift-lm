@@ -271,7 +271,9 @@ public class MiniMaxModel: Module, LLMModel, KVCacheDimensionProvider {
                     if sanitizedWeights[firstKey] != nil {
                         let toJoin = (0 ..< configuration.numLocalExperts).map { expertIndex in
                             sanitizedWeights.removeValue(
-                                forKey: "\(prefix).block_sparse_moe.experts.\(expertIndex).\(orig).\(key)")!
+                                forKey:
+                                    "\(prefix).block_sparse_moe.experts.\(expertIndex).\(orig).\(key)"
+                            )!
                         }
                         sanitizedWeights[
                             "\(prefix).block_sparse_moe.switch_mlp.\(updated).\(key)"
