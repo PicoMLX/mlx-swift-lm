@@ -191,6 +191,19 @@ class MiMoV2FlashAttention: Module {
 
         return wo(output)
     }
+    
+    override func updateMissing(
+        parameter: String,
+        verify: VerifyUpdate,
+        path: [String],
+        modulePath: [String]
+    ) throws {
+        if parameter == "attention_sink_bias", hasSinks {
+            // Keep the default you already set in init (ones([numAttentionHeads]))
+            return
+        }
+        try super.updateMissing(parameter: parameter, verify: verify, path: path, modulePath: modulePath)
+    }
 }
 
 class MiMoV2FlashMLP: Module, UnaryLayer {
