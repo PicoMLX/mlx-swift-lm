@@ -134,8 +134,8 @@ class GLM4MoELiteAttention: Module {
             qPe = rope(qPe, offset: cache.offset)
             kPe = rope(kPe, offset: cache.offset)
         } else {
-            qPe = rope(qPe)
-            kPe = rope(kPe)
+            qPe = rope(qPe, offset: 0)
+            kPe = rope(kPe, offset: 0)
         }
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
@@ -499,14 +499,20 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
         self.qkRopeHeadDim = try container.decode(Int.self, forKey: .qkRopeHeadDim)
         self.qkNopeHeadDim = try container.decode(Int.self, forKey: .qkNopeHeadDim)
         self.vHeadDim = try container.decode(Int.self, forKey: .vHeadDim)
-        self.topkMethod = try container.decodeIfPresent(String.self, forKey: .topkMethod) ?? "noaux_tc"
-        self.scoringFunc = try container.decodeIfPresent(String.self, forKey: .scoringFunc) ?? "sigmoid"
-        self.normTopkProb = try container.decode(Bool.self, forKey: .normTopkProb)
-        self.nGroup = try container.decode(Int.self, forKey: .nGroup)
-        self.topkGroup = try container.decode(Int.self, forKey: .topkGroup)
-        self.numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
-        self.moeLayerFreq = try container.decode(Int.self, forKey: .moeLayerFreq)
-        self.firstKDenseReplace = try container.decode(Int.self, forKey: .firstKDenseReplace)
+        self.topkMethod =
+            try container.decodeIfPresent(String.self, forKey: .topkMethod) ?? "noaux_tc"
+        self.scoringFunc =
+            try container.decodeIfPresent(String.self, forKey: .scoringFunc) ?? "sigmoid"
+        self.normTopkProb =
+            try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
+        self.nGroup = try container.decodeIfPresent(Int.self, forKey: .nGroup) ?? 1
+        self.topkGroup = try container.decodeIfPresent(Int.self, forKey: .topkGroup) ?? 1
+        self.numExpertsPerTok =
+            try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 4
+        self.moeLayerFreq =
+            try container.decodeIfPresent(Int.self, forKey: .moeLayerFreq) ?? 1
+        self.firstKDenseReplace =
+            try container.decodeIfPresent(Int.self, forKey: .firstKDenseReplace) ?? 1
         self.maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
         self.rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
         self.ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
@@ -517,8 +523,10 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
         self.attentionBias = try container.decode(Bool.self, forKey: .attentionBias)
         self.attentionDropout =
             try container.decodeIfPresent(Float.self, forKey: .attentionDropout) ?? 0.0
-        self.partialRotaryFactor = try container.decode(Float.self, forKey: .partialRotaryFactor)
-        self.tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings)
+        self.partialRotaryFactor =
+            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        self.tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings)
             ?? false
         self.numNextnPredictLayers =
             try container.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers) ?? 1
