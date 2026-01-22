@@ -35,13 +35,6 @@ class GLM4MoELiteAttention: Module {
     @ModuleInfo(key: "kv_a_layernorm") var kvALayerNorm: RMSNorm
     @ModuleInfo(key: "kv_b_proj") var kvBProj: Linear
 
-    private var wkBProjWeight: MLXArray?
-    private var wvBProjWeight: MLXArray?
-    private var wkBProjScales: MLXArray?
-    private var wvBProjScales: MLXArray?
-    private var wkBProjBiases: MLXArray?
-    private var wvBProjBiases: MLXArray?
-
     init(_ config: GLM4MoELiteConfiguration) {
         self.config = config
         self.hiddenSize = config.hiddenSize
@@ -107,56 +100,6 @@ class GLM4MoELiteAttention: Module {
         )
     }
 
-    private func splitKvBProjIfNeeded() -> (
-        MLXArray, MLXArray, MLXArray?, MLXArray?, MLXArray?, MLXArray?
-    ) {
-        if let wkBProjWeight, let wvBProjWeight {
-            return (
-                wkBProjWeight, wvBProjWeight,
-                wkBProjScales, wkBProjBiases,
-                wvBProjScales, wvBProjBiases
-            )
-        }
-
-        let headDim = qkNopeHeadDim + vHeadDim
-
-        if let quantized = kvBProj as? QuantizedLinear {
-            let weight = quantized.weight.reshaped(numHeads, headDim, -1)
-            let wk = weight[.ellipsis, ..<qkNopeHeadDim, 0...]
-            let wv = weight[.ellipsis, qkNopeHeadDim..., 0...]
-
-            let scales = quantized.scales.reshaped(numHeads, headDim, -1)
-            let wkScales = scales[.ellipsis, ..<qkNopeHeadDim, 0...]
-            let wvScales = scales[.ellipsis, qkNopeHeadDim..., 0...]
-
-            var wkBiases: MLXArray?
-            var wvBiases: MLXArray?
-            if let biases = quantized.biases {
-                let reshapedBiases = biases.reshaped(numHeads, headDim, -1)
-                wkBiases = reshapedBiases[.ellipsis, ..<qkNopeHeadDim, 0...]
-                wvBiases = reshapedBiases[.ellipsis, qkNopeHeadDim..., 0...]
-            }
-
-            self.wkBProjWeight = wk
-            self.wvBProjWeight = wv
-            self.wkBProjScales = wkScales
-            self.wvBProjScales = wvScales
-            self.wkBProjBiases = wkBiases
-            self.wvBProjBiases = wvBiases
-
-            return (wk, wv, wkScales, wkBiases, wvScales, wvBiases)
-        }
-
-        let weight = kvBProj.weight.reshaped(numHeads, headDim, -1)
-        let wk = weight[.ellipsis, ..<qkNopeHeadDim, 0...]
-        let wv = weight[.ellipsis, qkNopeHeadDim..., 0...]
-
-        self.wkBProjWeight = wk
-        self.wvBProjWeight = wv
-
-        return (wk, wv, nil, nil, nil, nil)
-    }
-
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -179,61 +122,13 @@ class GLM4MoELiteAttention: Module {
         compressedKv = splitCompressedKv[0]
         var kPe = splitCompressedKv[1]
         kPe = kPe.reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
-        let kvLatent = kvALayerNorm(compressedKv)
 
-        let useLatentCache = !(kvBProj is LoRALayer)
-        if !useLatentCache {
-            var kv = kvBProj(kvLatent)
-            kv = kv.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
+        var kv = kvBProj(kvALayerNorm(compressedKv))
+        kv = kv.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
 
-            let splitKv = split(kv, indices: [qkNopeHeadDim], axis: -1)
-            let kNope = splitKv[0]
-            let values = splitKv[1]
-
-            if let cache {
-                qPe = rope(qPe, offset: cache.offset)
-                kPe = rope(kPe, offset: cache.offset)
-            } else {
-                qPe = rope(qPe, offset: 0)
-                kPe = rope(kPe, offset: 0)
-            }
-            kPe = repeated(kPe, count: numHeads, axis: 1)
-
-            let keys = concatenated([kNope, kPe], axis: -1)
-            let queries = concatenated([qNope, qPe], axis: -1)
-
-            let output = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
-
-            return oProj(output)
-        }
-
-        let kvLatentExpanded = expandedDimensions(kvLatent, axis: 1)
-        let (wk, wv, wkScales, wkBiases, wvScales, wvBiases) = splitKvBProjIfNeeded()
-
-        let qNopeAbsorbed: MLXArray
-        if let quantized = kvBProj as? QuantizedLinear, let wkScales {
-            qNopeAbsorbed = quantizedMM(
-                qNope,
-                wk,
-                scales: wkScales,
-                biases: wkBiases,
-                transpose: false,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode
-            )
-        } else {
-            qNopeAbsorbed = qNope.matmul(wk)
-        }
+        let splitKv = split(kv, indices: [qkNopeHeadDim], axis: -1)
+        let kNope = splitKv[0]
+        let values = splitKv[1]
 
         if let cache {
             qPe = rope(qPe, offset: cache.offset)
@@ -242,12 +137,12 @@ class GLM4MoELiteAttention: Module {
             qPe = rope(qPe, offset: 0)
             kPe = rope(kPe, offset: 0)
         }
+        kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        let keys = concatenated([kvLatentExpanded, kPe], axis: -1)
-        let values = kvLatentExpanded
-        let queries = concatenated([qNopeAbsorbed, qPe], axis: -1)
+        let keys = concatenated([kNope, kPe], axis: -1)
+        let queries = concatenated([qNope, qPe], axis: -1)
 
-        var output = attentionWithCacheUpdate(
+        let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -255,23 +150,8 @@ class GLM4MoELiteAttention: Module {
             scale: scale,
             mask: mask
         )
-
-        if let quantized = kvBProj as? QuantizedLinear, let wvScales {
-            output = quantizedMM(
-                output,
-                wv,
-                scales: wvScales,
-                biases: wvBiases,
-                transpose: true,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode
-            )
-        } else {
-            output = output.matmul(wv.transposed(0, 2, 1))
-        }
-
-        output = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
 
         return oProj(output)
     }
@@ -507,48 +387,6 @@ public class GLM4MoELiteModel: Module, LLMModel, KVCacheDimensionProvider {
                         sanitized["\(prefix).mlp.switch_mlp.\(n).\(k)"] = MLX.stacked(toJoin)
                     }
                 }
-            }
-        }
-
-        let headDim = configuration.qkNopeHeadDim + configuration.vHeadDim
-        let numHeads = configuration.attentionHeads
-        for l in 0 ..< configuration.hiddenLayers {
-            let attnPrefix = "model.layers.\(l).self_attn"
-            let kvWeightKey = "\(attnPrefix).kv_b_proj.weight"
-            let kvScalesKey = "\(attnPrefix).kv_b_proj.scales"
-            let kvBiasesKey = "\(attnPrefix).kv_b_proj.biases"
-            let wkWeightKey = "\(attnPrefix).wk_b_proj_weight"
-            let wvWeightKey = "\(attnPrefix).wv_b_proj_weight"
-            let wkScalesKey = "\(attnPrefix).wk_b_proj_scales"
-            let wvScalesKey = "\(attnPrefix).wv_b_proj_scales"
-            let wkBiasesKey = "\(attnPrefix).wk_b_proj_biases"
-            let wvBiasesKey = "\(attnPrefix).wv_b_proj_biases"
-
-            if sanitized[kvWeightKey] == nil,
-                let wkWeight = sanitized[wkWeightKey],
-                let wvWeight = sanitized[wvWeightKey]
-            {
-                let merged = concatenated([wkWeight, wvWeight], axis: 1)
-                    .reshaped(numHeads * headDim, -1)
-                sanitized[kvWeightKey] = merged
-
-                if let wkScales = sanitized[wkScalesKey], let wvScales = sanitized[wvScalesKey] {
-                    let mergedScales = concatenated([wkScales, wvScales], axis: 1)
-                        .reshaped(numHeads * headDim, -1)
-                    sanitized[kvScalesKey] = mergedScales
-                }
-
-                if let wkBiases = sanitized[wkBiasesKey], let wvBiases = sanitized[wvBiasesKey] {
-                    let mergedBiases = concatenated([wkBiases, wvBiases], axis: 1)
-                        .reshaped(numHeads * headDim, -1)
-                    sanitized[kvBiasesKey] = mergedBiases
-                }
-            }
-
-            for key in [
-                wkWeightKey, wvWeightKey, wkScalesKey, wvScalesKey, wkBiasesKey, wvBiasesKey,
-            ] {
-                sanitized[key] = nil
             }
         }
 
