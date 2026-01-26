@@ -49,6 +49,7 @@ Currently supported model types are:
 - Gemma2
 - InternLM2
 - Llama / Mistral
+- MiniCPM (v1/v2/v4; v3 uses a different architecture)
 - OpenELM
 - Phi
 - Phi3
