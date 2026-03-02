@@ -51,7 +51,11 @@ public struct BaseProcessorConfiguration: Codable, Sendable {
     }
 }
 
-private func JSON5Decoder() -> JSONDecoder { let d = JSONDecoder(); d.allowsJSON5 = true; return d }
+private func JSON5Decoder() -> JSONDecoder {
+    let d = JSONDecoder()
+    d.allowsJSON5 = true
+    return d
+}
 
 /// Creates a function that loads a configuration file and instantiates a model with the proper configuration
 private func create<C: Codable, M>(

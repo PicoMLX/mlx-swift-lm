@@ -6,7 +6,11 @@ import MLX
 import MLXLMCommon
 import Tokenizers
 
-private func JSON5Decoder() -> JSONDecoder { let d = JSONDecoder(); d.allowsJSON5 = true; return d }
+private func JSON5Decoder() -> JSONDecoder {
+    let d = JSONDecoder()
+    d.allowsJSON5 = true
+    return d
+}
 
 /// Creates a function that decodes configuration data and instantiates a model with the proper configuration
 private func create<C: Codable, M>(
