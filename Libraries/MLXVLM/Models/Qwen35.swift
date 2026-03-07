@@ -446,11 +446,9 @@ enum Qwen35Language {
         func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
             let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
             if let gate {
-                let gateF32 = silu(gate.asType(.float32))
-                let xF32 = x.asType(.float32)
-                return (gateF32 * xF32).asType(hiddenStates.dtype)
+                return silu(gate) * x
             }
-            return x.asType(hiddenStates.dtype)
+            return x
         }
     }
 
