@@ -65,6 +65,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// MiniMax M2 format with invoke/parameter tags.
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
+    
+    case qwen35 = "qwen3_5"
 
     // MARK: - Factory Methods
 
@@ -87,6 +89,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .qwen35:
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         }
     }
 
@@ -113,6 +117,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Gemma
         if type == "gemma" {
             return .gemma
+        }
+        
+        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
+        if type.hasPrefix("qwen3_5") {
+            return .qwen35
         }
 
         return nil
