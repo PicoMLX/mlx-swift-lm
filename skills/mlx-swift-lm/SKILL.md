@@ -1,6 +1,6 @@
 ---
 name: swift-mlx-lm
-description: MLX Swift LM - Run LLMs and VLMs on Apple Silicon using MLX. Covers local inference, streaming, wired memory coordination, tool calling, LoRA fine-tuning, embeddings, and model porting.
+description: MLX Swift LM - Run LLMs and VLMs on Apple Silicon using MLX. Covers local inference, streaming, batched multi-request inference, wired memory coordination, tool calling, LoRA fine-tuning, embeddings, and model porting.
 triggers:
   - mlx
   - mlx-swift
@@ -14,17 +14,21 @@ triggers:
   - wired memory ticket
   - model porting
   - add model support
+  - batch inference
+  - concurrent inference
+  - inference scheduler
 ---
 
 # mlx-swift-lm Skill
 
 ## 1. Overview & Triggers
 
-mlx-swift-lm is a Swift package for running Large Language Models (LLMs) and Vision-Language Models (VLMs) on Apple Silicon using MLX. It supports local inference, streaming generation, wired-memory coordination, tool calling, LoRA/DoRA fine-tuning, and embeddings.
+mlx-swift-lm is a Swift package for running Large Language Models (LLMs) and Vision-Language Models (VLMs) on Apple Silicon using MLX. It supports local inference, batched multi-request inference, streaming generation, wired-memory coordination, tool calling, LoRA/DoRA fine-tuning, and embeddings.
 
 ### When to Use This Skill
 - Running LLM/VLM inference on macOS/iOS with Apple Silicon
 - Streaming text generation from local models
+- Serving multiple concurrent requests with automatic batching (`InferenceScheduler`)
 - Coordinating concurrent inference with wired-memory policies and tickets
 - Tool calling / function calling with models
 - LoRA adapter training and fine-tuning
@@ -33,7 +37,8 @@ mlx-swift-lm is a Swift package for running Large Language Models (LLMs) and Vis
 
 ### Architecture Overview
 ```
-MLXLMCommon     - Core infra (ModelContainer, ChatSession, Evaluate, KVCache, wired memory helpers)
+MLXLMCommon     - Core infra (ModelContainer, ChatSession, Evaluate, KVCache,
+                  InferenceScheduler, BatchKVCache, wired memory helpers)
 MLXLLM          - Text-only LLM support (Llama, Qwen, Gemma, Phi, DeepSeek, etc.)
 MLXVLM          - Vision-Language Models (Qwen-VL, PaliGemma, Gemma3, etc.)
 MLXEmbedders    - Embedding models and pooling utilities
@@ -57,6 +62,11 @@ MLXEmbedders    - Embedding models and pooling utilities
 | VLM factory & registry | `Libraries/MLXVLM/VLMModelFactory.swift` |
 | LoRA configuration | `Libraries/MLXLMCommon/Adapters/LoRA/LoRAContainer.swift` |
 | LoRA training | `Libraries/MLXLLM/LoraTrain.swift` |
+| Batched inference scheduler | `Libraries/MLXLMCommon/Batching/InferenceScheduler.swift` |
+| Batched KV cache | `Libraries/MLXLMCommon/Batching/BatchKVCache.swift` |
+| Batch token iterator | `Libraries/MLXLMCommon/Batching/BatchTokenIterator.swift` |
+| Per-request sequence state | `Libraries/MLXLMCommon/Batching/SequenceState.swift` |
+| GPU serialization actor | `Libraries/MLXLMCommon/Batching/DeviceEngine.swift` |
 
 ## 3. Quick Start
 
@@ -380,6 +390,7 @@ await session.clear()
 | [references/training.md](references/training.md) | LoRATrain API, fine-tuning |
 | [references/embeddings.md](references/embeddings.md) | EmbeddingModel, pooling, use cases |
 | [references/model-porting.md](references/model-porting.md) | Porting models from Python MLX-LM to Swift |
+| [references/batching.md](references/batching.md) | InferenceScheduler, BatchKVCache, batched inference, single-to-batch upgrade |
 
 ## 8. Deprecated Patterns Summary
 

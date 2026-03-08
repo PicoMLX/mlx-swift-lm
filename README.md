@@ -8,6 +8,7 @@ Some key features include:
 - Integration with the Hugging Face Hub to easily use thousands of LLMs with a single command.
 - Low-rank (LoRA) and full model fine-tuning with support for quantized models.
 - Many model architectures for both LLMs and VLMs.
+- Batched inference via `InferenceScheduler` — multiple concurrent requests are automatically decoded together in a single forward pass, with dynamic single-to-batch upgrade when a second request arrives mid-generation.
 
 For some example applications and tools that use MLX Swift LM check out
 the [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
