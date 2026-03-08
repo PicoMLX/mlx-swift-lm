@@ -208,3 +208,110 @@ end. This helps prevent over-commit when many inferences launch at once.
 Use `WiredMemoryManager.events()` to observe policy stacking and limit changes
 in DEBUG builds. The stream is empty in release builds, so event logging is a
 no-op in production.
+
+## Batched Inference (InferenceScheduler)
+
+`InferenceScheduler` enables concurrent multi-request inference by batching
+multiple sequences through a single model forward pass. This is useful for
+local servers, API gateways, or any scenario where more than one request may
+be in flight at the same time.
+
+### Basic Setup
+
+```swift
+// Load a model as usual
+let context = try await LLMModelFactory.shared.loadContext(configuration: .init(id: "mlx-community/Qwen3-4B-4bit"))
+
+// Wrap it in a ModelContainer with a scheduler
+let container = ModelContainer(
+    context: context,
+    schedulerConfig: InferenceScheduler.Config(
+        completionBatchSize: 4   // up to 4 sequences decoded together
+    )
+)
+
+// Use generate() exactly as before — the scheduler handles batching transparently
+let stream = try await container.generate(input: input, parameters: parameters)
+for await event in stream {
+    if case .chunk(let text) = event { print(text, terminator: "") }
+}
+```
+
+Multiple concurrent callers get their own `AsyncStream<Generation>` and are
+automatically batched together whenever they overlap in time.
+
+### How It Works
+
+1. **Prefill** — each request's prompt is processed independently with its own
+   KV cache, using the same chunked prefill path as single-sequence inference.
+2. **Batch decode** — once two or more sequences are ready, the scheduler stacks
+   their current tokens into `[B, 1]` and runs a single batched forward pass per
+   decode step.
+3. **Single-to-batch upgrade** — if a second request arrives while the first is
+   already mid-generation, the scheduler merges the two KV caches and continues
+   with a batch of size 2. No restart required.
+4. **Completion** — finished sequences are removed from the batch; the remainder
+   continue decoding.
+
+### Configuration
+
+```swift
+InferenceScheduler.Config(
+    completionBatchSize: 4,   // max concurrent decode sequences (default: 4)
+    prefillBatchSize:    4,   // max sequences admitted per prefill round (default: 4)
+    maxQueueSize:        32   // max requests waiting in the queue (default: 32)
+)
+```
+
+Default values are tuned for local/LAN use where memory is the primary
+constraint. Increase `completionBatchSize` for higher-throughput scenarios if
+memory allows.
+
+### Architecture
+
+```
+Client Request
+    ↓
+InferenceScheduler (actor — manages queue + single-to-batch upgrade)
+    ↓
+BatchTokenIterator (batched prefill + decode)
+    ↓
+BatchKVCache (left-padded, [B, heads, seq_len, head_dim])
+    ↓
+LanguageModel forward pass ([B, 1] tokens → [B, 1, vocab] logits)
+```
+
+**`BatchKVCache`** stores all sequences' keys and values in a single
+`[B, nHeads, seqLen, headDim]` tensor. Shorter sequences are left-padded so
+that all sequences share the same `offset` and can be processed in one pass.
+The `fromSingle(_:leftPadding:)` factory method converts per-sequence
+`KVCacheSimple` instances into a merged batch cache.
+
+**`BatchTokenIterator`** runs prefill for each new sequence independently
+(preserving correct per-token RoPE positions in the cache), then merges the
+caches and runs all decode steps as a batch.
+
+**`InferenceScheduler`** is an `actor` whose decode loop yields between steps
+(via `Task.yield()`) so that new `submit()` calls can be processed promptly
+without artificial batching delays.
+
+### Known Limitations
+
+- **RoPE position approximation during decode**: During a decode step, all
+  sequences in the batch use the same `cache.offset` integer for RoPE. For
+  sequences with different prompt lengths (which are left-padded to match),
+  shorter sequences' decode tokens will have their RoPE position overestimated
+  by `leftPadding[i]` steps. This is exact when all sequences have the same
+  prompt length (simultaneous batch), and mild for small length differences.
+
+- **Attention mask on single-token decode**: Many models use the deprecated
+  `createAttentionMask(h:cache:)` helper which returns no mask for single-token
+  decode steps (since there is normally no constraint needed). With left-padding
+  this means padding positions are not explicitly excluded during decode,
+  producing slight quality degradation proportional to the padding amount.
+  Updating models to use `createAttentionMask(h:cache:windowSize:returnArray:)`
+  will resolve this.
+
+Both limitations only affect the single-to-batch upgrade path. Pure simultaneous
+batching (all requests start at the same time, padded to the same prefill length)
+is unaffected.

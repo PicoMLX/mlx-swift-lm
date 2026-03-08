@@ -34,6 +34,16 @@ import Tokenizers
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
 
+    /// Optional inference scheduler for concurrent/batched request handling.
+    ///
+    /// When set, ``generate(input:parameters:wiredMemoryTicket:)`` routes requests
+    /// through the scheduler instead of running single-sequence inference directly.
+    /// Multiple concurrent callers benefit from automatic batching.
+    ///
+    /// Set this during initialization via ``init(context:schedulerConfig:)`` or
+    /// assign it directly after creation.
+    public let scheduler: InferenceScheduler?
+
     public var configuration: ModelConfiguration {
         get async {
             await context.read { $0.configuration }
@@ -52,7 +62,22 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Create a `ModelContainer` without a scheduler (standard single-sequence mode).
     public init(context: consuming ModelContext) {
+        self.context = .init(context)
+        self.scheduler = nil
+    }
+
+    /// Create a `ModelContainer` with an ``InferenceScheduler`` for batched inference.
+    ///
+    /// When a scheduler is provided, concurrent ``generate`` calls are automatically
+    /// batched together, improving throughput for multi-user or multi-request scenarios.
+    ///
+    /// - Parameters:
+    ///   - context: The loaded model context.
+    ///   - schedulerConfig: Configuration for the inference scheduler.
+    public init(context: ModelContext, schedulerConfig: InferenceScheduler.Config) {
+        self.scheduler = InferenceScheduler(context: context, config: schedulerConfig)
         self.context = .init(context)
     }
 
@@ -174,6 +199,12 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
+        // Route through the scheduler when batched inference is enabled
+        if let scheduler {
+            let request = InferenceRequest(input: input, parameters: parameters)
+            return try await scheduler.submit(request)
+        }
+
         let input = SendableBox(input)
 
         // Note: this is only visiting the model exclusively
