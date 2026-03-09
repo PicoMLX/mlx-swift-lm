@@ -167,7 +167,21 @@ public class Gemma2ModelInner: Module {
         h = h * hiddenScale
 
         // Gemma2 uses the older array-based mask pattern with manual application in attention
-        let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
+        let mask: MLXArray?
+        if let cache = cache?.first {
+            switch cache.makeMask(n: h.dim(1), windowSize: nil, returnArray: true) {
+            case .array(let array):
+                mask = array
+            case .arrays(let arrays):
+                mask = arrays.first
+            case .none:
+                mask = nil
+            case .causal:
+                mask = createCausalMask(n: h.dim(1), offset: cache.offset)
+            }
+        } else {
+            mask = h.dim(1) > 1 ? createCausalMask(n: h.dim(1), offset: 0) : nil
+        }
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])

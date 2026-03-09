@@ -65,6 +65,15 @@ private struct PrefilledPrompt {
     var processor: BatchLogitProcessorBox?
 }
 
+private struct PreparedCachedPrompt {
+    let uid: Int
+    let tokens: [Int]
+    let maxTokens: Int
+    let cache: [KVCache]
+    let sampler: any LogitSampler
+    var processor: BatchLogitProcessorBox?
+}
+
 private final class ActiveBatch {
     var uids: [Int]
     var tokens: MLXArray
@@ -384,6 +393,10 @@ struct BatchTokenIterator {
     }
 
     private mutating func processCachedPrompts(_ prompts: [PendingPrompt]) -> ActiveBatch {
+        if let batch = processCachedPromptsInBatch(prompts) {
+            return batch
+        }
+
         let prefills = prompts.map { prefillSingle($0) }
         let mergedCache = mergePerSequenceCaches(prefills.map(\.cache))
         let firstTokens = MLXArray(prefills.map(\.firstToken))
@@ -397,6 +410,119 @@ struct BatchTokenIterator {
             cache: mergedCache,
             samplers: prefills.map(\.sampler),
             processors: prefills.map(\.processor)
+        )
+    }
+
+    private mutating func processCachedPromptsInBatch(_ prompts: [PendingPrompt]) -> ActiveBatch? {
+        var prepared = [PreparedCachedPrompt]()
+        prepared.reserveCapacity(prompts.count)
+
+        for prompt in prompts {
+            guard let cachedPrompt = prepareCachedPromptForBatch(prompt) else {
+                return nil
+            }
+            prepared.append(cachedPrompt)
+        }
+
+        return prefillCachedPromptsInBatch(prepared)
+    }
+
+    private mutating func prepareCachedPromptForBatch(_ prompt: PendingPrompt) -> PreparedCachedPrompt? {
+        guard let promptCache = prompt.promptCache else {
+            return nil
+        }
+
+        let cache = promptCache
+        var processor = prompt.processor
+        let input = LMInput(tokens: MLXArray(prompt.tokens.map(Int32.init)))
+
+        prepareProcessor(&processor, with: prompt.tokens)
+
+        do {
+            switch try model.prepare(
+                input,
+                cache: cache,
+                windowSize: configuration.generation.prefillStepSize
+            ) {
+            case .tokens(let tokens):
+                guard tokens.mask == nil else { return nil }
+                let tokenValues = tokens.tokens.asArray(Int32.self).map(Int.init)
+                guard !tokenValues.isEmpty else { return nil }
+
+                return PreparedCachedPrompt(
+                    uid: prompt.uid,
+                    tokens: tokenValues,
+                    maxTokens: prompt.maxTokens,
+                    cache: cache,
+                    sampler: prompt.sampler,
+                    processor: processor
+                )
+
+            case .logits:
+                return nil
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    private mutating func prefillCachedPromptsInBatch(_ prompts: [PreparedCachedPrompt]) -> ActiveBatch {
+        let tokenLists = prompts.map(\.tokens)
+        let lengths = tokenLists.map(\.count)
+        let (padded, rightPadding) = rightPadPrompts(tokenLists)
+        let lastTokens = MLXArray(tokenLists.map { Int32($0.last!) })
+        var cache = mergePerSequenceCaches(prompts.map(\.cache))
+        var processors = prompts.map(\.processor)
+
+        if padded.dim(1) > 1 {
+            let prefixLengths = lengths.map { max($0 - 1, 0) }
+            prepareMergedCachesForRightPaddedPrefill(
+                cache,
+                lengths: prefixLengths,
+                rightPadding: rightPadding
+            )
+
+            var remaining = padded
+            while remaining.dim(1) > 1 {
+                let nToProcess = min(configuration.generation.prefillStepSize, remaining.dim(1) - 1)
+                let slice = remaining[0..., ..<nToProcess]
+                _ = model(slice, cache: cache)
+                maybeQuantizeKVCache(
+                    cache: &cache,
+                    kvBits: configuration.generation.kvBits,
+                    kvGroupSize: configuration.generation.kvGroupSize,
+                    quantizedKVStart: configuration.generation.quantizedKVStart
+                )
+
+                let states = cache.flatMap(\.state)
+                if !states.isEmpty {
+                    eval(states)
+                }
+
+                let length = remaining.dim(1)
+                remaining = remaining[0..., nToProcess..<length]
+                Memory.clearCache()
+            }
+
+            finalizeMergedCachesAfterPrefill(cache)
+        }
+
+        let firstTokens = step(
+            inputTokens: lastTokens[0..., .newAxis],
+            cache: &cache,
+            samplers: prompts.map(\.sampler),
+            processors: &processors
+        )
+        asyncEval(firstTokens)
+
+        return ActiveBatch(
+            uids: prompts.map(\.uid),
+            tokens: firstTokens,
+            maxTokens: prompts.map(\.maxTokens),
+            numTokens: Array(repeating: 0, count: prompts.count),
+            cache: cache,
+            samplers: prompts.map(\.sampler),
+            processors: processors
         )
     }
 
@@ -589,6 +715,27 @@ private func leftPadPrompts(_ prompts: [[Int]]) -> (MLXArray, [Int]) {
     return (MLXArray(padded, [prompts.count, maxLength]), leftPadding)
 }
 
+private func rightPadPrompts(_ prompts: [[Int]]) -> (MLXArray, [Int]) {
+    guard let maxLength = prompts.map(\.count).max() else {
+        return (MLXArray.zeros([0, 0], type: Int32.self), [])
+    }
+
+    var padded: [Int] = []
+    padded.reserveCapacity(prompts.count * maxLength)
+
+    var rightPadding: [Int] = []
+    rightPadding.reserveCapacity(prompts.count)
+
+    for prompt in prompts {
+        let pad = maxLength - prompt.count
+        rightPadding.append(pad)
+        padded.append(contentsOf: prompt)
+        padded.append(contentsOf: Array(repeating: 0, count: pad))
+    }
+
+    return (MLXArray(padded, [prompts.count, maxLength]), rightPadding)
+}
+
 private func makeBatchCache(
     model: any LanguageModel,
     parameters: GenerateParameters,
@@ -604,6 +751,44 @@ private func mergePerSequenceCaches(_ perSequenceCaches: [[KVCache]]) -> [KVCach
     let layerCount = first.count
     return (0 ..< layerCount).map { layerIndex in
         mergeLayerCaches(perSequenceCaches.map { $0[layerIndex] })
+    }
+}
+
+private func prepareMergedCachesForRightPaddedPrefill(
+    _ caches: [KVCache],
+    lengths: [Int],
+    rightPadding: [Int]
+) {
+    for cache in caches {
+        switch cache {
+        case let batch as BatchKVCache:
+            batch.prepare(rightPadding: rightPadding)
+        case let rotating as BatchRotatingKVCache:
+            rotating.prepare(lengths: lengths, rightPadding: rightPadding)
+        case let arrays as ArraysCache:
+            arrays.prepare(lengths: lengths)
+        case let list as CacheList:
+            list.prepare(lengths: lengths, rightPadding: rightPadding)
+        default:
+            break
+        }
+    }
+}
+
+private func finalizeMergedCachesAfterPrefill(_ caches: [KVCache]) {
+    for cache in caches {
+        switch cache {
+        case let batch as BatchKVCache:
+            batch.finalizeBatchPrefill()
+        case let rotating as BatchRotatingKVCache:
+            rotating.finalizeBatchPrefill()
+        case let arrays as ArraysCache:
+            arrays.finalizeBatchPrefill()
+        case let list as CacheList:
+            list.finalizeBatchPrefill()
+        default:
+            break
+        }
     }
 }
 

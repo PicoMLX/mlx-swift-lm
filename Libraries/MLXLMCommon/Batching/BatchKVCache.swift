@@ -14,6 +14,7 @@ public class BatchKVCache: BaseKVCache {
     public private(set) var offsets: MLXArray
     private var leftPaddingStorage: MLXArray
     private var currentLength: Int = 0
+    private var pendingRightPadding: MLXArray?
 
     public var batchSize: Int { leftPaddingStorage.size }
     public var leftPadding: [Int] { leftPaddingStorage.asArray(Int.self) }
@@ -124,6 +125,31 @@ public class BatchKVCache: BaseKVCache {
         offsets = offsets - trimmed
         offset = currentLength
         return trimmed
+    }
+
+    public func prepare(rightPadding: [Int]?) {
+        guard let rightPadding, rightPadding.contains(where: { $0 > 0 }) else {
+            pendingRightPadding = nil
+            return
+        }
+        pendingRightPadding = MLXArray(rightPadding)
+    }
+
+    public func finalizeBatchPrefill() {
+        guard let pendingRightPadding,
+            pendingRightPadding.size > 0,
+            let keys,
+            let values
+        else {
+            self.pendingRightPadding = nil
+            return
+        }
+
+        self.keys = dynamicRoll(keys, shifts: pendingRightPadding, axis: 2)
+        self.values = dynamicRoll(values, shifts: pendingRightPadding, axis: 2)
+        offsets = offsets - pendingRightPadding
+        leftPaddingStorage = leftPaddingStorage + pendingRightPadding
+        self.pendingRightPadding = nil
     }
 
     public static func fromSingle(
@@ -382,6 +408,7 @@ public class BatchRotatingKVCache: BaseKVCache {
     private var idx: Int = 0
     private var offsetCursor: Int = 0
     private var rotated = false
+    private var pendingLengths: MLXArray?
 
     public override var maxSize: Int? { maxWindowSize }
     public override var isTrimmable: Bool { offsetCursor < maxWindowSize }
@@ -562,6 +589,62 @@ public class BatchRotatingKVCache: BaseKVCache {
         offset = offsetCursor
     }
 
+    public func prepare(lengths: [Int]?, rightPadding: [Int]?) {
+        guard let rightPadding, rightPadding.contains(where: { $0 > 0 }) else {
+            pendingLengths = nil
+            return
+        }
+        let prefixLengths = lengths ?? Array(repeating: 0, count: rightPadding.count)
+        pendingLengths = MLXArray(prefixLengths) + offsets
+    }
+
+    public func finalizeBatchPrefill() {
+        guard let pendingLengths,
+            let keys,
+            let values
+        else {
+            self.pendingLengths = nil
+            return
+        }
+
+        let roll = maximum(MLXArray(0), offsets - pendingLengths)
+        self.keys = dynamicRoll(keys, shifts: roll, axis: 2)
+        self.values = dynamicRoll(values, shifts: roll, axis: 2)
+        leftPadding = leftPadding + roll
+        offsets = offsets - roll
+        self.pendingLengths = nil
+    }
+
+    public func extract(index: Int) -> RotatingKVCache {
+        let cache = RotatingKVCache(maxSize: maxWindowSize, keep: 0)
+        guard let keys, let values else { return cache }
+
+        let padding = leftPadding[index].item(Int.self)
+        let offsetValue = offsets[index].item(Int.self)
+
+        var extractedKeys = keys[index ..< (index + 1), .ellipsis]
+        var extractedValues = values[index ..< (index + 1), .ellipsis]
+        var extractedIndex = idx
+
+        if rotated {
+            extractedKeys = MLX.roll(extractedKeys, shift: -idx, axis: 2)
+            extractedValues = MLX.roll(extractedValues, shift: -idx, axis: 2)
+            extractedIndex = maxWindowSize
+        }
+
+        cache.state = [
+            extractedKeys[.ellipsis, padding ..< extractedIndex, 0...],
+            extractedValues[.ellipsis, padding ..< extractedIndex, 0...],
+        ]
+        cache.metaState = [
+            String(0),
+            String(maxWindowSize),
+            String(offsetValue),
+            String(min(extractedIndex - padding, maxWindowSize)),
+        ]
+        return cache
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offsetCursor, n)
@@ -656,6 +739,17 @@ public class BatchRotatingKVCache: BaseKVCache {
                 self.values = currentValues[.ellipsis, ..<idx, 0...]
             }
 
+            if let pendingLengths,
+                let currentKeys = self.keys,
+                let currentValues = self.values
+            {
+                let roll = maximum(MLXArray(0), offsets - pendingLengths)
+                self.keys = dynamicRoll(currentKeys, shifts: roll, axis: 2)
+                self.values = dynamicRoll(currentValues, shifts: roll, axis: 2)
+                leftPadding = leftPadding + roll
+                offsets = offsets - roll
+            }
+
             let trimSize = idx - maxWindowSize + 1
             if trimSize > 0 {
                 leftPadding = leftPadding - MLXArray(trimSize)
@@ -683,6 +777,10 @@ public class BatchRotatingKVCache: BaseKVCache {
     }
 
     private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if pendingLengths != nil {
+            fatalError("finalizeBatchPrefill() must be called before decode with BatchRotatingKVCache")
+        }
+
         let tokenCount = keys.dim(2)
         let batch = keys.dim(0)
         let kvHeads = keys.dim(1)
@@ -744,4 +842,25 @@ public class BatchRotatingKVCache: BaseKVCache {
 
         return (self.keys!, self.values!)
     }
+}
+
+private func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
+    let normalizedAxis = axis >= 0 ? axis : x.ndim + axis
+    let size = x.dim(normalizedAxis)
+
+    var indexShape = Array(repeating: 1, count: x.ndim)
+    indexShape[0] = x.dim(0)
+    indexShape[normalizedAxis] = size
+
+    let base = broadcast(
+        MLXArray(Int32(0) ..< Int32(size)).reshaped(indexShape),
+        to: x.shape
+    )
+
+    var shiftShape = Array(repeating: 1, count: x.ndim)
+    shiftShape[0] = x.dim(0)
+    let expandedShifts = broadcast(shifts.reshaped(shiftShape), to: x.shape)
+
+    let indices = (base - expandedShifts.asType(.int32) + Int32(size)) % Int32(size)
+    return take(x, indices, axis: normalizedAxis)
 }

@@ -1042,6 +1042,7 @@ public class ChunkedKVCache: KVCacheSimple {
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     private var leftPadding: MLXArray?
+    private var lengths: MLXArray?
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
@@ -1071,12 +1072,22 @@ public class ArraysCache: BaseKVCache {
         leftPadding = MLXArray(padding)
     }
 
+    public func prepare(lengths: [Int]? = nil) {
+        self.lengths = lengths.map { MLXArray($0) }
+    }
+
+    public func finalizeBatchPrefill() {
+        lengths = nil
+        leftPadding = nil
+    }
+
     /// In-place filter to keep just the given indices in the cache
     public func filter(batchIndices: MLXArray) {
         cache = cache.map { c in
             c?[batchIndices]
         }
         leftPadding = nil
+        lengths = nil
     }
 
     /// In-place extend this cache with the other cache
@@ -1088,12 +1099,21 @@ public class ArraysCache: BaseKVCache {
             return c ?? o
         }
         leftPadding = nil
+        lengths = nil
+    }
+
+    public func extract(index: Int) -> ArraysCache {
+        let extracted = ArraysCache(size: cache.count)
+        extracted.cache = cache.map { $0?[index ..< (index + 1)] }
+        return extracted
     }
 
     /// Create attention mask based on left padding
     public func makeMask(N: Int) -> MLXArray? {
-        if cache[0] == nil, let leftPadding = leftPadding {
+        if let leftPadding {
             return MLXArray(0 ..< N) .>= leftPadding[0..., .newAxis]
+        } else if let lengths {
+            return MLXArray(0 ..< N) .< lengths[0..., .newAxis]
         } else {
             return nil
         }
@@ -1191,6 +1211,59 @@ public class CacheList: BaseKVCache {
                 lhs.extend(other: rhs)
             } else {
                 fatalError("\(type(of: cache)) does not support batched extension")
+            }
+        }
+    }
+
+    public func extract(index: Int) -> CacheList {
+        CacheList(
+            caches.map { cache in
+                switch cache {
+                case let batchCache as BatchKVCache:
+                    return batchCache.extract(index: index)
+                case let rotatingCache as BatchRotatingKVCache:
+                    return rotatingCache.extract(index: index)
+                case let arraysCache as ArraysCache:
+                    return arraysCache.extract(index: index)
+                case let listCache as CacheList:
+                    return listCache.extract(index: index)
+                default:
+                    fatalError("\(type(of: cache)) does not support batched extraction")
+                }
+            }
+        )
+    }
+
+    public func prepare(lengths: [Int]? = nil, rightPadding: [Int]? = nil) {
+        for cache in caches {
+            switch cache {
+            case let batchCache as BatchKVCache:
+                batchCache.prepare(rightPadding: rightPadding)
+            case let rotatingCache as BatchRotatingKVCache:
+                rotatingCache.prepare(lengths: lengths, rightPadding: rightPadding)
+            case let arraysCache as ArraysCache:
+                arraysCache.prepare(lengths: lengths)
+            case let listCache as CacheList:
+                listCache.prepare(lengths: lengths, rightPadding: rightPadding)
+            default:
+                break
+            }
+        }
+    }
+
+    public func finalizeBatchPrefill() {
+        for cache in caches {
+            switch cache {
+            case let batchCache as BatchKVCache:
+                batchCache.finalizeBatchPrefill()
+            case let rotatingCache as BatchRotatingKVCache:
+                rotatingCache.finalizeBatchPrefill()
+            case let arraysCache as ArraysCache:
+                arraysCache.finalizeBatchPrefill()
+            case let listCache as CacheList:
+                listCache.finalizeBatchPrefill()
+            default:
+                break
             }
         }
     }

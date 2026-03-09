@@ -160,6 +160,30 @@ struct BatchKVCacheTests {
         #expect(filtered.extract(index: 0).offset == 12)
     }
 
+    @Test("BatchKVCache finalizes right-padded cached prefill back to left-padded decode state")
+    func testFinalizeRightPaddedPrefill() {
+        let caches = BatchKVCache.fromSingle(
+            perSequenceCaches: [
+                [makeSimpleCache(seqLen: 4)],
+                [makeSimpleCache(seqLen: 2)],
+            ]
+        )
+        let cache = caches[0]
+
+        cache.prepare(rightPadding: [0, 2])
+
+        let keys = MLXArray.ones([2, 4, 3, 32])
+        let values = MLXArray.ones([2, 4, 3, 32]) * 2
+        _ = cache.update(keys: keys, values: values)
+        cache.finalizeBatchPrefill()
+        eval(cache.state)
+
+        #expect(cache.leftPadding == [0, 4])
+        #expect(cache.offsets.asArray(Int.self) == [7, 3])
+        #expect(cache.extract(index: 0).offset == 7)
+        #expect(cache.extract(index: 1).offset == 3)
+    }
+
     // MARK: - extract
 
     @Test("BatchKVCache.extract returns single-sequence cache")
@@ -220,6 +244,30 @@ struct BatchKVCacheTests {
         default:
             Issue.record("Expected .array mask for decode with left-padding")
         }
+    }
+
+    @Test("BatchRotatingKVCache finalizes right-padded cached prefill back to left-padded decode state")
+    func testRotatingCacheFinalizeRightPaddedPrefill() {
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 2])
+        cache.state = [
+            MLXArray.ones([2, 4, 4, 32]),
+            MLXArray.ones([2, 4, 4, 32]) * 2,
+            MLXArray([4, 2]),
+            MLXArray([0, 2]),
+        ]
+        cache.metaState = ["8", "4", "4", "0"]
+
+        cache.prepare(lengths: [3, 1], rightPadding: [0, 2])
+
+        let keys = MLXArray.ones([2, 4, 3, 32]) * 3
+        let values = MLXArray.ones([2, 4, 3, 32]) * 4
+        _ = cache.update(keys: keys, values: values)
+        cache.finalizeBatchPrefill()
+        eval(cache.state)
+
+        #expect(cache.offsets.asArray(Int.self) == [7, 3])
+        #expect(cache.extract(index: 0).offset == 7)
+        #expect(cache.extract(index: 1).offset == 3)
     }
 }
 
@@ -438,6 +486,58 @@ struct BatchTokenIteratorTests {
         if case .some(.stop) = secondStep[2]?.stopReason {
         } else {
             Issue.record("Expected cached prompt batch to stop on EOS")
+        }
+    }
+
+    @Test("Iterator batches cached prompts with variable suffix lengths")
+    func testIteratorBatchesCachedPromptsWithVariableSuffixLengths() {
+        let model = DeterministicBatchLanguageModel(
+            transitions: [
+                10: 11,
+                11: 12,
+                12: 3,
+                20: 4,
+                3: 0,
+                4: 0,
+            ]
+        )
+
+        var iterator = BatchTokenIterator(
+            model: model,
+            configuration: BatchIteratorConfiguration(
+                completionBatchSize: 4,
+                prefillBatchSize: 4,
+                generation: GenerateParameters(maxTokens: 2, temperature: 0)
+            ),
+            stopTokens: [0],
+            unknownTokenId: nil
+        )
+
+        iterator.insert(
+            uids: [1, 2],
+            prompts: [[10, 11, 12], [20]],
+            promptCaches: [[makeSimpleTestCache(seqLen: 6)], [makeSimpleTestCache(seqLen: 2)]],
+            maxTokens: [2, 2],
+            samplers: [ArgMaxSampler(), ArgMaxSampler()],
+            processors: [nil, nil]
+        )
+
+        let firstStep = Dictionary(uniqueKeysWithValues: (iterator.next() ?? []).map { ($0.uid, $0) })
+        #expect(firstStep[1]?.token == 3)
+        #expect(firstStep[2]?.token == 4)
+        #expect(firstStep[1]?.stopReason == nil)
+        #expect(firstStep[2]?.stopReason == nil)
+
+        let secondStep = Dictionary(uniqueKeysWithValues: (iterator.next() ?? []).map { ($0.uid, $0) })
+        #expect(secondStep[1]?.token == 0)
+        #expect(secondStep[2]?.token == 0)
+        if case .some(.stop) = secondStep[1]?.stopReason {
+        } else {
+            Issue.record("Expected cached prompt batch with variable suffix lengths to stop on EOS")
+        }
+        if case .some(.stop) = secondStep[2]?.stopReason {
+        } else {
+            Issue.record("Expected cached prompt batch with variable suffix lengths to stop on EOS")
         }
     }
 }
