@@ -260,6 +260,7 @@ struct InferenceSchedulerConfigTests {
         #expect(config.completionBatchSize == 4)
         #expect(config.prefillBatchSize == 4)
         #expect(config.maxQueueSize == 32)
+        #expect(config.maxConcurrentLanes == 2)
     }
 
     @Test("Custom config values are preserved")
@@ -267,16 +268,80 @@ struct InferenceSchedulerConfigTests {
         let config = InferenceScheduler.Config(
             completionBatchSize: 8,
             prefillBatchSize: 2,
-            maxQueueSize: 16
+            maxQueueSize: 16,
+            maxConcurrentLanes: 3
         )
         #expect(config.completionBatchSize == 8)
         #expect(config.prefillBatchSize == 2)
         #expect(config.maxQueueSize == 16)
+        #expect(config.maxConcurrentLanes == 3)
+    }
+}
+
+@Suite("InferenceScheduler")
+struct InferenceSchedulerTests {
+
+    @Test("Scheduler enforces the configured outstanding request limit")
+    func testQueueFull() async throws {
+        let tokenizer = DeterministicTokenizer()
+        let configuration = ModelConfiguration(id: "test")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let scheduler = InferenceScheduler(
+            context: ModelContext(
+                configuration: configuration,
+                model: SlowDeterministicBatchLanguageModel(transitions: [1: 2, 2: 2]),
+                processor: processor,
+                tokenizer: tokenizer
+            ),
+            config: .init(
+                completionBatchSize: 1,
+                prefillBatchSize: 1,
+                maxQueueSize: 0,
+                maxConcurrentLanes: 1
+            )
+        )
+
+        _ = try await scheduler.submit(
+            InferenceRequest(
+                input: LMInput(tokens: MLXArray([Int32(1)])),
+                parameters: GenerateParameters(maxTokens: 32, temperature: 0)
+            )
+        )
+
+        do {
+            _ = try await scheduler.submit(
+                InferenceRequest(
+                    input: LMInput(tokens: MLXArray([Int32(1)])),
+                    parameters: GenerateParameters(maxTokens: 32, temperature: 0)
+                )
+            )
+            Issue.record("Expected the scheduler to reject the second request")
+        } catch InferenceScheduler.SchedulerError.queueFull {
+        } catch {
+            Issue.record("Expected queueFull but received \(error)")
+        }
+
+        await scheduler.cancelAll()
     }
 }
 
 @Suite("BatchTokenIterator")
 struct BatchTokenIteratorTests {
+
+    @Test("Prompt cache length contributes to batching order")
+    func testEffectivePromptLengthIncludesPromptCache() {
+        let cache = makeSimpleTestCache(seqLen: 6)
+        let nested = CacheList(cache)
+
+        #expect(promptCacheLength([cache]) == 6)
+        #expect(promptCacheLength([nested]) == 6)
+        #expect(effectivePromptLength(tokens: [1, 2], promptCache: [cache]) == 8)
+        #expect(effectivePromptLength(tokens: [1, 2], promptCache: nil) == 2)
+    }
 
     @Test("Iterator emits the prefetched first token and stops immediately on prefetched EOS")
     func testIteratorFirstTokenAndPrefetchedEOS() {
@@ -324,6 +389,56 @@ struct BatchTokenIteratorTests {
         #expect(secondStep.count == 1)
         #expect(secondStep.first?.uid == 1)
         #expect(secondStep.first?.token == 4)
+    }
+
+    @Test("Iterator batches cached prompts and continues decoding")
+    func testIteratorBatchesCachedPrompts() {
+        let model = DeterministicBatchLanguageModel(
+            transitions: [
+                10: 3,
+                20: 4,
+                3: 0,
+                4: 0,
+            ]
+        )
+
+        var iterator = BatchTokenIterator(
+            model: model,
+            configuration: BatchIteratorConfiguration(
+                completionBatchSize: 4,
+                prefillBatchSize: 4,
+                generation: GenerateParameters(maxTokens: 2, temperature: 0)
+            ),
+            stopTokens: [0],
+            unknownTokenId: nil
+        )
+
+        iterator.insert(
+            uids: [1, 2],
+            prompts: [[10], [20]],
+            promptCaches: [[makeSimpleTestCache(seqLen: 6)], [makeSimpleTestCache(seqLen: 2)]],
+            maxTokens: [2, 2],
+            samplers: [ArgMaxSampler(), ArgMaxSampler()],
+            processors: [nil, nil]
+        )
+
+        let firstStep = Dictionary(uniqueKeysWithValues: (iterator.next() ?? []).map { ($0.uid, $0) })
+        #expect(firstStep[1]?.token == 3)
+        #expect(firstStep[2]?.token == 4)
+        #expect(firstStep[1]?.stopReason == nil)
+        #expect(firstStep[2]?.stopReason == nil)
+
+        let secondStep = Dictionary(uniqueKeysWithValues: (iterator.next() ?? []).map { ($0.uid, $0) })
+        #expect(secondStep[1]?.token == 0)
+        #expect(secondStep[2]?.token == 0)
+        if case .some(.stop) = secondStep[1]?.stopReason {
+        } else {
+            Issue.record("Expected cached prompt batch to stop on EOS")
+        }
+        if case .some(.stop) = secondStep[2]?.stopReason {
+        } else {
+            Issue.record("Expected cached prompt batch to stop on EOS")
+        }
     }
 }
 
@@ -428,6 +543,17 @@ struct BatchingHelperTests {
     }
 }
 
+private func makeSimpleTestCache(nHeads: Int = 8, headDim: Int = 64, seqLen: Int) -> KVCacheSimple {
+    let cache = KVCacheSimple()
+    if seqLen > 0 {
+        let k = MLXArray.ones([1, nHeads, seqLen, headDim])
+        let v = MLXArray.ones([1, nHeads, seqLen, headDim]) * 2
+        _ = cache.update(keys: k, values: v)
+        eval(k, v)
+    }
+    return cache
+}
+
 private struct DeterministicTokenizer: Tokenizer {
     private let tokens: [Int: String] = [
         0: "<eos>",
@@ -525,6 +651,13 @@ private class DeterministicBatchLanguageModel: Module, LanguageModel {
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         [KVCacheSimple()]
+    }
+}
+
+private final class SlowDeterministicBatchLanguageModel: DeterministicBatchLanguageModel {
+    override func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        Thread.sleep(forTimeInterval: 0.05)
+        return super.callAsFunction(inputs, cache: cache)
     }
 }
 

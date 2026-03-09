@@ -58,11 +58,10 @@ public actor InferenceScheduler {
     private struct LaneState {
         var pendingQueue: [PendingEntry] = []
         var iterator: BatchTokenIterator?
-        var decodeTask: Task<Void, Never>?
         var cancelledUIDs = Set<Int>()
 
         var hasWork: Bool {
-            iterator != nil || !pendingQueue.isEmpty
+            iterator != nil || !pendingQueue.isEmpty || !cancelledUIDs.isEmpty
         }
     }
 
@@ -72,10 +71,13 @@ public actor InferenceScheduler {
     private let unknownTokenId: Int?
 
     private var lanes: [BatchExecutionOptions: LaneState] = [:]
+    private var activeLaneOrder: [BatchExecutionOptions] = []
     private var deferredQueues: [BatchExecutionOptions: [PendingEntry]] = [:]
     private var deferredLaneOrder: [BatchExecutionOptions] = []
     private var sequences: [Int: SequenceState] = [:]
     private var sequenceLaneKeys: [Int: BatchExecutionOptions] = [:]
+    private var runLoopTask: Task<Void, Never>?
+    private var nextLaneIndex = 0
     private var nextUID = 0
 
     public init(context: ModelContext, config: Config = Config()) {
@@ -167,20 +169,20 @@ public actor InferenceScheduler {
     }
 
     public func cancelAll() {
-        let tasks = lanes.values.compactMap(\.decodeTask)
-        for task in tasks {
-            task.cancel()
-        }
+        runLoopTask?.cancel()
+        runLoopTask = nil
 
         for sequence in sequences.values {
             sequence.finish(stopReason: .cancelled)
         }
 
         lanes.removeAll()
+        activeLaneOrder.removeAll()
         deferredQueues.removeAll()
         deferredLaneOrder.removeAll()
         sequences.removeAll()
         sequenceLaneKeys.removeAll()
+        nextLaneIndex = 0
     }
 
     private func enqueue(_ entry: PendingEntry) {
@@ -189,7 +191,7 @@ public actor InferenceScheduler {
         if var lane = lanes[laneKey] {
             lane.pendingQueue.append(entry)
             lanes[laneKey] = lane
-            ensureDecodeLoopRunning(for: laneKey)
+            ensureRunLoopRunning()
             return
         }
 
@@ -197,8 +199,8 @@ public actor InferenceScheduler {
             var lane = LaneState()
             lane.pendingQueue = takeDeferredEntries(for: laneKey)
             lane.pendingQueue.append(entry)
-            lanes[laneKey] = lane
-            ensureDecodeLoopRunning(for: laneKey)
+            activateLane(lane, for: laneKey)
+            ensureRunLoopRunning()
             return
         }
 
@@ -206,6 +208,7 @@ public actor InferenceScheduler {
         if !deferredLaneOrder.contains(laneKey) {
             deferredLaneOrder.append(laneKey)
         }
+        ensureRunLoopRunning()
     }
 
     private func takeDeferredEntries(for laneKey: BatchExecutionOptions) -> [PendingEntry] {
@@ -214,88 +217,139 @@ public actor InferenceScheduler {
         return entries
     }
 
-    private func ensureDecodeLoopRunning(for laneKey: BatchExecutionOptions) {
-        guard var lane = lanes[laneKey], lane.decodeTask == nil else { return }
-        lane.decodeTask = Task { [weak self] in
-            await self?.runDecodeLoop(for: laneKey)
-        }
+    private func activateLane(_ lane: LaneState, for laneKey: BatchExecutionOptions) {
         lanes[laneKey] = lane
+        if !activeLaneOrder.contains(laneKey) {
+            activeLaneOrder.append(laneKey)
+        }
     }
 
-    private func runDecodeLoop(for laneKey: BatchExecutionOptions) async {
-        defer { finishDecodeLoop(for: laneKey) }
+    private func ensureRunLoopRunning() {
+        guard runLoopTask == nil else { return }
+        runLoopTask = Task { [weak self] in
+            await self?.runLoop()
+        }
+    }
+
+    private func runLoop() async {
+        defer { finishRunLoop() }
 
         while !Task.isCancelled {
-            applyCancelledSequences(in: laneKey)
-            admitPending(in: laneKey)
+            activateDeferredLanesIfPossible()
 
-            guard let lane = lanes[laneKey] else {
+            guard let laneKey = nextRunnableLane() else {
                 break
             }
 
-            guard let localIterator = lane.iterator else {
-                if lane.pendingQueue.isEmpty {
-                    break
-                }
-                await Task.yield()
-                continue
-            }
-
-            let snapshot = localIterator
-            let result = try? await DeviceEngine.shared.run {
-                var iterator = snapshot
-                let responses = iterator.next()
-                return (responses, iterator)
-            }
-            guard let (responses, updatedIterator) = result else {
-                break
-            }
-
-            guard var lane = lanes[laneKey] else {
-                break
-            }
-
-            lane.iterator = updatedIterator
-            lanes[laneKey] = lane
-
-            applyCancelledSequences(in: laneKey)
-            if let responses {
-                processStepResults(responses)
-            }
-
-            if var refreshedLane = lanes[laneKey], refreshedLane.iterator?.hasWork == false {
-                refreshedLane.iterator = nil
-                lanes[laneKey] = refreshedLane
-            }
-
-            if let refreshedLane = lanes[laneKey], !refreshedLane.hasWork {
-                break
-            }
-
+            await processNextStep(in: laneKey)
             await Task.yield()
-        }
-
-        applyCancelledSequences(in: laneKey)
-        if Task.isCancelled, var lane = lanes[laneKey] {
-            lane.iterator = nil
-            lanes[laneKey] = lane
         }
     }
 
-    private func finishDecodeLoop(for laneKey: BatchExecutionOptions) {
-        guard var lane = lanes[laneKey] else {
+    private func finishRunLoop() {
+        runLoopTask = nil
+        compactIdleLanes()
+        activateDeferredLanesIfPossible()
+
+        if hasOutstandingWork {
+            ensureRunLoopRunning()
+        }
+    }
+
+    private var hasOutstandingWork: Bool {
+        !lanes.isEmpty || deferredLaneOrder.contains { deferredQueues[$0]?.isEmpty == false }
+    }
+
+    private func nextRunnableLane() -> BatchExecutionOptions? {
+        compactIdleLanes()
+        guard !activeLaneOrder.isEmpty else { return nil }
+
+        let laneCount = activeLaneOrder.count
+        for offset in 0 ..< laneCount {
+            let index = (nextLaneIndex + offset) % laneCount
+            let laneKey = activeLaneOrder[index]
+            guard let lane = lanes[laneKey], lane.hasWork else { continue }
+            nextLaneIndex = (index + 1) % laneCount
+            return laneKey
+        }
+        return nil
+    }
+
+    private func compactIdleLanes() {
+        let idleLaneKeys = activeLaneOrder.filter { !(lanes[$0]?.hasWork ?? false) }
+        for laneKey in idleLaneKeys {
+            removeLane(for: laneKey)
+        }
+    }
+
+    private func removeLane(for laneKey: BatchExecutionOptions) {
+        lanes.removeValue(forKey: laneKey)
+
+        guard let index = activeLaneOrder.firstIndex(of: laneKey) else {
+            return
+        }
+
+        activeLaneOrder.remove(at: index)
+
+        if activeLaneOrder.isEmpty {
+            nextLaneIndex = 0
+        } else {
+            if index < nextLaneIndex {
+                nextLaneIndex -= 1
+            }
+            nextLaneIndex %= activeLaneOrder.count
+        }
+    }
+
+    private func processNextStep(in laneKey: BatchExecutionOptions) async {
+        applyCancelledSequences(in: laneKey)
+        admitPending(in: laneKey)
+
+        guard let lane = lanes[laneKey] else {
+            return
+        }
+
+        guard let localIterator = lane.iterator else {
+            if !lane.hasWork {
+                removeLane(for: laneKey)
+                activateDeferredLanesIfPossible()
+            }
+            return
+        }
+
+        let snapshot = localIterator
+        let result = try? await DeviceEngine.shared.run {
+            var iterator = snapshot
+            let responses = iterator.next()
+            return (responses, iterator)
+        }
+
+        guard let (responses, updatedIterator) = result else {
+            removeLane(for: laneKey)
             activateDeferredLanesIfPossible()
             return
         }
 
-        lane.decodeTask = nil
-        if lane.hasWork {
-            lanes[laneKey] = lane
-        } else {
-            lanes.removeValue(forKey: laneKey)
+        guard var refreshedLane = lanes[laneKey] else {
+            return
+        }
+        refreshedLane.iterator = updatedIterator
+        lanes[laneKey] = refreshedLane
+
+        applyCancelledSequences(in: laneKey)
+        if let responses {
+            processStepResults(responses)
         }
 
-        activateDeferredLanesIfPossible()
+        if var latestLane = lanes[laneKey], latestLane.iterator?.hasWork == false {
+            latestLane.iterator = nil
+            lanes[laneKey] = latestLane
+        }
+
+        if let latestLane = lanes[laneKey], !latestLane.hasWork {
+            removeLane(for: laneKey)
+            activateDeferredLanesIfPossible()
+        }
     }
 
     private func activateDeferredLanesIfPossible() {
@@ -305,8 +359,7 @@ public actor InferenceScheduler {
 
             var lane = LaneState()
             lane.pendingQueue = entries
-            lanes[laneKey] = lane
-            ensureDecodeLoopRunning(for: laneKey)
+            activateLane(lane, for: laneKey)
         }
     }
 

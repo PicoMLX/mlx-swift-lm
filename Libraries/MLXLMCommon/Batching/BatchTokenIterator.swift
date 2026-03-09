@@ -53,7 +53,7 @@ private struct PendingPrompt {
     let sampler: any LogitSampler
     var processor: BatchLogitProcessorBox?
 
-    var length: Int { tokens.count }
+    var length: Int { effectivePromptLength(tokens: tokens, promptCache: promptCache) }
 }
 
 private struct PrefilledPrompt {
@@ -316,23 +316,37 @@ struct BatchTokenIterator {
     }
 
     private mutating func processPrompts(_ prompts: [PendingPrompt]) -> ActiveBatch {
-        let cachedPrompts = prompts.filter { $0.promptCache != nil }
-        let freshPrompts = prompts.filter { $0.promptCache == nil }
-
-        var batches: [ActiveBatch] = []
-        if !freshPrompts.isEmpty {
-            batches.append(processFreshPrompts(freshPrompts))
-        }
-        if !cachedPrompts.isEmpty {
-            batches.append(processCachedPrompts(cachedPrompts))
-        }
-
-        guard let batch = batches.first else {
+        guard var start = prompts.indices.first else {
             fatalError("processPrompts requires at least one prompt")
         }
-        for nextBatch in batches.dropFirst() {
-            batch.extend(nextBatch)
+
+        let firstUsesPromptCache = prompts[start].promptCache != nil
+        var end = start + 1
+        while end < prompts.endIndex, (prompts[end].promptCache != nil) == firstUsesPromptCache {
+            end += 1
         }
+
+        let firstBatch = firstUsesPromptCache
+            ? processCachedPrompts(Array(prompts[start..<end]))
+            : processFreshPrompts(Array(prompts[start..<end]))
+
+        let batch = firstBatch
+        start = end
+
+        while start < prompts.endIndex {
+            let usesPromptCache = prompts[start].promptCache != nil
+            end = start + 1
+            while end < prompts.endIndex, (prompts[end].promptCache != nil) == usesPromptCache {
+                end += 1
+            }
+
+            let nextBatch = usesPromptCache
+                ? processCachedPrompts(Array(prompts[start..<end]))
+                : processFreshPrompts(Array(prompts[start..<end]))
+            batch.extend(nextBatch)
+            start = end
+        }
+
         return batch
     }
 
@@ -536,6 +550,23 @@ struct BatchTokenIterator {
 }
 
 extension BatchTokenIterator: @unchecked Sendable {}
+
+func effectivePromptLength(tokens: [Int], promptCache: [KVCache]?) -> Int {
+    tokens.count + promptCacheLength(promptCache)
+}
+
+func promptCacheLength(_ promptCache: [KVCache]?) -> Int {
+    promptCache?.map(cacheSequenceLength).max() ?? 0
+}
+
+private func cacheSequenceLength(_ cache: KVCache) -> Int {
+    switch cache {
+    case let list as CacheList:
+        return (0 ..< list.count).map { cacheSequenceLength(list[$0]) }.max() ?? 0
+    default:
+        return cache.offset
+    }
+}
 
 private func leftPadPrompts(_ prompts: [[Int]]) -> (MLXArray, [Int]) {
     guard let maxLength = prompts.map(\.count).max() else {
