@@ -3,18 +3,38 @@ import MLX
 import MLXLMCommon
 import Testing
 
+enum CacheFactory: String, CaseIterable, Sendable {
+    case simple
+    case rotating
+    case quantized
+    case chunked
+    case arrays
+    case mamba
+
+    func make() -> any KVCache {
+        switch self {
+        case .simple:
+            return KVCacheSimple()
+        case .rotating:
+            return RotatingKVCache(maxSize: 32)
+        case .quantized:
+            return QuantizedKVCache()
+        case .chunked:
+            return ChunkedKVCache(chunkSize: 16)
+        case .arrays:
+            return ArraysCache(size: 2)
+        case .mamba:
+            return MambaCache()
+        }
+    }
+}
+
 @Test(
     .serialized,
-    arguments: [
-        ({ KVCacheSimple() }),
-        ({ RotatingKVCache(maxSize: 32) }),
-        ({ QuantizedKVCache() }),
-        ({ ChunkedKVCache(chunkSize: 16) }),
-        ({ ArraysCache(size: 2) }),
-        ({ MambaCache() }),
-    ])
-func testCacheSerialization(creator: (() -> any KVCache)) async throws {
-    let cache = (0 ..< 10).map { _ in creator() }
+    arguments: CacheFactory.allCases
+)
+func testCacheSerialization(factory: CacheFactory) async throws {
+    let cache = (0 ..< 10).map { _ in factory.make() }
     let keys = MLXArray.ones([1, 8, 32, 64], dtype: .bfloat16)
     let values = MLXArray.ones([1, 8, 32, 64], dtype: .bfloat16)
     for item in cache {

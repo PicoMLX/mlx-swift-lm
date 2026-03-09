@@ -162,18 +162,20 @@ struct BatchKVCacheTests {
 
     @Test("BatchKVCache finalizes right-padded cached prefill back to left-padded decode state")
     func testFinalizeRightPaddedPrefill() {
+        let nHeads = 4
+        let headDim = 32
         let caches = BatchKVCache.fromSingle(
             perSequenceCaches: [
-                [makeSimpleCache(seqLen: 4)],
-                [makeSimpleCache(seqLen: 2)],
+                [makeSimpleCache(nHeads: nHeads, headDim: headDim, seqLen: 4)],
+                [makeSimpleCache(nHeads: nHeads, headDim: headDim, seqLen: 2)],
             ]
         )
         let cache = caches[0]
 
         cache.prepare(rightPadding: [0, 2])
 
-        let keys = MLXArray.ones([2, 4, 3, 32])
-        let values = MLXArray.ones([2, 4, 3, 32]) * 2
+        let keys = MLXArray.ones([2, nHeads, 3, headDim])
+        let values = MLXArray.ones([2, nHeads, 3, headDim]) * 2
         _ = cache.update(keys: keys, values: values)
         cache.finalizeBatchPrefill()
         eval(cache.state)
@@ -268,6 +270,26 @@ struct BatchKVCacheTests {
         #expect(cache.offsets.asArray(Int.self) == [7, 3])
         #expect(cache.extract(index: 0).offset == 7)
         #expect(cache.extract(index: 1).offset == 3)
+    }
+
+    @Test("ArraysCache uses prepared lengths to build right-padded masks")
+    func testArraysCachePreparedLengthMask() {
+        let cache = ArraysCache(size: 1)
+        cache.prepare(lengths: [3, 1])
+
+        let mask = cache.makeMask(N: 4)
+        guard let mask else {
+            Issue.record("Expected ArraysCache to produce a mask from prepared lengths")
+            return
+        }
+
+        eval(mask)
+        #expect(mask.shape == [2, 4])
+        #expect(mask[0].asArray(Bool.self) == [true, true, true, false])
+        #expect(mask[1].asArray(Bool.self) == [true, false, false, false])
+
+        cache.finalizeBatchPrefill()
+        #expect(cache.makeMask(N: 4) == nil)
     }
 }
 
@@ -374,6 +396,111 @@ struct InferenceSchedulerTests {
         }
 
         await scheduler.cancelAll()
+    }
+
+    @Test("Scheduler batches mixed fresh and cached requests")
+    func testMixedFreshAndCachedRequests() async throws {
+        let tokenizer = DeterministicTokenizer()
+        let configuration = ModelConfiguration(id: "test")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let scheduler = InferenceScheduler(
+            context: ModelContext(
+                configuration: configuration,
+                model: DeterministicBatchLanguageModel(
+                    transitions: [
+                        10: 3,
+                        20: 4,
+                        3: 0,
+                        4: 0,
+                    ]
+                ),
+                processor: processor,
+                tokenizer: tokenizer
+            ),
+            config: .init(
+                completionBatchSize: 2,
+                prefillBatchSize: 2,
+                maxQueueSize: 8,
+                maxConcurrentLanes: 1
+            )
+        )
+
+        let freshStream = try await scheduler.submit(
+            InferenceRequest(
+                input: LMInput(tokens: MLXArray([Int32(10)])),
+                parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            )
+        )
+        let cachedStream = try await scheduler.submit(
+            InferenceRequest(
+                input: LMInput(tokens: MLXArray([Int32(20)])),
+                promptCache: [makeSimpleTestCache(seqLen: 6)],
+                parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            )
+        )
+
+        async let freshResult = collectGenerationStream(freshStream)
+        async let cachedResult = collectGenerationStream(cachedStream)
+
+        let (fresh, cached) = await (freshResult, cachedResult)
+
+        #expect(fresh.chunks == ["!"])
+        #expect(cached.chunks == ["done"])
+        #expect(stopReason(fresh.stopReason, matches: .stop))
+        #expect(stopReason(cached.stopReason, matches: .stop))
+
+        await scheduler.cancelAll()
+    }
+
+    @Test("Scheduler cancelAll finishes active and deferred streams")
+    func testCancelAllFinishesOutstandingStreams() async throws {
+        let tokenizer = DeterministicTokenizer()
+        let configuration = ModelConfiguration(id: "test")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let scheduler = InferenceScheduler(
+            context: ModelContext(
+                configuration: configuration,
+                model: SlowDeterministicBatchLanguageModel(transitions: [1: 2, 2: 2]),
+                processor: processor,
+                tokenizer: tokenizer
+            ),
+            config: .init(
+                completionBatchSize: 1,
+                prefillBatchSize: 1,
+                maxQueueSize: 8,
+                maxConcurrentLanes: 1
+            )
+        )
+
+        let activeStream = try await scheduler.submit(
+            InferenceRequest(
+                input: LMInput(tokens: MLXArray([Int32(1)])),
+                parameters: GenerateParameters(maxTokens: 32, temperature: 0, prefillStepSize: 1)
+            )
+        )
+        let deferredStream = try await scheduler.submit(
+            InferenceRequest(
+                input: LMInput(tokens: MLXArray([Int32(1)])),
+                parameters: GenerateParameters(maxTokens: 32, temperature: 0, prefillStepSize: 2)
+            )
+        )
+
+        async let activeResult = collectGenerationStream(activeStream)
+        async let deferredResult = collectGenerationStream(deferredStream)
+
+        await scheduler.cancelAll()
+
+        let (active, deferred) = await (activeResult, deferredResult)
+        #expect(stopReason(active.stopReason, matches: .cancelled))
+        #expect(stopReason(deferred.stopReason, matches: .cancelled))
     }
 }
 
@@ -539,6 +666,41 @@ struct BatchTokenIteratorTests {
         } else {
             Issue.record("Expected cached prompt batch with variable suffix lengths to stop on EOS")
         }
+    }
+
+    @Test("Iterator preserves effective-length order across fresh and cached prompt groups")
+    func testIteratorPreservesMixedPromptOrdering() {
+        let model = DeterministicBatchLanguageModel(
+            transitions: [
+                10: 1,
+                20: 2,
+                30: 3,
+            ]
+        )
+
+        var iterator = BatchTokenIterator(
+            model: model,
+            configuration: BatchIteratorConfiguration(
+                completionBatchSize: 4,
+                prefillBatchSize: 4,
+                generation: GenerateParameters(maxTokens: 2, temperature: 0)
+            ),
+            stopTokens: [0],
+            unknownTokenId: nil
+        )
+
+        iterator.insert(
+            uids: [1, 2, 3],
+            prompts: [[10, 10, 10, 10], [20], [30]],
+            promptCaches: [nil, [makeSimpleTestCache(seqLen: 2)], nil],
+            maxTokens: [2, 2, 2],
+            samplers: [ArgMaxSampler(), ArgMaxSampler(), ArgMaxSampler()],
+            processors: [nil, nil, nil]
+        )
+
+        let firstStep = iterator.next() ?? []
+        #expect(firstStep.map(\.uid) == [3, 2, 1])
+        #expect(firstStep.map(\.token) == [3, 2, 1])
     }
 }
 
@@ -768,5 +930,40 @@ private final class UnsupportedBatchLanguageModel: DeterministicBatchLanguageMod
 
     override func newCache(parameters: GenerateParameters?) -> [KVCache] {
         [QuantizedKVCache()]
+    }
+}
+
+private struct CollectedGenerationStream {
+    var chunks: [String] = []
+    var stopReason: GenerateStopReason?
+}
+
+private func collectGenerationStream(_ stream: AsyncStream<Generation>) async
+    -> CollectedGenerationStream
+{
+    var result = CollectedGenerationStream()
+
+    for await generation in stream {
+        switch generation {
+        case .chunk(let text):
+            result.chunks.append(text)
+        case .info(let info):
+            result.stopReason = info.stopReason
+        case .toolCall:
+            Issue.record("Unexpected tool call in batching test stream")
+        }
+    }
+
+    return result
+}
+
+private func stopReason(_ actual: GenerateStopReason?, matches expected: GenerateStopReason) -> Bool {
+    switch (actual, expected) {
+    case (.some(.stop), .stop),
+        (.some(.length), .length),
+        (.some(.cancelled), .cancelled):
+        return true
+    default:
+        return false
     }
 }

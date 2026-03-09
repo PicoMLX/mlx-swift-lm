@@ -330,6 +330,13 @@ public class BatchKVCache: BaseKVCache {
             fatalError("BatchKVCache missing backing storage")
         }
 
+        validateIncomingShapes(
+            keys: keys,
+            values: values,
+            currentKeys: currentKeys,
+            currentValues: currentValues
+        )
+
         let tokenCount = keys.dim(2)
         if previousLength + tokenCount <= currentKeys.dim(2) {
             return
@@ -358,6 +365,35 @@ public class BatchKVCache: BaseKVCache {
         return (
             MLXArray.zeros([batch, kvHeads, capacity, keyDim], dtype: keys.dtype),
             MLXArray.zeros([batch, kvHeads, capacity, valueDim], dtype: values.dtype)
+        )
+    }
+
+    private func validateIncomingShapes(
+        keys: MLXArray,
+        values: MLXArray,
+        currentKeys: MLXArray,
+        currentValues: MLXArray
+    ) {
+        precondition(keys.ndim == 4 && values.ndim == 4, "BatchKVCache expects rank-4 key/value tensors")
+        precondition(
+            currentKeys.dim(0) == keys.dim(0),
+            "BatchKVCache batch size mismatch: existing \(currentKeys.dim(0)) vs incoming \(keys.dim(0))"
+        )
+        precondition(
+            currentKeys.dim(1) == keys.dim(1),
+            "BatchKVCache key head count mismatch: existing \(currentKeys.dim(1)) vs incoming \(keys.dim(1))"
+        )
+        precondition(
+            currentValues.dim(1) == values.dim(1),
+            "BatchKVCache value head count mismatch: existing \(currentValues.dim(1)) vs incoming \(values.dim(1))"
+        )
+        precondition(
+            currentKeys.dim(3) == keys.dim(3),
+            "BatchKVCache key head dimension mismatch: existing \(currentKeys.dim(3)) vs incoming \(keys.dim(3))"
+        )
+        precondition(
+            currentValues.dim(3) == values.dim(3),
+            "BatchKVCache value head dimension mismatch: existing \(currentValues.dim(3)) vs incoming \(values.dim(3))"
         )
     }
 
@@ -639,6 +675,7 @@ public class BatchRotatingKVCache: BaseKVCache {
         cache.metaState = [
             String(0),
             String(maxWindowSize),
+            String(step),
             String(offsetValue),
             String(min(extractedIndex - padding, maxWindowSize)),
         ]
@@ -847,20 +884,36 @@ public class BatchRotatingKVCache: BaseKVCache {
 private func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
     let normalizedAxis = axis >= 0 ? axis : x.ndim + axis
     let size = x.dim(normalizedAxis)
+    guard x.ndim > 0, x.dim(0) > 0, size > 0 else {
+        return x
+    }
+    precondition(normalizedAxis == 2, "dynamicRoll currently supports cache sequence axis only")
 
-    var indexShape = Array(repeating: 1, count: x.ndim)
-    indexShape[0] = x.dim(0)
-    indexShape[normalizedAxis] = size
-
-    let base = broadcast(
-        MLXArray(Int32(0) ..< Int32(size)).reshaped(indexShape),
-        to: x.shape
+    let batch = x.dim(0)
+    let shiftValues = shifts.asArray(Int.self)
+    precondition(
+        shiftValues.count == batch,
+        "dynamicRoll expects one shift per batch element"
     )
 
-    var shiftShape = Array(repeating: 1, count: x.ndim)
-    shiftShape[0] = x.dim(0)
-    let expandedShifts = broadcast(shifts.reshaped(shiftShape), to: x.shape)
+    let rolledSlices = (0 ..< batch).map { index in
+        let slice = x[index ..< (index + 1), .ellipsis]
+        let shift = max(0, min(shiftValues[index], size))
+        guard shift > 0 else {
+            return slice
+        }
 
-    let indices = (base - expandedShifts.asType(.int32) + Int32(size)) % Int32(size)
-    return take(x, indices, axis: normalizedAxis)
+        if shift == size {
+            return MLXArray.zeros(slice.shape, dtype: slice.dtype)
+        }
+
+        let prefix = MLXArray.zeros(
+            [slice.dim(0), slice.dim(1), shift, slice.dim(3)],
+            dtype: slice.dtype
+        )
+        let body = slice[.ellipsis, ..<(size - shift), 0...]
+        return MLX.concatenated([prefix, body], axis: 2)
+    }
+
+    return MLX.concatenated(rolledSlices, axis: 0)
 }
