@@ -23,10 +23,6 @@ struct BatchIteratorConfiguration: Sendable {
     let completionBatchSize: Int
     let prefillBatchSize: Int
     let generation: GenerateParameters
-
-    var batchOptions: BatchExecutionOptions {
-        BatchExecutionOptions(parameters: generation)
-    }
 }
 
 struct BatchLogitProcessorBox: Sendable {
@@ -163,7 +159,6 @@ struct BatchTokenIterator {
     private var unprocessedPrompts: [PendingPrompt] = []
     private var activeBatch: ActiveBatch?
 
-    var batchOptions: BatchExecutionOptions { configuration.batchOptions }
     var batchSize: Int { activeBatch?.count ?? 0 }
     var hasWork: Bool { activeBatch != nil || !unprocessedPrompts.isEmpty }
 
@@ -353,41 +348,15 @@ struct BatchTokenIterator {
 
         var processors = prompts.map(\.processor)
         for index in processors.indices {
-            if var processor = processors[index] {
-                processor.prompt(MLXArray(tokenLists[index].map(Int32.init)))
-                processors[index] = processor
-            }
+            prepareProcessor(&processors[index], with: tokenLists[index])
         }
 
-        var remaining = padded
-        while remaining.dim(1) > 1 {
-            let nToProcess = min(configuration.generation.prefillStepSize, remaining.dim(1) - 1)
-            let slice = remaining[0..., ..<nToProcess]
-            _ = model(slice, cache: cache)
-            maybeQuantizeKVCache(
-                cache: &cache,
-                kvBits: configuration.generation.kvBits,
-                kvGroupSize: configuration.generation.kvGroupSize,
-                quantizedKVStart: configuration.generation.quantizedKVStart
-            )
-
-            let states = cache.flatMap(\.state)
-            if !states.isEmpty {
-                eval(states)
-            }
-
-            let length = remaining.dim(1)
-            remaining = remaining[0..., nToProcess..<length]
-            Memory.clearCache()
-        }
-
-        let firstTokens = step(
-            inputTokens: remaining,
+        let firstTokens = prefillAndSampleFirstTokens(
+            inputTokens: padded,
             cache: &cache,
             samplers: prompts.map(\.sampler),
             processors: &processors
         )
-        asyncEval(firstTokens)
 
         return ActiveBatch(
             uids: prompts.map(\.uid),
@@ -422,10 +391,7 @@ struct BatchTokenIterator {
         var processor = prompt.processor
         let input = LMInput(tokens: MLXArray(prompt.tokens.map(Int32.init)))
 
-        if var localProcessor = processor {
-            localProcessor.prompt(input.text.tokens)
-            processor = localProcessor
-        }
+        prepareProcessor(&processor, with: prompt.tokens)
 
         let firstToken: Int32
         do {
@@ -435,35 +401,9 @@ struct BatchTokenIterator {
                 windowSize: configuration.generation.prefillStepSize
             ) {
             case .tokens(let tokens):
-                var remaining = tokens.tokens
-                if remaining.ndim == 1 {
-                    remaining = remaining[.newAxis]
-                }
-
-                while remaining.dim(1) > 1 {
-                    let nToProcess = min(configuration.generation.prefillStepSize, remaining.dim(1) - 1)
-                    let slice = remaining[0..., ..<nToProcess]
-                    _ = model(slice, cache: cache)
-                    maybeQuantizeKVCache(
-                        cache: &cache,
-                        kvBits: configuration.generation.kvBits,
-                        kvGroupSize: configuration.generation.kvGroupSize,
-                        quantizedKVStart: configuration.generation.quantizedKVStart
-                    )
-
-                    let states = cache.flatMap(\.state)
-                    if !states.isEmpty {
-                        eval(states)
-                    }
-
-                    let length = remaining.dim(1)
-                    remaining = remaining[0..., nToProcess..<length]
-                    Memory.clearCache()
-                }
-
                 var processors = [processor]
-                firstToken = step(
-                    inputTokens: remaining,
+                firstToken = prefillAndSampleFirstTokens(
+                    inputTokens: tokens.tokens,
                     cache: &cache,
                     samplers: [prompt.sampler],
                     processors: &processors
@@ -489,6 +429,54 @@ struct BatchTokenIterator {
             sampler: prompt.sampler,
             processor: processor
         )
+    }
+
+    private func prepareProcessor(_ processor: inout BatchLogitProcessorBox?, with tokens: [Int]) {
+        guard var localProcessor = processor else { return }
+        localProcessor.prompt(MLXArray(tokens.map(Int32.init)))
+        processor = localProcessor
+    }
+
+    private mutating func prefillAndSampleFirstTokens(
+        inputTokens: MLXArray,
+        cache: inout [KVCache],
+        samplers: [any LogitSampler],
+        processors: inout [BatchLogitProcessorBox?]
+    ) -> MLXArray {
+        var remaining = inputTokens
+        if remaining.ndim == 1 {
+            remaining = remaining[.newAxis]
+        }
+
+        while remaining.dim(1) > 1 {
+            let nToProcess = min(configuration.generation.prefillStepSize, remaining.dim(1) - 1)
+            let slice = remaining[0..., ..<nToProcess]
+            _ = model(slice, cache: cache)
+            maybeQuantizeKVCache(
+                cache: &cache,
+                kvBits: configuration.generation.kvBits,
+                kvGroupSize: configuration.generation.kvGroupSize,
+                quantizedKVStart: configuration.generation.quantizedKVStart
+            )
+
+            let states = cache.flatMap(\.state)
+            if !states.isEmpty {
+                eval(states)
+            }
+
+            let length = remaining.dim(1)
+            remaining = remaining[0..., nToProcess..<length]
+            Memory.clearCache()
+        }
+
+        let firstTokens = step(
+            inputTokens: remaining,
+            cache: &cache,
+            samplers: samplers,
+            processors: &processors
+        )
+        asyncEval(firstTokens)
+        return firstTokens
     }
 
     private mutating func step(

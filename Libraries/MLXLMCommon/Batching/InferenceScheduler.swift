@@ -39,7 +39,6 @@ public actor InferenceScheduler {
 
     public enum SchedulerError: Error, Sendable {
         case queueFull
-        case modelNotReady
     }
 
     private struct PendingEntry {

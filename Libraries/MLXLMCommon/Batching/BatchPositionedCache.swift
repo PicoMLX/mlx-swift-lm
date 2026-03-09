@@ -7,16 +7,11 @@ import MLXNN
 /// Cache capability for batched caches that track per-sequence positions.
 public protocol BatchPositionedKVCache: KVCache {
     var offsets: MLXArray { get }
-    var batchLeftPadding: MLXArray { get }
 }
 
-extension BatchKVCache: BatchPositionedKVCache {
-    public var batchLeftPadding: MLXArray { state.count >= 4 ? state[3] : MLXArray([]) }
-}
+extension BatchKVCache: BatchPositionedKVCache {}
 
-extension BatchRotatingKVCache: BatchPositionedKVCache {
-    public var batchLeftPadding: MLXArray { state.count >= 4 ? state[3] : MLXArray([]) }
-}
+extension BatchRotatingKVCache: BatchPositionedKVCache {}
 
 public func batchedOffsets(for cache: KVCache?) -> MLXArray? {
     (cache as? any BatchPositionedKVCache)?.offsets

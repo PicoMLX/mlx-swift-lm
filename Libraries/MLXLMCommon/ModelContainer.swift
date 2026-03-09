@@ -35,14 +35,7 @@ public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
 
     /// Optional inference scheduler for concurrent/batched request handling.
-    ///
-    /// When set, ``generate(input:parameters:wiredMemoryTicket:)`` routes requests
-    /// through the scheduler instead of running single-sequence inference directly.
-    /// Multiple concurrent callers benefit from automatic batching.
-    ///
-    /// Set this during initialization via ``init(context:schedulerConfig:)`` or
-    /// assign it directly after creation.
-    public let scheduler: InferenceScheduler?
+    private let scheduler: InferenceScheduler?
 
     public var configuration: ModelConfiguration {
         get async {
