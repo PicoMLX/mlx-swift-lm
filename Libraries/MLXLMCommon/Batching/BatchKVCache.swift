@@ -4,212 +4,128 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Batched KV cache for multi-sequence inference.
-///
-/// Stores keys and values for all sequences in a batch in a single contiguous
-/// `[B, nHeads, seqLen, headDim]` tensor. Sequences with shorter prompts are
-/// left-padded with zeros so all sequences share the same `offset`.
-///
-/// ## Design Notes
-///
-/// - **Left-padding**: Shorter sequences are padded on the left so that all
-///   sequences in the batch are aligned at the right (most-recent token).
-///   This means `cache.offset` is the same for all sequences.
-///
-/// - **RoPE position approximation**: During batch decode, `cache.offset`
-///   (an `Int`) is used by models for all sequences. For sequences merged via
-///   the single-to-batch upgrade path (``fromSingle(_:leftPadding:)``), shorter
-///   sequences will have their decode-step RoPE position overestimated by
-///   `leftPadding[i]` positions. For simultaneous batch (all sequences prefilled
-///   together with the same padded length), RoPE positions are exact.
-///
-/// - **Attention mask**: The mask returned by ``makeMask(n:windowSize:returnArray:)``
-///   accounts for left-padding. However, many models use the deprecated
-///   `createAttentionMask(h:cache:)` helper which returns `nil` for single-token
-///   decode steps. In that case, padding positions are attended to (mild quality
-///   degradation). This will be fully resolved once models adopt the new
-///   `createAttentionMask(h:cache:windowSize:returnArray:)` API.
-///
-/// ## Usage
-///
-/// ```swift
-/// // Create from simultaneously-prefilled single-sequence caches
-/// let batchCaches = BatchKVCache.fromSingle(
-///     perSequenceCaches: [[cacheA_layer0, cacheA_layer1], [cacheB_layer0, cacheB_layer1]],
-///     leftPadding: [0, 20]   // B already padded 20 tokens on the left
-/// )
-/// ```
+/// Batch-aware KV cache with left-padding support and efficient batch merging.
 public class BatchKVCache: BaseKVCache {
 
-    // MARK: - Storage
+    public var step = 256
 
-    /// Batched keys: `[B, nHeads, seqLen, headDim]`
-    internal var batchKeys: MLXArray?
+    private var keys: MLXArray?
+    private var values: MLXArray?
+    public private(set) var offsets: MLXArray
+    private var leftPaddingStorage: MLXArray
+    private var currentLength: Int = 0
 
-    /// Batched values: `[B, nHeads, seqLen, headDim]`
-    internal var batchValues: MLXArray?
+    public var batchSize: Int { leftPaddingStorage.size }
+    public var leftPadding: [Int] { leftPaddingStorage.asArray(Int.self) }
 
-    /// Number of sequences in this batch.
-    public let batchSize: Int
+    public override var isTrimmable: Bool { true }
 
-    /// Per-sequence left-padding amounts.
-    ///
-    /// `leftPadding[i]` is the number of zero-value padding tokens prepended to
-    /// the start of sequence `i`'s key/value arrays.
-    public let leftPadding: [Int]
-
-    /// Allocation step size (keys/values grow in multiples of this).
-    public var step: Int = 256
-
-    // MARK: - Init
-
-    /// Create an empty BatchKVCache for `batchSize` sequences.
-    ///
-    /// - Parameters:
-    ///   - batchSize: Number of sequences in the batch.
-    ///   - leftPadding: Per-sequence left-padding lengths. Must have exactly `batchSize` elements.
     public init(batchSize: Int, leftPadding: [Int]) {
-        precondition(leftPadding.count == batchSize,
-                     "leftPadding must have exactly batchSize elements")
-        self.batchSize = batchSize
-        self.leftPadding = leftPadding
+        precondition(leftPadding.count == batchSize, "leftPadding must have exactly batchSize elements")
+        self.leftPaddingStorage = MLXArray(leftPadding)
+        self.offsets = MLXArray(leftPadding.map { -$0 })
         super.init()
     }
 
-    // MARK: - KVCache Protocol
+    public convenience init(leftPadding: [Int]) {
+        self.init(batchSize: leftPadding.count, leftPadding: leftPadding)
+    }
 
     public override func innerState() -> [MLXArray] {
-        [batchKeys, batchValues].compactMap { $0 }
+        [keys, values].compactMap { $0 }
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        let previous = self.offset
-        let incoming = keys.dim(2)  // number of new tokens
+        let previous = currentLength
+        let tokenCount = keys.dim(2)
 
-        // Grow allocation if needed
-        let needsResize = batchKeys == nil || (previous + incoming) > batchKeys!.dim(2)
-        if needsResize {
-            let B = keys.dim(0)
-            let kvHeads = keys.dim(1)
-            let kHeadDim = keys.dim(3)
-            let vHeadDim = values.dim(3)
+        ensureCapacity(for: keys, values: values, previousLength: previous)
 
-            let nSteps = (step + incoming - 1) / step
-            let newK = MLXArray.zeros([B, kvHeads, nSteps * step, kHeadDim], dtype: keys.dtype)
-            let newV = MLXArray.zeros([B, kvHeads, nSteps * step, vHeadDim], dtype: values.dtype)
-
-            if var cur = batchKeys, var curV = batchValues {
-                if previous % step != 0 {
-                    cur = cur[.ellipsis, ..<previous, 0...]
-                    curV = curV[.ellipsis, ..<previous, 0...]
-                }
-                batchKeys = concatenated([cur, newK], axis: 2)
-                batchValues = concatenated([curV, newV], axis: 2)
-            } else {
-                batchKeys = newK
-                batchValues = newV
-            }
+        guard self.keys != nil, self.values != nil else {
+            fatalError("BatchKVCache storage was not initialized before update")
         }
 
-        self.offset += incoming
+        currentLength += tokenCount
+        offsets = offsets + tokenCount
+        offset = currentLength
 
-        batchKeys?[.ellipsis, previous..<self.offset, 0...] = keys
-        batchValues?[.ellipsis, previous..<self.offset, 0...] = values
+        self.keys?[.ellipsis, previous ..< currentLength, 0...] = keys
+        self.values?[.ellipsis, previous ..< currentLength, 0...] = values
 
-        let retK = batchKeys![.ellipsis, ..<self.offset, 0...]
-        let retV = batchValues![.ellipsis, ..<self.offset, 0...]
-        return (retK, retV)
-    }
-
-    /// Create a batch-aware attention mask that excludes left-padded positions.
-    ///
-    /// Returns a `[B, 1, n, offset+n]` additive float mask where:
-    /// - `-1e9` = masked out (causal violation OR left-padding)
-    /// - `0.0`  = attend normally
-    ///
-    /// For decode (n=1) with no padding this returns `.none`.
-    public override func makeMask(
-        n: Int, windowSize: Int?, returnArray: Bool
-    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        let total = offset + n
-
-        // Fast path: single decode token with no left-padding
-        if n == 1 && leftPadding.allSatisfy({ $0 == 0 }) {
-            return .none
-        }
-
-        // Causal part: [1, n, total]
-        // Query positions run from `offset` to `offset+n-1`.
-        let queryPositions = (offset != 0
-            ? MLXArray(Int32(offset) ..< Int32(offset + n))
-            : MLXArray(Int32(0) ..< Int32(n))
-        ).reshaped(1, -1, 1)  // [1, n, 1]
-
-        let keyPositions = MLXArray(Int32(0) ..< Int32(total)).reshaped(1, 1, -1)  // [1, 1, total]
-
-        // causal[0, i, j] = (query_pos[i] >= key_pos[j])
-        var causal = queryPositions .>= keyPositions  // [1, n, total]
-
-        // Optional window constraint
-        if let windowSize {
-            let windowed = queryPositions .< keyPositions + Int32(windowSize)
-            causal = causal & windowed
-        }
-
-        // Per-sequence left-padding mask: key_pos[j] >= leftPadding[b]
-        if leftPadding.contains(where: { $0 > 0 }) {
-            let padArr = MLXArray(leftPadding.map { Int32($0) }).reshaped(-1, 1, 1)  // [B, 1, 1]
-            let noPad = keyPositions .>= padArr  // [B, 1, total]
-            causal = causal & noPad  // broadcasts to [B, n, total]
-        }
-
-        // Convert bool to additive float mask and add head dim → [B, 1, n, total]
-        let floatMask = causal.asType(.float32)
-        let additive = (1.0 - floatMask) * Float(-1e9)
-        return .array(additive.reshaped(batchSize, 1, n, total))
+        return (
+            self.keys![.ellipsis, ..<currentLength, 0...],
+            self.values![.ellipsis, ..<currentLength, 0...]
+        )
     }
 
     public override var state: [MLXArray] {
         get {
-            guard let k = batchKeys, let v = batchValues else { return [] }
-            if offset == k.dim(2) {
-                return [k, v]
+            guard var keys = self.keys, var values = self.values else { return [] }
+            if currentLength < keys.dim(2) {
+                keys = keys[.ellipsis, ..<currentLength, 0...]
+                values = values[.ellipsis, ..<currentLength, 0...]
             }
-            return [k[.ellipsis, ..<offset, 0...], v[.ellipsis, ..<offset, 0...]]
+            return [keys, values, offsets, leftPaddingStorage]
         }
         set {
-            guard newValue.count == 2 else {
-                fatalError("BatchKVCache state must have exactly 2 arrays (keys, values)")
+            guard newValue.count >= 4 else {
+                keys = nil
+                values = nil
+                offsets = MLXArray([])
+                leftPaddingStorage = MLXArray([])
+                currentLength = 0
+                offset = 0
+                return
             }
-            batchKeys = newValue[0]
-            batchValues = newValue[1]
-            self.offset = batchKeys!.dim(2)
+
+            keys = newValue[0]
+            values = newValue[1]
+            offsets = newValue[2]
+            leftPaddingStorage = newValue[3]
+            currentLength = keys?.dim(2) ?? 0
+            offset = currentLength
         }
     }
 
     public override var metaState: [String] {
-        get { ["batch:\(batchSize)"] }
-        set {}
+        get { [] }
+        set {
+            if !newValue.isEmpty {
+                fatalError("BatchKVCache does not use metaState")
+            }
+        }
     }
 
-    public override var isTrimmable: Bool { false }
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1 && leftPadding.allSatisfy({ $0 == 0 }) && windowSize == nil {
+            return .none
+        }
 
-    // MARK: - Factory
+        var mask = createCausalMask(n: n, offset: currentLength, windowSize: windowSize)
+        mask = mask[.newAxis, .newAxis, 0..., 0...]
 
-    /// Create a per-layer array of ``BatchKVCache`` from independent single-sequence caches.
-    ///
-    /// This is the primary entry point for merging individually prefilled sequences into
-    /// a batch for the subsequent decode loop.
-    ///
-    /// Shorter sequences are left-padded with zeros to match the longest sequence.
-    /// The returned `leftPadding` values can be used to create the appropriate attention
-    /// mask during decode.
-    ///
-    /// - Parameters:
-    ///   - perSequenceCaches: `caches[seqIdx][layerIdx]` — one inner `[KVCache]` per sequence.
-    ///   - leftPadding: Per-sequence left-padding amounts. If `nil`, computed automatically
-    ///     so all sequences have the same length.
-    /// - Returns: `[BatchKVCache]` indexed by layer (replaces a single sequence's `[KVCache]`).
+        if leftPaddingStorage.size > 0 && leftPadding.contains(where: { $0 > 0 }) {
+            let total = currentLength + n
+            let columnIndices = MLXArray(Int32(0) ..< Int32(total))[.newAxis, .newAxis, .newAxis, 0...]
+            let leftMask = leftPaddingStorage[0..., .newAxis, .newAxis, .newAxis] .<= columnIndices
+            mask = mask & leftMask
+        }
+
+        return .array(mask)
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(currentLength, n)
+        if trimmed == 0 { return 0 }
+        currentLength -= trimmed
+        offsets = offsets - trimmed
+        offset = currentLength
+        return trimmed
+    }
+
     public static func fromSingle(
         perSequenceCaches: [[KVCacheSimple]],
         leftPadding: [Int]? = nil
@@ -217,130 +133,615 @@ public class BatchKVCache: BaseKVCache {
         let batchSize = perSequenceCaches.count
         guard batchSize > 0 else { return [] }
 
-        let nLayers = perSequenceCaches[0].count
-        let offsets = perSequenceCaches.map { $0.first?.offset ?? 0 }
-        let maxOffset = offsets.max() ?? 0
+        let layerCount = perSequenceCaches[0].count
+        let sequenceLengths = perSequenceCaches.map { $0.first?.offset ?? 0 }
+        let maxOffset = sequenceLengths.max() ?? 0
+        let padding = leftPadding ?? sequenceLengths.map { maxOffset - $0 }
 
-        // Compute left-padding for each sequence so all reach maxOffset
-        let padding = leftPadding ?? offsets.map { maxOffset - $0 }
-
-        return (0 ..< nLayers).map { layerIdx in
-            let layerCaches = perSequenceCaches.map { $0[layerIdx] }
+        return (0 ..< layerCount).map { layerIndex in
+            let layerCaches = perSequenceCaches.map { $0[layerIndex] }
             return makeBatchLayer(
                 layerCaches: layerCaches,
                 padding: padding,
-                maxOffset: maxOffset,
-                batchSize: batchSize
+                sequenceLengths: sequenceLengths,
+                maxOffset: maxOffset
             )
         }
     }
 
-    // MARK: - Helpers
+    public func filter(batchIndices: MLXArray) {
+        guard keys != nil, values != nil else { return }
+
+        if batchIndices.size == 0 {
+            keys = nil
+            values = nil
+            offsets = MLXArray([])
+            leftPaddingStorage = MLXArray([])
+            currentLength = 0
+            offset = 0
+            return
+        }
+
+        keys = keys?[batchIndices, .ellipsis]
+        values = values?[batchIndices, .ellipsis]
+        offsets = offsets[batchIndices]
+        leftPaddingStorage = leftPaddingStorage[batchIndices]
+
+        let minLeftPad = leftPaddingStorage.min().item(Int.self)
+        if minLeftPad > 0 {
+            let shift = min(minLeftPad, currentLength)
+            if shift > 0 {
+                keys = keys?[.ellipsis, shift..., 0...]
+                values = values?[.ellipsis, shift..., 0...]
+                currentLength -= shift
+                offset = currentLength
+            }
+            leftPaddingStorage = leftPaddingStorage - MLXArray(minLeftPad)
+        }
+    }
+
+    public func filter(keepIndices: [Int]) -> BatchKVCache {
+        let filtered = BatchKVCache(leftPadding: leftPadding)
+        filtered.state = state
+        filtered.filter(batchIndices: MLXArray(keepIndices.map(Int32.init)))
+        return filtered
+    }
+
+    public func extend(other: BatchKVCache) {
+        guard let otherKeys = other.keys, let otherValues = other.values else { return }
+
+        if keys == nil {
+            keys = otherKeys
+            values = otherValues
+            offsets = other.offsets
+            leftPaddingStorage = other.leftPaddingStorage
+            currentLength = other.currentLength
+            offset = currentLength
+            return
+        }
+
+        guard let currentKeys = keys else {
+            fatalError("BatchKVCache missing backing storage during extend")
+        }
+
+        let maxIndex = max(currentLength, other.currentLength)
+        let maxCapacity = max(currentKeys.dim(2), otherKeys.dim(2))
+
+        let paddedSelf = paddedForConcat(targetLength: maxIndex, targetCapacity: maxCapacity)
+        let paddedOther = other.paddedForConcat(targetLength: maxIndex, targetCapacity: maxCapacity)
+
+        keys = MLX.concatenated([paddedSelf.keys, paddedOther.keys], axis: 0)
+        values = MLX.concatenated([paddedSelf.values, paddedOther.values], axis: 0)
+        offsets = MLX.concatenated([paddedSelf.offsets, paddedOther.offsets], axis: 0)
+        leftPaddingStorage = MLX.concatenated(
+            [paddedSelf.leftPadding, paddedOther.leftPadding], axis: 0)
+        currentLength = maxIndex
+        offset = currentLength
+    }
+
+    public func extract(index: Int) -> KVCacheSimple {
+        let simple = KVCacheSimple()
+        guard let keys, let values else { return simple }
+
+        let pad = leftPadding[index]
+        guard currentLength > pad else { return simple }
+
+        simple.state = [
+            keys[index...(index), .ellipsis, pad..<currentLength, 0...],
+            values[index...(index), .ellipsis, pad..<currentLength, 0...],
+        ]
+        return simple
+    }
 
     private static func makeBatchLayer(
         layerCaches: [KVCacheSimple],
         padding: [Int],
-        maxOffset: Int,
-        batchSize: Int
+        sequenceLengths: [Int],
+        maxOffset: Int
     ) -> BatchKVCache {
-        let batchCache = BatchKVCache(batchSize: batchSize, leftPadding: padding)
+        let batchCache = BatchKVCache(leftPadding: padding)
+        batchCache.currentLength = maxOffset
         batchCache.offset = maxOffset
+        batchCache.offsets = MLXArray(sequenceLengths)
 
         guard maxOffset > 0 else { return batchCache }
 
-        // Stack keys and values for each sequence, with left-padding
         var keysList: [MLXArray] = []
         var valuesList: [MLXArray] = []
 
         for (cache, pad) in zip(layerCaches, padding) {
             let state = cache.state
             guard state.count >= 2 else {
-                // Empty cache: create all-zeros for this sequence
-                // We'll fill in shape below once we know the dims
                 keysList.append(MLXArray.zeros([1, 1, maxOffset, 1]))
                 valuesList.append(MLXArray.zeros([1, 1, maxOffset, 1]))
                 continue
             }
 
-            var k = state[0]  // [1, nHeads, seqLen, headDim]
-            var v = state[1]  // [1, nHeads, seqLen, headDim]
+            var keys = state[0]
+            var values = state[1]
 
             if pad > 0 {
-                let kPad = MLXArray.zeros([1, k.dim(1), pad, k.dim(3)], dtype: k.dtype)
-                let vPad = MLXArray.zeros([1, v.dim(1), pad, v.dim(3)], dtype: v.dtype)
-                k = concatenated([kPad, k], axis: 2)
-                v = concatenated([vPad, v], axis: 2)
+                let keyPad = MLXArray.zeros([1, keys.dim(1), pad, keys.dim(3)], dtype: keys.dtype)
+                let valuePad = MLXArray.zeros([1, values.dim(1), pad, values.dim(3)], dtype: values.dtype)
+                keys = MLX.concatenated([keyPad, keys], axis: 2)
+                values = MLX.concatenated([valuePad, values], axis: 2)
             }
 
-            keysList.append(k)
-            valuesList.append(v)
+            keysList.append(keys)
+            valuesList.append(values)
         }
 
-        // Fix any placeholder zeros using the shape from real caches
-        let realIdx = keysList.firstIndex(where: { $0.dim(1) > 1 }) ?? 0
-        if realIdx < keysList.count {
-            let refK = keysList[realIdx]
-            let refV = valuesList[realIdx]
-            for i in 0 ..< keysList.count {
-                if keysList[i].dim(1) == 1 && refK.dim(1) > 1 {
-                    keysList[i] = MLXArray.zeros(
-                        [1, refK.dim(1), maxOffset, refK.dim(3)], dtype: refK.dtype)
-                    valuesList[i] = MLXArray.zeros(
-                        [1, refV.dim(1), maxOffset, refV.dim(3)], dtype: refV.dtype)
-                }
+        let realIndex = keysList.firstIndex(where: { $0.dim(1) > 1 }) ?? 0
+        if realIndex < keysList.count {
+            let referenceKeys = keysList[realIndex]
+            let referenceValues = valuesList[realIndex]
+            for index in 0 ..< keysList.count where keysList[index].dim(1) == 1 && referenceKeys.dim(1) > 1 {
+                keysList[index] = MLXArray.zeros(
+                    [1, referenceKeys.dim(1), maxOffset, referenceKeys.dim(3)],
+                    dtype: referenceKeys.dtype
+                )
+                valuesList[index] = MLXArray.zeros(
+                    [1, referenceValues.dim(1), maxOffset, referenceValues.dim(3)],
+                    dtype: referenceValues.dtype
+                )
             }
         }
 
-        batchCache.batchKeys = concatenated(keysList, axis: 0)    // [B, nHeads, maxOffset, headDim]
-        batchCache.batchValues = concatenated(valuesList, axis: 0)
-
+        batchCache.keys = MLX.concatenated(keysList, axis: 0)
+        batchCache.values = MLX.concatenated(valuesList, axis: 0)
         return batchCache
     }
 
-    /// Remove sequences at specific indices, returning a new cache with only the kept sequences.
-    ///
-    /// Use this when sequences complete and you want to continue decoding the remainder.
-    /// If only one sequence remains, consider using ``extract(index:)`` to get a
-    /// ``KVCacheSimple`` for the standard single-sequence path.
-    ///
-    /// - Parameter keepIndices: Indices (in `0 ..< batchSize`) of sequences to keep.
-    /// - Returns: A new ``BatchKVCache`` containing only the kept sequences.
-    public func filter(keepIndices: [Int]) -> BatchKVCache {
-        guard let k = batchKeys, let v = batchValues else {
-            return BatchKVCache(batchSize: keepIndices.count, leftPadding: keepIndices.map { leftPadding[$0] })
+    private func ensureCapacity(for keys: MLXArray, values: MLXArray, previousLength: Int) {
+        if self.keys == nil {
+            let chunk = allocateChunk(for: keys, values: values)
+            self.keys = chunk.keys
+            self.values = chunk.values
+            return
         }
 
-        let keptK = concatenated(keepIndices.map { k[($0)...($0), .ellipsis] }, axis: 0)
-        let keptV = concatenated(keepIndices.map { v[($0)...($0), .ellipsis] }, axis: 0)
-        let keptPadding = keepIndices.map { leftPadding[$0] }
+        guard var currentKeys = self.keys, var currentValues = self.values else {
+            fatalError("BatchKVCache missing backing storage")
+        }
 
-        let newCache = BatchKVCache(batchSize: keepIndices.count, leftPadding: keptPadding)
-        newCache.batchKeys = keptK
-        newCache.batchValues = keptV
-        newCache.offset = self.offset
-        return newCache
+        let tokenCount = keys.dim(2)
+        if previousLength + tokenCount <= currentKeys.dim(2) {
+            return
+        }
+
+        if previousLength % step != 0 {
+            currentKeys = currentKeys[.ellipsis, ..<previousLength, 0...]
+            currentValues = currentValues[.ellipsis, ..<previousLength, 0...]
+        }
+
+        let chunk = allocateChunk(for: keys, values: values)
+        self.keys = MLX.concatenated([currentKeys, chunk.keys], axis: 2)
+        self.values = MLX.concatenated([currentValues, chunk.values], axis: 2)
     }
 
-    /// Extract a single sequence's cache as a ``KVCacheSimple``.
-    ///
-    /// Use this when the batch drops to a single sequence and you want to switch
-    /// back to the standard single-sequence code path.
-    ///
-    /// - Parameter index: Index of the sequence to extract.
-    /// - Returns: A ``KVCacheSimple`` containing only the real (non-padded) tokens.
-    public func extract(index: Int) -> KVCacheSimple {
-        let simple = KVCacheSimple()
-        guard let k = batchKeys, let v = batchValues else { return simple }
+    private func allocateChunk(for keys: MLXArray, values: MLXArray) -> (keys: MLXArray, values: MLXArray) {
+        let batch = keys.dim(0)
+        let kvHeads = keys.dim(1)
+        let tokenCount = keys.dim(2)
+        let keyDim = keys.dim(3)
+        let valueDim = values.dim(3)
 
-        let pad = leftPadding[index]
-        let realStart = pad
-        let realEnd = offset
+        let steps = (step + tokenCount - 1) / step
+        let capacity = steps * step
 
-        if realEnd > realStart {
-            let extractedK = k[index...(index), .ellipsis, realStart..<realEnd, 0...]
-            let extractedV = v[index...(index), .ellipsis, realStart..<realEnd, 0...]
-            simple.state = [extractedK, extractedV]
+        return (
+            MLXArray.zeros([batch, kvHeads, capacity, keyDim], dtype: keys.dtype),
+            MLXArray.zeros([batch, kvHeads, capacity, valueDim], dtype: values.dtype)
+        )
+    }
+
+    private func paddedForConcat(
+        targetLength: Int,
+        targetCapacity: Int
+    ) -> (keys: MLXArray, values: MLXArray, offsets: MLXArray, leftPadding: MLXArray) {
+        guard var keys = self.keys, var values = self.values else {
+            fatalError("BatchKVCache has no backing tensors to pad")
         }
-        return simple
+
+        let left = targetLength - currentLength
+        var right = targetCapacity - keys.dim(2) - left
+
+        if right < 0 {
+            let end = keys.dim(2) + right
+            keys = keys[.ellipsis, ..<end, 0...]
+            values = values[.ellipsis, ..<end, 0...]
+            right = 0
+        }
+
+        if left != 0 || right != 0 {
+            let padWidths: [IntOrPair] = [
+                IntOrPair(0),
+                IntOrPair(0),
+                IntOrPair((left, right)),
+                IntOrPair(0),
+            ]
+            keys = MLX.padded(keys, widths: padWidths)
+            values = MLX.padded(values, widths: padWidths)
+        }
+
+        let adjustedLeftPadding = leftPaddingStorage + MLXArray(left)
+        return (keys, values, offsets, adjustedLeftPadding)
+    }
+}
+
+/// Batch-aware rotating cache for sliding-window attention.
+public class BatchRotatingKVCache: BaseKVCache {
+
+    public var step = 256
+
+    private let maxWindowSize: Int
+    private var keys: MLXArray?
+    private var values: MLXArray?
+    private var leftPadding: MLXArray
+    public private(set) var offsets: MLXArray
+    private var idx: Int = 0
+    private var offsetCursor: Int = 0
+    private var rotated = false
+
+    public override var maxSize: Int? { maxWindowSize }
+    public override var isTrimmable: Bool { offsetCursor < maxWindowSize }
+
+    public init(maxSize: Int, leftPadding: [Int]) {
+        maxWindowSize = maxSize
+        self.leftPadding = MLXArray(leftPadding)
+        offsets = MLXArray(leftPadding.map { -$0 })
+        super.init()
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if keys.dim(2) == 1 {
+            return updateInPlace(keys: keys, values: values)
+        } else {
+            return updateConcat(keys: keys, values: values)
+        }
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard var keys = self.keys, var values = self.values else { return [] }
+            if offsetCursor < keys.dim(2) {
+                keys = keys[.ellipsis, ..<offsetCursor, 0...]
+                values = values[.ellipsis, ..<offsetCursor, 0...]
+            }
+            return [keys, values, offsets, leftPadding]
+        }
+        set {
+            guard newValue.count >= 4 else {
+                keys = nil
+                values = nil
+                offsets = MLXArray([])
+                leftPadding = MLXArray([])
+                idx = 0
+                offsetCursor = 0
+                rotated = false
+                offset = 0
+                return
+            }
+
+            keys = newValue[0]
+            values = newValue[1]
+            offsets = newValue[2]
+            leftPadding = newValue[3]
+            offsetCursor = keys?.dim(2) ?? 0
+            idx = offsetCursor
+            offset = offsetCursor
+            rotated = false
+        }
+    }
+
+    public override var metaState: [String] {
+        get {
+            [
+                String(maxWindowSize),
+                String(offsetCursor),
+                String(idx),
+                rotated ? "1" : "0",
+            ]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("BatchRotatingKVCache metaState must have exactly 4 values")
+            }
+            guard let parsedMax = Int(newValue[0]) else {
+                fatalError("Invalid maxSize in BatchRotatingKVCache metaState")
+            }
+            guard parsedMax == maxWindowSize else {
+                fatalError("BatchRotatingKVCache maxSize mismatch during state load")
+            }
+            guard let parsedOffset = Int(newValue[1]), let parsedIndex = Int(newValue[2]) else {
+                fatalError("Invalid offset/index in BatchRotatingKVCache metaState")
+            }
+
+            offsetCursor = parsedOffset
+            idx = parsedIndex
+            rotated = newValue[3] == "1"
+            offset = offsetCursor
+        }
+    }
+
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1 && leftPadding.asArray(Int.self).allSatisfy({ $0 == 0 }) && windowSize == nil {
+            return .none
+        }
+        return makeMask(sequenceLength: n, returnArray: returnArray, windowSize: windowSize)
+    }
+
+    public func filter(batchIndices: MLXArray) {
+        guard keys != nil, values != nil else { return }
+
+        if batchIndices.size == 0 {
+            keys = nil
+            values = nil
+            offsets = MLXArray([])
+            leftPadding = MLXArray([])
+            offsetCursor = 0
+            idx = 0
+            rotated = false
+            offset = 0
+            return
+        }
+
+        keys = keys?[batchIndices, .ellipsis]
+        values = values?[batchIndices, .ellipsis]
+        offsets = offsets[batchIndices]
+        leftPadding = leftPadding[batchIndices]
+    }
+
+    public func extend(other: BatchRotatingKVCache) {
+        guard let otherKeys = other.keys, let otherValues = other.values else { return }
+
+        if keys == nil {
+            keys = otherKeys
+            values = otherValues
+            offsets = other.offsets
+            leftPadding = other.leftPadding
+            offsetCursor = other.offsetCursor
+            idx = other.idx
+            rotated = other.rotated
+            offset = offsetCursor
+            return
+        }
+
+        ensureTemporalOrder()
+        other.ensureTemporalOrder()
+
+        guard let currentKeys = keys, let currentValues = values else {
+            fatalError("BatchRotatingKVCache missing backing storage during extend")
+        }
+
+        let maxIndex = max(idx, other.idx)
+        let maxCapacity = max(currentKeys.dim(2), otherKeys.dim(2))
+
+        func pad(_ cache: BatchRotatingKVCache) -> (
+            keys: MLXArray, values: MLXArray, offsets: MLXArray, leftPadding: MLXArray
+        ) {
+            guard var keys = cache.keys, var values = cache.values else {
+                fatalError("BatchRotatingKVCache has no backing tensors to pad")
+            }
+
+            let left = maxIndex - cache.idx
+            var right = maxCapacity - keys.dim(2) - left
+            if right < 0 {
+                let end = keys.dim(2) + right
+                keys = keys[.ellipsis, ..<end, 0...]
+                values = values[.ellipsis, ..<end, 0...]
+                right = 0
+            }
+
+            if left != 0 || right != 0 {
+                let padWidths: [IntOrPair] = [
+                    IntOrPair(0),
+                    IntOrPair(0),
+                    IntOrPair((left, right)),
+                    IntOrPair(0),
+                ]
+                keys = MLX.padded(keys, widths: padWidths)
+                values = MLX.padded(values, widths: padWidths)
+            }
+
+            return (keys, values, cache.offsets, cache.leftPadding + MLXArray(left))
+        }
+
+        let paddedSelf = pad(self)
+        let paddedOther = pad(other)
+
+        keys = MLX.concatenated([paddedSelf.keys, paddedOther.keys], axis: 0)
+        values = MLX.concatenated([paddedSelf.values, paddedOther.values], axis: 0)
+        offsets = MLX.concatenated([paddedSelf.offsets, paddedOther.offsets], axis: 0)
+        leftPadding = MLX.concatenated([paddedSelf.leftPadding, paddedOther.leftPadding], axis: 0)
+        idx = maxIndex
+        offsetCursor = max(offsetCursor, other.offsetCursor)
+        rotated = false
+        offset = offsetCursor
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(offsetCursor, n)
+        if trimmed == 0 { return 0 }
+
+        offsetCursor -= trimmed
+        idx = max(idx - trimmed, 0)
+        offsets = offsets - MLXArray(trimmed)
+        offset = offsetCursor
+        return trimmed
+    }
+
+    public func makeMask(
+        sequenceLength: Int,
+        returnArray: Bool = false,
+        windowSize: Int? = nil
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        let window = windowSize ?? maxWindowSize
+        let offsetValue = min(maxWindowSize - 1, offsetCursor)
+        let total = offsetValue + sequenceLength
+
+        var rinds = MLXArray(Int32(0) ..< Int32(total))
+        var linds: MLXArray
+        if offsetValue > 0 {
+            linds = MLXArray(Int32(offsetValue) ..< Int32(offsetValue + sequenceLength))
+        } else {
+            linds = rinds
+        }
+
+        linds = linds[0..., .newAxis]
+        rinds = rinds[.newAxis]
+
+        var mask = linds .>= rinds
+        mask = mask & (linds .< (rinds + MLXArray(window)))
+
+        var adjustedLeftPadding = leftPadding
+        let trimSize = idx - maxWindowSize + (sequenceLength > 1 ? 1 : 0)
+        if trimSize > 0 {
+            adjustedLeftPadding = adjustedLeftPadding - MLXArray(trimSize)
+        }
+
+        let isRotated = sequenceLength == 1 && (rotated || idx >= maxWindowSize)
+        if isRotated {
+            adjustedLeftPadding = adjustedLeftPadding - MLXArray(1)
+        }
+
+        var mask4d = mask[.newAxis, .newAxis, 0..., 0...]
+        let columnIndices = MLXArray(Int32(0) ..< Int32(total))[.newAxis, .newAxis, .newAxis, 0...]
+        let leftMask = adjustedLeftPadding[0..., .newAxis, .newAxis, .newAxis] .<= columnIndices
+        mask4d = mask4d & leftMask
+
+        if isRotated {
+            var shift = idx
+            if shift >= maxWindowSize {
+                shift = 0
+            }
+            mask4d = MLX.roll(mask4d, shift: shift + 1, axis: -1)
+        }
+
+        return .array(mask4d)
+    }
+
+    private func ensureTemporalOrder() {
+        guard rotated, let keys, let values else { return }
+        self.keys = MLX.roll(keys, shift: -idx, axis: 2)
+        self.values = MLX.roll(values, shift: -idx, axis: 2)
+        idx = self.keys?.dim(2) ?? 0
+        rotated = false
+    }
+
+    private func trim(array: MLXArray, trimSize: Int, append: MLXArray? = nil) -> MLXArray {
+        var result = array
+        if trimSize > 0 {
+            result = result[.ellipsis, trimSize..., 0...]
+        }
+        if let append {
+            result = MLX.concatenated([result, append], axis: 2)
+        }
+        return result
+    }
+
+    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if self.keys == nil {
+            self.keys = keys
+            self.values = values
+        } else {
+            ensureTemporalOrder()
+            if let currentKeys = self.keys, currentKeys.dim(2) > idx {
+                self.keys = currentKeys[.ellipsis, ..<idx, 0...]
+            }
+            if let currentValues = self.values, currentValues.dim(2) > idx {
+                self.values = currentValues[.ellipsis, ..<idx, 0...]
+            }
+
+            let trimSize = idx - maxWindowSize + 1
+            if trimSize > 0 {
+                leftPadding = leftPadding - MLXArray(trimSize)
+                if let currentKeys = self.keys {
+                    self.keys = trim(array: currentKeys, trimSize: trimSize, append: keys)
+                }
+                if let currentValues = self.values {
+                    self.values = trim(array: currentValues, trimSize: trimSize, append: values)
+                }
+            } else {
+                self.keys = trim(array: self.keys!, trimSize: 0, append: keys)
+                self.values = trim(array: self.values!, trimSize: 0, append: values)
+            }
+        }
+
+        offsetCursor += keys.dim(2)
+        offsets = offsets + MLXArray(keys.dim(2))
+        idx = self.keys?.dim(2) ?? 0
+        offset = offsetCursor
+
+        guard let currentKeys = self.keys, let currentValues = self.values else {
+            fatalError("BatchRotatingKVCache failed to produce backing storage")
+        }
+        return (currentKeys, currentValues)
+    }
+
+    private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let tokenCount = keys.dim(2)
+        let batch = keys.dim(0)
+        let kvHeads = keys.dim(1)
+        let keyDim = keys.dim(3)
+        let valueDim = values.dim(3)
+        let previous = offsetCursor
+
+        if self.keys == nil
+            || (previous >= (self.keys?.dim(2) ?? 0) && (self.keys?.dim(2) ?? 0) < maxWindowSize)
+        {
+            let newSize = min(step, maxWindowSize - previous)
+            let newKeys = MLXArray.zeros([batch, kvHeads, newSize, keyDim], dtype: keys.dtype)
+            let newValues = MLXArray.zeros([batch, kvHeads, newSize, valueDim], dtype: values.dtype)
+            if let currentKeys = self.keys, let currentValues = self.values {
+                self.keys = MLX.concatenated([currentKeys, newKeys], axis: 2)
+                self.values = MLX.concatenated([currentValues, newValues], axis: 2)
+            } else {
+                self.keys = newKeys
+                self.values = newValues
+            }
+        }
+
+        guard var currentKeys = self.keys, var currentValues = self.values else {
+            fatalError("BatchRotatingKVCache missing storage during in-place update")
+        }
+
+        let trimSize = currentKeys.dim(2) - maxWindowSize
+        if trimSize > 0 {
+            currentKeys = trim(array: currentKeys, trimSize: trimSize)
+            currentValues = trim(array: currentValues, trimSize: trimSize)
+            self.keys = currentKeys
+            self.values = currentValues
+            idx = maxWindowSize
+            leftPadding = leftPadding - MLXArray(trimSize)
+        }
+
+        if idx == maxWindowSize {
+            rotated = true
+            idx = 0
+        }
+        if rotated {
+            leftPadding = leftPadding - MLXArray(tokenCount)
+        }
+
+        self.keys?[.ellipsis, idx ..< (idx + tokenCount), 0...] = keys
+        self.values?[.ellipsis, idx ..< (idx + tokenCount), 0...] = values
+
+        offsetCursor += tokenCount
+        offsets = offsets + MLXArray(tokenCount)
+        idx += tokenCount
+        offset = offsetCursor
+
+        if offsetCursor < maxWindowSize {
+            return (
+                self.keys![.ellipsis, ..<offsetCursor, 0...],
+                self.values![.ellipsis, ..<offsetCursor, 0...]
+            )
+        }
+
+        return (self.keys!, self.values!)
     }
 }

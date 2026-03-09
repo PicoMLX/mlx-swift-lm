@@ -442,6 +442,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         super.init()
     }
 
+    public var keepTokens: Int { keep }
+
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
     }
@@ -1062,6 +1064,10 @@ public class ArraysCache: BaseKVCache {
         }
     }
 
+    public func setLeftPadding(_ padding: [Int]) {
+        leftPadding = MLXArray(padding)
+    }
+
     /// In-place filter to keep just the given indices in the cache
     public func filter(batchIndices: MLXArray) {
         cache = cache.map { c in
@@ -1107,9 +1113,16 @@ public class CacheList: BaseKVCache {
         super.init()
     }
 
+    public init(_ caches: [KVCache]) {
+        self.caches = caches
+        super.init()
+    }
+
     public override func innerState() -> [MLXArray] {
         caches.flatMap { $0.innerState() }
     }
+
+    public var count: Int { caches.count }
 
     public subscript(index: Int) -> KVCache {
         return caches[index]
@@ -1143,6 +1156,40 @@ public class CacheList: BaseKVCache {
             result = cache.trim(n)
         }
         return result
+    }
+
+    public func filter(batchIndices: MLXArray) {
+        for cache in caches {
+            if let batchCache = cache as? BatchKVCache {
+                batchCache.filter(batchIndices: batchIndices)
+            } else if let rotatingCache = cache as? BatchRotatingKVCache {
+                rotatingCache.filter(batchIndices: batchIndices)
+            } else if let arraysCache = cache as? ArraysCache {
+                arraysCache.filter(batchIndices: batchIndices)
+            } else if let listCache = cache as? CacheList {
+                listCache.filter(batchIndices: batchIndices)
+            } else {
+                fatalError("\(type(of: cache)) does not support batched filtering")
+            }
+        }
+    }
+
+    public func extend(other: CacheList) {
+        for (cache, otherCache) in zip(caches, other.caches) {
+            if let lhs = cache as? BatchKVCache, let rhs = otherCache as? BatchKVCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = cache as? BatchRotatingKVCache,
+                let rhs = otherCache as? BatchRotatingKVCache
+            {
+                lhs.extend(other: rhs)
+            } else if let lhs = cache as? ArraysCache, let rhs = otherCache as? ArraysCache {
+                lhs.extend(other: rhs)
+            } else if let lhs = cache as? CacheList, let rhs = otherCache as? CacheList {
+                lhs.extend(other: rhs)
+            } else {
+                fatalError("\(type(of: cache)) does not support batched extension")
+            }
+        }
     }
 }
 

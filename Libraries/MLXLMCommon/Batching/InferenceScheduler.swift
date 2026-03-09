@@ -2,15 +2,8 @@
 
 import Foundation
 import MLX
-import MLXNN
 import Tokenizers
 
-/// An inference request submitted to the ``InferenceScheduler``.
-///
-/// `LMInput` contains `MLXArray` which is not `Sendable` in the strict sense,
-/// but we need to transfer ownership from the caller to the scheduler actor.
-/// The `@unchecked` suppression is safe because the caller transfers ownership
-/// at the `submit` call site and does not retain a reference afterwards.
 public struct InferenceRequest: @unchecked Sendable {
     public let input: LMInput
     public let parameters: GenerateParameters
@@ -21,55 +14,11 @@ public struct InferenceRequest: @unchecked Sendable {
     }
 }
 
-/// Actor that manages a queue of inference requests and dispatches them through
-/// batched prefill + decode.
-///
-/// ## Overview
-///
-/// `InferenceScheduler` is the top-level entry point for concurrent LLM inference
-/// on a single model. Callers submit ``InferenceRequest`` values and receive
-/// `AsyncStream<Generation>` back. The scheduler:
-///
-/// 1. Runs requests immediately if capacity allows (no artificial wait time).
-/// 2. Batches new requests with any currently decoding sequences when they arrive
-///    mid-generation (the _single-to-batch upgrade_).
-/// 3. Removes completed sequences from the batch and continues.
-///
-/// ## Configuration
-///
-/// ```swift
-/// let scheduler = InferenceScheduler(
-///     context: modelContext,
-///     config: .init(completionBatchSize: 4)
-/// )
-/// let stream = await scheduler.submit(InferenceRequest(input: input, parameters: params))
-/// ```
-///
-/// ## Thread Safety
-///
-/// `InferenceScheduler` is an `actor`. Submit calls from any context; the scheduler
-/// serializes access internally.
 public actor InferenceScheduler {
 
-    // MARK: - Config
-
-    /// Configuration for the inference scheduler.
     public struct Config: Sendable {
-        /// Maximum number of sequences decoded simultaneously.
-        ///
-        /// Requests beyond this limit queue until space is available.
-        /// Default is 4, suitable for local/LAN use.
         public var completionBatchSize: Int = 4
-
-        /// Maximum number of sequences that can be prefilled in one go.
-        ///
-        /// Setting this lower than `completionBatchSize` staggers prefills to
-        /// reduce peak memory during the fill phase.
         public var prefillBatchSize: Int = 4
-
-        /// Maximum number of requests waiting in the queue.
-        ///
-        /// Submissions beyond this limit throw ``SchedulerError/queueFull``.
         public var maxQueueSize: Int = 32
 
         public init(
@@ -83,235 +32,279 @@ public actor InferenceScheduler {
         }
     }
 
-    // MARK: - Errors
-
     public enum SchedulerError: Error, Sendable {
         case queueFull
         case modelNotReady
     }
 
-    // MARK: - State
+    private struct PendingEntry {
+        let uid: Int
+        let promptTokens: [Int]
+        let parameters: GenerateParameters
+        let sampler: any LogitSampler
+        let processor: BatchLogitProcessorBox?
+        let batchOptions: BatchExecutionOptions
+
+        var maxTokens: Int {
+            parameters.maxTokens ?? .max
+        }
+    }
 
     private let context: ModelContext
     public let config: Config
+    private let stopTokenIDs: Set<Int>
+    private let unknownTokenId: Int?
 
-    /// Pending requests waiting to be prefilled and admitted.
     private var pendingQueue: [PendingEntry] = []
-
-    /// The active batch iterator (nil when idle).
+    private var sequences: [Int: SequenceState] = [:]
     private var iterator: BatchTokenIterator?
-
-    /// The decode loop task (nil when idle).
     private var decodeTask: Task<Void, Never>?
+    private var nextUID = 0
+    private var cancelledUIDs = Set<Int>()
 
-    /// Monotonically increasing UID counter.
-    private var nextUID: Int = 0
-
-    private struct PendingEntry {
-        let uid: Int
-        let request: InferenceRequest
-        let continuation: AsyncStream<Generation>.Continuation
-        let submitted: Date
-    }
-
-    // MARK: - Init
-
-    /// Create a scheduler bound to the given model context.
-    ///
-    /// - Parameters:
-    ///   - context: The loaded model context. The scheduler holds a strong reference.
-    ///   - config: Scheduling configuration.
     public init(context: ModelContext, config: Config = Config()) {
         self.context = context
         self.config = config
+        self.stopTokenIDs = buildStopTokenIDs(
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer
+        )
+        self.unknownTokenId = context.tokenizer.unknownTokenId
     }
 
-    // MARK: - Public API
-
-    /// Submit an inference request and return a streaming generation result.
-    ///
-    /// - Parameter request: The request to enqueue.
-    /// - Returns: An `AsyncStream<Generation>` that emits text chunks, tool calls, and
-    ///   completion info as the model generates tokens.
-    /// - Throws: ``SchedulerError/queueFull`` if the pending queue is at capacity.
-    public func submit(_ request: InferenceRequest) async throws -> AsyncStream<Generation> {
-        guard pendingQueue.count < config.maxQueueSize else {
-            throw SchedulerError.queueFull
+    static func isBatchCompatible(
+        input: LMInput,
+        parameters: GenerateParameters,
+        context: ModelContext
+    ) -> Bool {
+        guard input.image == nil, input.video == nil, input.text.mask == nil else {
+            return false
         }
 
-        var continuation: AsyncStream<Generation>.Continuation!
-        let stream = AsyncStream<Generation> { continuation = $0 }
+        // Batched KV quantization is not implemented for batch cache types.
+        guard parameters.kvBits == nil else {
+            return false
+        }
+
+        return supportsBatchCaches(context.model.newCache(parameters: parameters))
+    }
+
+    private static func supportsBatchCaches(_ caches: [KVCache]) -> Bool {
+        caches.allSatisfy { cache in
+            switch cache {
+            case is KVCacheSimple:
+                return true
+            case let rotating as RotatingKVCache:
+                return rotating.keepTokens == 0 && rotating.maxSize != nil
+            case is ArraysCache:
+                return true
+            case let list as CacheList:
+                return supportsBatchCaches((0 ..< list.count).map { list[$0] })
+            default:
+                return false
+            }
+        }
+    }
+
+    public func submit(_ request: InferenceRequest) async throws -> AsyncStream<Generation> {
+        guard sequences.count < config.maxQueueSize + config.completionBatchSize else {
+            throw SchedulerError.queueFull
+        }
 
         let uid = nextUID
         nextUID += 1
 
-        pendingQueue.append(PendingEntry(
+        let promptTokens = request.input.text.tokens.asArray(Int32.self).map(Int.init)
+        let (stream, continuation) = AsyncStream<Generation>.makeStream()
+
+        sequences[uid] = SequenceState(
             uid: uid,
-            request: request,
-            continuation: continuation,
-            submitted: .now
-        ))
+            promptTokenCount: promptTokens.count,
+            tokenizer: context.tokenizer,
+            modelConfiguration: context.configuration,
+            continuation: continuation
+        )
 
-        // Start the decode loop if it's not already running
+        let processor = request.parameters.processor().map(BatchLogitProcessorBox.init)
+        pendingQueue.append(
+            PendingEntry(
+                uid: uid,
+                promptTokens: promptTokens,
+                parameters: request.parameters,
+                sampler: request.parameters.sampler(),
+                processor: processor,
+                batchOptions: BatchExecutionOptions(parameters: request.parameters)
+            )
+        )
+
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.cancelSequence(uid: uid) }
+        }
+
         ensureDecodeLoopRunning()
-
         return stream
     }
 
-    // MARK: - Internal
+    public func cancelAll() {
+        let outstandingUIDs = Array(sequences.keys)
+        for uid in outstandingUIDs {
+            cancelSequenceInternal(uid: uid)
+        }
+
+        pendingQueue.removeAll()
+        cancelledUIDs.removeAll()
+        iterator = nil
+        decodeTask?.cancel()
+        decodeTask = nil
+    }
 
     private func ensureDecodeLoopRunning() {
-        guard decodeTask == nil || decodeTask!.isCancelled else { return }
+        guard decodeTask == nil else { return }
         decodeTask = Task { [weak self] in
             await self?.runDecodeLoop()
         }
     }
 
-    /// The main decode loop: runs until both the pending queue and active batch are empty.
     private func runDecodeLoop() async {
-        while !pendingQueue.isEmpty || (iterator?.batchSize ?? 0) > 0 {
-            // Admit pending requests into the active batch
+        defer { decodeTask = nil }
+
+        while !Task.isCancelled {
+            applyCancelledSequences()
             admitPending()
 
-            guard let iter = iterator, iter.batchSize > 0 else { break }
+            guard let localIterator = iterator else {
+                if pendingQueue.isEmpty {
+                    break
+                }
+                await Task.yield()
+                continue
+            }
 
-            // Run one decode step (this is the hot path)
-            let stepResults = iter.step()
+            let snapshot = localIterator
+            let result = try? await DeviceEngine.shared.run {
+                var iterator = snapshot
+                let responses = iterator.next()
+                return (responses, iterator)
+            }
+            guard let (responses, updatedIterator) = result else {
+                break
+            }
+            iterator = updatedIterator
 
-            // Deliver tokens and handle completions
-            processStepResults(stepResults)
+            applyCancelledSequences()
+            if let responses {
+                processStepResults(responses)
+            }
 
-            // Yield to allow new submissions to be processed
+            if iterator?.hasWork == false {
+                iterator = nil
+            }
+
+            if pendingQueue.isEmpty && sequences.isEmpty && iterator == nil {
+                break
+            }
+
             await Task.yield()
         }
 
-        // Cleanup
-        iterator = nil
-        decodeTask = nil
-    }
-
-    /// Admit pending requests into the active batch (up to `completionBatchSize`).
-    ///
-    /// Prefill runs synchronously on the actor's executor. MLX operations are
-    /// non-blocking (graph construction is fast; GPU evaluation is async via
-    /// `asyncEval`), so this does not stall other actor methods for long.
-    private func admitPending() {
-        let currentSize = iterator?.batchSize ?? 0
-        let available = config.completionBatchSize - currentSize
-        guard available > 0, !pendingQueue.isEmpty else { return }
-
-        let toAdmit = Array(pendingQueue.prefix(min(available, config.prefillBatchSize)))
-        pendingQueue.removeFirst(toAdmit.count)
-
-        // Prefill each pending sequence individually on the actor's executor
-        var prefilled: [(sequence: SequenceState, caches: [KVCacheSimple])] = []
-
-        for entry in toAdmit {
-            do {
-                let promptTokens = entry.request.input.text.tokens.asArray(Int32.self).map { Int($0) }
-                let params = entry.request.parameters
-
-                let (caches, firstToken) = try BatchTokenIterator.prefillSingle(
-                    promptTokens: promptTokens,
-                    model: context.model,
-                    parameters: params
-                )
-
-                let seq = SequenceState(
-                    uid: entry.uid,
-                    currentToken: firstToken,
-                    promptTokens: promptTokens,
-                    parameters: params,
-                    tokenizer: context.tokenizer,
-                    continuation: entry.continuation
-                )
-
-                prefilled.append((seq, caches))
-
-            } catch {
-                // Prefill failed — deliver the error and skip this sequence
-                entry.continuation.finish()
-            }
-        }
-
-        guard !prefilled.isEmpty else { return }
-
-        // Merge into the active batch iterator
-        if let existingIter = iterator {
-            // Single-to-batch upgrade: add each new sequence to the existing batch
-            for (seq, caches) in prefilled {
-                existingIter.addSequence(seq, perLayerCache: caches)
-            }
-        } else {
-            // Create a new iterator from the freshly prefilled sequences
-            let sequences = prefilled.map { $0.sequence }
-            let caches = prefilled.map { $0.caches }
-            iterator = BatchTokenIterator(
-                sequences: sequences,
-                perSequenceCaches: caches,
-                model: context.model
-            )
-        }
-    }
-
-    /// Process decode step results: deliver tokens, finish completed sequences.
-    private func processStepResults(_ results: [BatchStepResult]) {
-        guard let iter = iterator else { return }
-
-        var finishedIndices: [Int] = []
-
-        for (idx, result) in results.enumerated() {
-            let seq = iter.activeSequences[idx]
-
-            // Decode the token to text
-            let text = context.tokenizer.decode(tokens: [result.token])
-
-            // Check if it's actually an EOS or just an empty string
-            let isEOS = result.token == context.tokenizer.eosTokenId
-
-            if !isEOS && !text.isEmpty {
-                seq.continuation.yield(.chunk(text))
-            }
-
-            if result.isDone {
-                let promptTime = seq.decodeStartTime.map { $0.timeIntervalSince(seq.prefillStartTime) } ?? 0
-                let decodeTime = seq.decodeStartTime.map { Date.now.timeIntervalSince($0) } ?? 0
-
-                let info = GenerateCompletionInfo(
-                    promptTokenCount: seq.promptTokenCount,
-                    generationTokenCount: seq.numTokens,
-                    promptTime: promptTime,
-                    generationTime: decodeTime,
-                    stopReason: seq.stopReason
-                )
-                seq.continuation.yield(.info(info))
-                seq.continuation.finish()
-                finishedIndices.append(idx)
-            }
-        }
-
-        // Remove finished sequences (in reverse order to preserve indices)
-        if !finishedIndices.isEmpty {
-            iter.removeSequences(at: finishedIndices.reversed())
-        }
-
-        // If the batch is now empty, clear the iterator
-        if iter.batchSize == 0 {
+        applyCancelledSequences()
+        if Task.isCancelled {
             iterator = nil
         }
     }
 
-    // MARK: - Cancellation
+    private func admitPending() {
+        guard !pendingQueue.isEmpty else { return }
 
-    /// Cancel all pending and active requests.
-    public func cancelAll() {
-        // Finish all pending continuations
-        for entry in pendingQueue {
-            entry.continuation.finish()
+        if iterator == nil, let first = pendingQueue.first {
+            iterator = BatchTokenIterator(
+                model: context.model,
+                configuration: BatchIteratorConfiguration(
+                    completionBatchSize: config.completionBatchSize,
+                    prefillBatchSize: config.prefillBatchSize,
+                    generation: first.parameters
+                ),
+                stopTokens: stopTokenIDs,
+                unknownTokenId: unknownTokenId
+            )
         }
-        pendingQueue.removeAll()
 
-        // The decode loop will see an empty batch and exit naturally
-        decodeTask?.cancel()
+        guard let iterator else { return }
+        let targetOptions = iterator.batchOptions
+
+        var accepted: [PendingEntry] = []
+        var deferred: [PendingEntry] = []
+        for entry in pendingQueue {
+            if entry.batchOptions == targetOptions {
+                accepted.append(entry)
+            } else {
+                deferred.append(entry)
+            }
+        }
+
+        pendingQueue = deferred
+        guard !accepted.isEmpty else { return }
+
+        var updatedIterator = iterator
+        updatedIterator.insert(
+            uids: accepted.map(\.uid),
+            prompts: accepted.map(\.promptTokens),
+            maxTokens: accepted.map(\.maxTokens),
+            samplers: accepted.map(\.sampler),
+            processors: accepted.map(\.processor)
+        )
+        self.iterator = updatedIterator
+    }
+
+    private func processStepResults(_ responses: [BatchTokenIterator.Response]) {
+        var emittedCancellationUIDs: [Int] = []
+
+        for response in responses {
+            guard let sequence = sequences[response.uid] else { continue }
+
+            let isStopToken = response.token == unknownTokenId || stopTokenIDs.contains(response.token)
+
+            if !isStopToken {
+                sequence.recordGeneratedToken(response.token)
+                if !sequence.emitToken(response.token) {
+                    emittedCancellationUIDs.append(response.uid)
+                    continue
+                }
+            }
+
+            if let stopReason = response.stopReason {
+                sequences.removeValue(forKey: response.uid)
+                sequence.finish(stopReason: stopReason)
+            }
+        }
+
+        for uid in emittedCancellationUIDs {
+            cancelSequenceInternal(uid: uid)
+        }
+    }
+
+    private func cancelSequence(uid: Int) {
+        cancelSequenceInternal(uid: uid)
+    }
+
+    private func cancelSequenceInternal(uid: Int) {
+        pendingQueue.removeAll { $0.uid == uid }
+        cancelledUIDs.insert(uid)
+
+        guard let sequence = sequences.removeValue(forKey: uid) else { return }
+        sequence.finish(stopReason: .cancelled)
+    }
+
+    private func applyCancelledSequences() {
+        guard !cancelledUIDs.isEmpty else { return }
+
+        pendingQueue.removeAll { cancelledUIDs.contains($0.uid) }
+
+        if var iterator {
+            iterator.remove(uids: cancelledUIDs)
+            self.iterator = iterator.hasWork ? iterator : nil
+        }
+
+        cancelledUIDs.removeAll()
     }
 }

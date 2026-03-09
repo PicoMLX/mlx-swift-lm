@@ -2,7 +2,9 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+import MLXNN
+import Tokenizers
+@testable import MLXLMCommon
 import Testing
 
 // MARK: - BatchKVCache Tests
@@ -141,6 +143,23 @@ struct BatchKVCacheTests {
         #expect(filtered.state.first?.shape == [2, nHeads, 10, headDim])
     }
 
+    @Test("BatchKVCache.filter trims shared left padding")
+    func testFilterTrimsSharedPadding() {
+        let nLayers = 1
+
+        let longPrompt = (0 ..< nLayers).map { _ in makeSimpleCache(seqLen: 20) }
+        let shortPrompt = (0 ..< nLayers).map { _ in makeSimpleCache(seqLen: 12) }
+
+        let batchCaches = BatchKVCache.fromSingle(perSequenceCaches: [longPrompt, shortPrompt])
+        let filtered = batchCaches[0].filter(keepIndices: [1])
+        eval(filtered.state)
+
+        #expect(filtered.batchSize == 1)
+        #expect(filtered.leftPadding == [0])
+        #expect(filtered.offset == 12)
+        #expect(filtered.extract(index: 0).offset == 12)
+    }
+
     // MARK: - extract
 
     @Test("BatchKVCache.extract returns single-sequence cache")
@@ -253,5 +272,267 @@ struct InferenceSchedulerConfigTests {
         #expect(config.completionBatchSize == 8)
         #expect(config.prefillBatchSize == 2)
         #expect(config.maxQueueSize == 16)
+    }
+}
+
+@Suite("BatchTokenIterator")
+struct BatchTokenIteratorTests {
+
+    @Test("Iterator emits the prefetched first token and stops immediately on prefetched EOS")
+    func testIteratorFirstTokenAndPrefetchedEOS() {
+        let model = DeterministicBatchLanguageModel(
+            transitions: [
+                10: 3,
+                3: 4,
+                4: 0,
+                20: 0,
+            ]
+        )
+
+        var iterator = BatchTokenIterator(
+            model: model,
+            configuration: BatchIteratorConfiguration(
+                completionBatchSize: 4,
+                prefillBatchSize: 4,
+                generation: GenerateParameters(maxTokens: 4, temperature: 0)
+            ),
+            stopTokens: [0],
+            unknownTokenId: nil
+        )
+
+        iterator.insert(
+            uids: [1, 2],
+            prompts: [[10], [20]],
+            maxTokens: [4, 4],
+            samplers: [ArgMaxSampler(), ArgMaxSampler()],
+            processors: [nil, nil]
+        )
+
+        let firstStep = Dictionary(uniqueKeysWithValues: (iterator.next() ?? []).map { ($0.uid, $0) })
+        #expect(firstStep[1]?.token == 3)
+        if firstStep[1]?.stopReason != nil {
+            Issue.record("Expected first prefetched token to remain active")
+        }
+        #expect(firstStep[2]?.token == 0)
+        if case .some(.stop) = firstStep[2]?.stopReason {
+        } else {
+            Issue.record("Expected prefetched EOS to stop immediately")
+        }
+
+        let secondStep = iterator.next() ?? []
+        #expect(secondStep.count == 1)
+        #expect(secondStep.first?.uid == 1)
+        #expect(secondStep.first?.token == 4)
+    }
+}
+
+@Suite("Batching Helpers")
+struct BatchingHelperTests {
+
+    @Test("StreamingGenerationProcessor waits for complete UTF-8 output")
+    func testStreamingGenerationProcessorUTF8Boundary() async {
+        let tokenizer = DeterministicTokenizer()
+        let (stream, continuation) = AsyncStream<Generation>.makeStream()
+        var processor = StreamingGenerationProcessor(tokenizer: tokenizer, format: .json)
+
+        if !processor.onToken(1, emit: continuation.yield) {
+            Issue.record("Processor should keep waiting after incomplete UTF-8 token")
+        }
+        if !processor.onToken(2, emit: continuation.yield) {
+            Issue.record("Processor should emit once the UTF-8 sequence is complete")
+        }
+        continuation.finish()
+
+        var chunks: [String] = []
+        for await generation in stream {
+            if case .chunk(let text) = generation {
+                chunks.append(text)
+            }
+        }
+
+        #expect(chunks == ["é"])
+    }
+
+    @Test("Scheduler compatibility gate rejects unsupported inputs and cache graphs")
+    func testSchedulerCompatibilityGate() {
+        let tokenizer = DeterministicTokenizer()
+        let configuration = ModelConfiguration(
+            id: "test",
+            extraEOSTokens: ["<extra-eos>"]
+        )
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+
+        let supportedContext = ModelContext(
+            configuration: configuration,
+            model: DeterministicBatchLanguageModel(transitions: [1: 2]),
+            processor: processor,
+            tokenizer: tokenizer
+        )
+        let unsupportedContext = ModelContext(
+            configuration: configuration,
+            model: UnsupportedBatchLanguageModel(),
+            processor: processor,
+            tokenizer: tokenizer
+        )
+
+        let textOnlyInput = LMInput(tokens: MLXArray([Int32(1)]))
+        let maskedInput = LMInput(
+            tokens: MLXArray([Int32(1)]),
+            mask: MLXArray([Int32(1)])
+        )
+        let imageInput = LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            image: .init(pixels: MLXArray.zeros([1, 1, 1, 1]))
+        )
+
+        #expect(
+            InferenceScheduler.isBatchCompatible(
+                input: textOnlyInput,
+                parameters: GenerateParameters(),
+                context: supportedContext
+            )
+        )
+        #expect(
+            !InferenceScheduler.isBatchCompatible(
+                input: maskedInput,
+                parameters: GenerateParameters(),
+                context: supportedContext
+            )
+        )
+        #expect(
+            !InferenceScheduler.isBatchCompatible(
+                input: imageInput,
+                parameters: GenerateParameters(),
+                context: supportedContext
+            )
+        )
+        #expect(
+            !InferenceScheduler.isBatchCompatible(
+                input: textOnlyInput,
+                parameters: GenerateParameters(kvBits: 4),
+                context: supportedContext
+            )
+        )
+        #expect(
+            !InferenceScheduler.isBatchCompatible(
+                input: textOnlyInput,
+                parameters: GenerateParameters(),
+                context: unsupportedContext
+            )
+        )
+    }
+}
+
+private struct DeterministicTokenizer: Tokenizer {
+    private let tokens: [Int: String] = [
+        0: "<eos>",
+        2: "suffix",
+        3: "!",
+        4: "done",
+    ]
+
+    func tokenize(text: String) -> [String] { [text] }
+    func encode(text: String) -> [Int] { [] }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokens: [Int], skipSpecialTokens: Bool) -> String {
+        if tokens == [1] {
+            return "\u{fffd}"
+        }
+        if tokens == [1, 2] {
+            return "é"
+        }
+        if tokens == [1, 2, 3] {
+            return "é!"
+        }
+        return tokens.compactMap { self.tokens[$0] }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? {
+        tokens.first(where: { $0.value == token })?.key
+    }
+    func convertIdToToken(_ id: Int) -> String? { tokens[id] }
+
+    var bosToken: String? = nil
+    var bosTokenId: Int? = nil
+    var eosToken: String? = "<eos>"
+    var eosTokenId: Int? = 0
+    var unknownToken: String? = nil
+    var unknownTokenId: Int? = 99
+
+    func applyChatTemplate(messages: [Tokenizers.Message]) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Tokenizers.Message], tools: [Tokenizers.ToolSpec]?) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [Tokenizers.Message],
+        tools: [Tokenizers.ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Tokenizers.Message], chatTemplate: Tokenizers.ChatTemplateArgument) throws -> [Int] { [] }
+    func applyChatTemplate(messages: [Tokenizers.Message], chatTemplate: String) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [Tokenizers.Message],
+        chatTemplate: Tokenizers.ChatTemplateArgument?,
+        addGenerationPrompt: Bool,
+        truncation: Bool,
+        maxLength: Int?,
+        tools: [Tokenizers.ToolSpec]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [Tokenizers.Message],
+        chatTemplate: Tokenizers.ChatTemplateArgument?,
+        addGenerationPrompt: Bool,
+        truncation: Bool,
+        maxLength: Int?,
+        tools: [Tokenizers.ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+private class DeterministicBatchLanguageModel: Module, LanguageModel {
+    private let transitions: [Int: Int]
+    private let vocabSize: Int
+
+    init(transitions: [Int: Int], vocabSize: Int = 128) {
+        self.transitions = transitions
+        self.vocabSize = vocabSize
+        super.init()
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let shape = inputs.shape
+        let batch = shape[0]
+        let length = shape[1]
+        let tokens = inputs.asArray(Int32.self)
+        var logits = Array(repeating: Float(0), count: batch * length * vocabSize)
+
+        for batchIndex in 0 ..< batch {
+            for tokenIndex in 0 ..< length {
+                let token = Int(tokens[batchIndex * length + tokenIndex])
+                let nextToken = transitions[token] ?? 0
+                logits[(batchIndex * length + tokenIndex) * vocabSize + nextToken] = 1_000
+            }
+        }
+
+        return MLXArray(logits, [batch, length, vocabSize])
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [KVCacheSimple()]
+    }
+}
+
+private final class UnsupportedBatchLanguageModel: DeterministicBatchLanguageModel {
+    init() {
+        super.init(transitions: [:])
+    }
+
+    override func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [QuantizedKVCache()]
     }
 }

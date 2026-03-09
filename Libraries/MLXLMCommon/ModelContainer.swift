@@ -199,24 +199,24 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
-        // Route through the scheduler when batched inference is enabled
-        if let scheduler {
-            let request = InferenceRequest(input: input, parameters: parameters)
-            return try await scheduler.submit(request)
-        }
-
         let input = SendableBox(input)
-
-        // Note: this is only visiting the model exclusively
-        // for the pre-fill time.  Beyond that there is no
-        // shared mutable state.
-        //
-        // This means that there may be concurrent access to the
-        // model weights themselves (but they are already evaluated).
-
         return try await context.read { context in
-            try MLXLMCommon.generate(
-                input: input.consume(),
+            let input = input.consume()
+
+            if let scheduler,
+                InferenceScheduler.isBatchCompatible(
+                    input: input,
+                    parameters: parameters,
+                    context: context
+                )
+            {
+                return try await scheduler.submit(
+                    InferenceRequest(input: input, parameters: parameters)
+                )
+            }
+
+            return try MLXLMCommon.generate(
+                input: input,
                 parameters: parameters,
                 context: context,
                 wiredMemoryTicket: wiredMemoryTicket

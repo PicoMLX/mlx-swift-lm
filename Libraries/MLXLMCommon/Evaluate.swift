@@ -535,7 +535,7 @@ private struct SynchronousGenerationLoopResult {
     let stopReason: GenerateStopReason
 }
 
-private func buildStopTokenIDs(
+func buildStopTokenIDs(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer
 ) -> Set<Int> {
@@ -550,6 +550,38 @@ private func buildStopTokenIDs(
         }
     }
     return stopTokenIDs
+}
+
+struct StreamingGenerationProcessor: @unchecked Sendable {
+    private var detokenizer: NaiveStreamingDetokenizer
+    private let toolCallProcessor: ToolCallProcessor
+
+    init(tokenizer: Tokenizer, format: ToolCallFormat) {
+        detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        toolCallProcessor = ToolCallProcessor(format: format)
+    }
+
+    mutating func onToken(
+        _ token: Int,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> Bool {
+        detokenizer.append(token: token)
+        if let chunk = detokenizer.next() {
+            if let textToYield = toolCallProcessor.processChunk(chunk) {
+                if case .terminated = emit(.chunk(textToYield)) {
+                    return false
+                }
+            }
+
+            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                if case .terminated = emit(.toolCall(toolCall)) {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
 }
 
 private func runSynchronousGenerationLoop(
@@ -1298,36 +1330,17 @@ private protocol TokenLoopHandler: Sendable {
 private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     typealias Output = Generation
 
-    var detokenizer: NaiveStreamingDetokenizer
-    let toolCallProcessor: ToolCallProcessor
+    var processor: StreamingGenerationProcessor
 
     init(tokenizer: Tokenizer, format: ToolCallFormat) {
-        detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format)
+        processor = StreamingGenerationProcessor(tokenizer: tokenizer, format: format)
     }
 
     mutating func onToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> Bool {
-        detokenizer.append(token: token)
-        if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
-                }
-            }
-
-            // Check if we have a complete tool call.
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
-            }
-        }
-
-        return true
+        processor.onToken(token, emit: emit)
     }
 
     mutating func onStopToken(
