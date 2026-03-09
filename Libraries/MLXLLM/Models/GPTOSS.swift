@@ -253,8 +253,8 @@ class AttentionBlock: Module {
         }
 
         if let cache {
-            q = rope(q, offset: cache.offset)
-            k = rope(k, offset: cache.offset)
+            q = applyRotaryPosition(rope, to: q, cache: cache)
+            k = applyRotaryPosition(rope, to: k, cache: cache)
             (k, v) = cache.update(keys: k, values: v)
         } else {
             q = rope(q)

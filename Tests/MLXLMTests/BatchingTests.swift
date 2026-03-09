@@ -303,6 +303,7 @@ struct BatchTokenIteratorTests {
         iterator.insert(
             uids: [1, 2],
             prompts: [[10], [20]],
+            promptCaches: [nil, nil],
             maxTokens: [4, 4],
             samplers: [ArgMaxSampler(), ArgMaxSampler()],
             processors: [nil, nil]

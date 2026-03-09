@@ -10,10 +10,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-protocol SmolLM3PositionEmbedding {
-    func callAsFunction(_ x: MLXArray, offset: Int) -> MLXArray
-    func callAsFunction(_ x: MLXArray) -> MLXArray
-}
+protocol SmolLM3PositionEmbedding: OffsetLayer {}
 
 extension RoPE: SmolLM3PositionEmbedding {}
 
@@ -79,11 +76,11 @@ class SmolLM3Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         } else {
-            queries = rope(queries)
-            keys = rope(keys)
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
         }
 
         let output = attentionWithCacheUpdate(

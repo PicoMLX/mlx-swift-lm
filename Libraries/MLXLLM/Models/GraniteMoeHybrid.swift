@@ -246,8 +246,8 @@ class GraniteMoeHybridAttention: Module {
 
         if let rope {
             if let cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
+                queries = applyRotaryPosition(rope, to: queries, cache: cache)
+                keys = applyRotaryPosition(rope, to: keys, cache: cache)
             } else {
                 queries = rope(queries, offset: 0)
                 keys = rope(keys, offset: 0)

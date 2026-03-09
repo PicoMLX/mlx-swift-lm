@@ -225,8 +225,8 @@ private class ApertusAttention: Module {
 
         // 4. RoPE
         if let cache = cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
             // Update cache (expects [B, H, L, D])
             let (k, v) = cache.update(keys: keys, values: values)

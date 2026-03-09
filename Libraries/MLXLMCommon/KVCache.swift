@@ -224,11 +224,19 @@ public func makeAttentionMask(
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let t = h.dim(1)
     if t > 1 {
-        var offset = 0
-        if let c = cache?.first {
-            offset = c.offset
+        if let cache = cache?.first {
+            switch cache.makeMask(n: t, windowSize: nil, returnArray: true) {
+            case .array(let mask):
+                return mask
+            case .arrays(let masks):
+                return masks.first
+            case .none:
+                return nil
+            case .causal:
+                return createCausalMask(n: t, offset: cache.offset)
+            }
         }
-        return createCausalMask(n: t, offset: offset)
+        return createCausalMask(n: t, offset: 0)
     }
     return nil
 }
@@ -242,22 +250,17 @@ public func createAttentionMask(h: MLXArray, cache: [KVCache]?, returnArray: Boo
 {
     let t = h.dim(1)
     if t > 1 {
-        var returnArray = returnArray
-        var offset = 0
-        var windowSize: Int? = nil
-        if let c = cache?.first {
-            offset = c.offset
-            if let maxSize = c.maxSize {
-                windowSize = maxSize
-                offset = min(maxSize - 1, offset)
-                if !returnArray {
-                    returnArray = offset + t > maxSize
-                }
-            }
+        if let cache = cache?.first {
+            return createAttentionMask(
+                h: h,
+                cache: cache,
+                windowSize: cache.maxSize,
+                returnArray: returnArray
+            )
         }
 
         if returnArray {
-            return .array(createCausalMask(n: t, offset: offset, windowSize: windowSize))
+            return .array(createCausalMask(n: t, offset: 0, windowSize: nil))
         } else {
             return .causal
         }

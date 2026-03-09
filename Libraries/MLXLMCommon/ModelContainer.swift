@@ -199,26 +199,65 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
+        try await generate(
+            input: input,
+            cache: nil,
+            parameters: parameters,
+            wiredMemoryTicket: wiredMemoryTicket
+        )
+    }
+
+    public func generate(
+        input: consuming sending LMInput,
+        cache: consuming [KVCache]? = nil,
+        parameters: GenerateParameters,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
+        let cache = SendableBox(cache)
         return try await context.read { context in
             let input = input.consume()
+            let cache = cache.consume()
 
             if let scheduler,
                 InferenceScheduler.isBatchCompatible(
                     input: input,
+                    promptCache: cache,
                     parameters: parameters,
                     context: context
                 )
             {
                 return try await scheduler.submit(
-                    InferenceRequest(input: input, parameters: parameters)
+                    InferenceRequest(input: input, promptCache: cache, parameters: parameters)
                 )
             }
 
             return try MLXLMCommon.generate(
                 input: input,
+                cache: cache,
                 parameters: parameters,
                 context: context,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
+    public func generateTokens(
+        input: consuming sending LMInput,
+        cache: consuming [KVCache]? = nil,
+        parameters: GenerateParameters,
+        includeStopToken: Bool = false,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<TokenGeneration> {
+        let input = SendableBox(input)
+        let cache = SendableBox(cache)
+        return try await context.read { context in
+            try MLXLMCommon.generateTokens(
+                input: input.consume(),
+                cache: cache.consume(),
+                parameters: parameters,
+                context: context,
+                includeStopToken: includeStopToken,
                 wiredMemoryTicket: wiredMemoryTicket
             )
         }

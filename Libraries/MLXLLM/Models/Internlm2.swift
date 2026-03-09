@@ -9,7 +9,7 @@ import MLXNN
 
 // Port of https://github.com/maiqingqiang/mlx-examples/blob/main/llms/mlx_lm/models/internlm2.py
 
-class Internlm2DynamicNTKScalingRoPE: Module {
+class Internlm2DynamicNTKScalingRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let maxPositionEmbeddings: Int
     let traditional: Bool
@@ -29,6 +29,19 @@ class Internlm2DynamicNTKScalingRoPE: Module {
 
     func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
         let seqLen = x.dim(1) + offset
+        var base = originalBase
+        if seqLen > maxPositionEmbeddings {
+            base *= pow(
+                (scale * Float(seqLen) / Float(maxPositionEmbeddings)) - (scale - 1),
+                Float(dims) / Float(dims - 2))
+        }
+        return MLXFast.RoPE(
+            x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+    }
+
+    func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
+        let maxOffset = offset.max().item(Int.self)
+        let seqLen = x.dim(2) + maxOffset
         var base = originalBase
         if seqLen > maxPositionEmbeddings {
             base *= pow(
@@ -109,8 +122,8 @@ class Internlm2Attention: Module {
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
         } else {
             queries = rope(queries)
             keys = rope(keys)

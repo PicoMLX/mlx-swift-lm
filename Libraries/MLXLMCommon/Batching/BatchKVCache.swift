@@ -512,7 +512,7 @@ public class BatchRotatingKVCache: BaseKVCache {
         ensureTemporalOrder()
         other.ensureTemporalOrder()
 
-        guard let currentKeys = keys, let currentValues = values else {
+        guard let currentKeys = keys, values != nil else {
             fatalError("BatchRotatingKVCache missing backing storage during extend")
         }
 

@@ -76,24 +76,23 @@ final class NanoChatAttention: Module {
         keys = keys.reshaped(batchSize, sequenceLength, numKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(batchSize, sequenceLength, numKVHeads, -1).transposed(0, 2, 1, 3)
 
-        let offset = cache?.offset ?? 0
         let freqs = _ropeFreqs
-        queries = MLXFast.RoPE(
+        queries = applyRotaryPosition(
             queries,
+            cache: cache,
             dimensions: headDim,
             traditional: false,
             base: nil,
             scale: 1.0,
-            offset: offset,
             freqs: freqs
         )
-        keys = MLXFast.RoPE(
+        keys = applyRotaryPosition(
             keys,
+            cache: cache,
             dimensions: headDim,
             traditional: false,
             base: nil,
             scale: 1.0,
-            offset: offset,
             freqs: freqs
         )
 
