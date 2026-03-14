@@ -34,6 +34,7 @@ private func assertArraysClose(_ lhs: [MLXArray], _ rhs: [MLXArray], label: Stri
 // MARK: - Original parameterized test (updated with value assertions)
 
 @Test(
+    .enabled(if: MLXMetalGuard.isAvailable, "Requires MLX Metal library (unavailable in SPM debug builds)"),
     .serialized,
     arguments: cacheCreators)
 func testCacheSerialization(creator: (() -> any KVCache)) async throws {
