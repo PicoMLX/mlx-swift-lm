@@ -4,17 +4,19 @@ import MLXLMCommon
 import Testing
 
 @Test(
-    .enabled(if: MLXMetalGuard.isAvailable, "Requires MLX Metal library (unavailable in SPM debug builds)"),
+    .enabled(
+        if: MLXMetalGuard.isAvailable,
+        "Requires MLX Metal library (unavailable in SPM debug builds)"),
     .serialized,
     arguments: [
-        ({ KVCacheSimple() }),
-        ({ RotatingKVCache(maxSize: 32) }),
-        ({ QuantizedKVCache() }),
-        ({ ChunkedKVCache(chunkSize: 16) }),
-        ({ ArraysCache(size: 2) }),
-        ({ MambaCache() }),
+        ({ KVCacheSimple() } as @Sendable () -> any KVCache),
+        ({ RotatingKVCache(maxSize: 32) } as @Sendable () -> any KVCache),
+        ({ QuantizedKVCache() } as @Sendable () -> any KVCache),
+        ({ ChunkedKVCache(chunkSize: 16) } as @Sendable () -> any KVCache),
+        ({ ArraysCache(size: 2) } as @Sendable () -> any KVCache),
+        ({ MambaCache() } as @Sendable () -> any KVCache),
     ])
-func testCacheSerialization(creator: (() -> any KVCache)) async throws {
+func testCacheSerialization(creator: @Sendable () -> any KVCache) async throws {
     let cache = (0 ..< 10).map { _ in creator() }
     let keys = MLXArray.ones([1, 8, 32, 64], dtype: .bfloat16)
     let values = MLXArray.ones([1, 8, 32, 64], dtype: .bfloat16)
