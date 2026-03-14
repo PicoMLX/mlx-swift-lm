@@ -4,6 +4,7 @@ import MLXLMCommon
 import Testing
 
 @Test(
+    .enabled(if: MLXMetalGuard.isAvailable, "Requires MLX Metal library (unavailable in SPM debug builds)"),
     .serialized,
     arguments: [
         ({ KVCacheSimple() }),
