@@ -250,7 +250,8 @@ public final class ModelContainer: Sendable {
                 cachedKVState: cachedKVState,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
-                inputTokens: inputTokens
+                inputTokens: inputTokens,
+                wiredMemoryTicket: wiredMemoryTicket
             )
         }
 
