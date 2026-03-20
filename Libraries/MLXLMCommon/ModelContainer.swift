@@ -31,6 +31,7 @@ import MLXNN
 /// ```
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
+    private let loadedAsVLM: Bool
 
     /// Optional inference scheduler for transparent batching support.
     ///
@@ -69,6 +70,7 @@ public final class ModelContainer: Sendable {
     }
 
     public init(context: consuming ModelContext, scheduler: InferenceScheduler? = nil) {
+        self.loadedAsVLM = context.loadedAsVLM
         self.context = .init(context)
         self.scheduler = scheduler
     }
@@ -208,10 +210,10 @@ public final class ModelContainer: Sendable {
         let input = SendableBox(input)
 
         // When a scheduler is set, route through InferenceScheduler for
-        // transparent batching. The scheduler handles batch compatibility
-        // checks internally — incompatible requests (VLMs, kvBits, SSM models)
-        // automatically fall back to the single TokenIterator path.
-        if let scheduler {
+        // transparent batching. VLMs are excluded at this level (!loadedAsVLM);
+        // the scheduler handles remaining compatibility checks (multimodal
+        // inputs, kvBits, SSM models) and falls back to single TokenIterator.
+        if let scheduler, !loadedAsVLM {
             let lmInput = input.consume()
 
             // Read model, tokenizer, and configuration from the context.
