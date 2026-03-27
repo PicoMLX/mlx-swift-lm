@@ -1165,7 +1165,7 @@ public class ArraysCache: BaseKVCache {
             return result
         }
         set {
-            // Handled by restoreFromMetaState
+            assertionFailure("ArraysCache.metaState should not be set directly. Use restoreFromMetaState() instead")
         }
     }
 
@@ -1306,7 +1306,7 @@ public class CacheList: BaseKVCache {
             return result
         }
         set {
-            // Handled by fromState
+            assertionFailure("CacheList.metaState should not be set directly. Use CacheList.fromState() instead")
         }
     }
 
