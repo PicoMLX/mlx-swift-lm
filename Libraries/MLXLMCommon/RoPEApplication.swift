@@ -6,10 +6,16 @@ import MLXNN
 
 // MARK: - applyRotaryPosition Helper
 
-/// Apply rotary position embeddings, using the cache offset when available.
+/// Apply rotary position embeddings, dispatching to the appropriate offset type
+/// based on the cache.
 ///
-/// This function enables models to use a single call site instead of
-/// repeating conditional offset handling:
+/// - For `BatchPositionedKVCache`: uses `ArrayOffsetLayer` with per-sequence
+///   `MLXArray` offsets for batched inference.
+/// - For single caches (non-batch): uses `OffsetLayer` with scalar `Int` offset.
+/// - For `nil` cache: uses `OffsetLayer` with offset `0`.
+///
+/// This function enables models to use a single call site that transparently
+/// supports both single-request and batched inference:
 /// ```swift
 /// queries = applyRotaryPosition(rope, to: queries, cache: cache)
 /// keys = applyRotaryPosition(rope, to: keys, cache: cache)
@@ -18,10 +24,16 @@ import MLXNN
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
 ///   - x: The input tensor to apply RoPE to.
-///   - cache: The KV cache (determines offset), or `nil` for offset 0.
+///   - cache: The KV cache (determines offset type), or `nil` for offset 0.
 /// - Returns: The input with rotary positional encoding applied.
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
-    return rope(x, offset: cache?.offset ?? 0)
+    if let batchCache = cache as? BatchPositionedKVCache {
+        // Batch path: per-sequence MLXArray offsets
+        return rope(x, offset: batchCache.batchOffset)
+    } else {
+        // Single path: scalar Int offset (or 0 for nil cache)
+        return rope(x, offset: cache?.offset ?? 0)
+    }
 }
