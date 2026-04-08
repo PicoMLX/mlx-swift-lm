@@ -91,12 +91,22 @@ struct BatchTokenIteratorTests {
             processors: [processorA, processorB]
         )
 
-        while let responses = iterator.next(), !responses.isEmpty {}
+        var tokensPerRequest = [[Int]]()
+        while let responses = iterator.next(), !responses.isEmpty {
+            tokensPerRequest.append(responses.map(\.token))
+        }
+
+        let returnedTokensA = tokensPerRequest.map { $0[0] }
+        let returnedTokensB = tokensPerRequest.map { $0[1] }
 
         #expect(processorA.promptTokens == [[1, 2, 3]])
         #expect(processorB.promptTokens == [[8, 9]])
-        #expect(processorA.sampledTokens.count == 2)
-        #expect(processorB.sampledTokens.count == 2)
+        #expect(returnedTokensA == [4, 5])
+        #expect(returnedTokensB == [10, 11])
+        // BatchTokenIterator mirrors TokenIterator's one-token lookahead:
+        // processors observe the sampled token that primes the next step.
+        #expect(processorA.sampledTokens == [4, 5, 6])
+        #expect(processorB.sampledTokens == [10, 11, 12])
     }
 
     @Test("Cache clear hook runs at the configured interval")
