@@ -3,7 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
-import Tokenizers
+//import Tokenizers
 
 // MARK: - InferenceScheduler
 
@@ -23,7 +23,14 @@ import Tokenizers
 ///
 /// Usage:
 /// ```swift
-/// let scheduler = InferenceScheduler()
+/// let scheduler = InferenceScheduler(
+///     configuration: .init(
+///         completionBatchSize: 16,
+///         prefillBatchSize: 4,
+///         prefillStepSize: 1024,
+///         cacheClearInterval: 512
+///     )
+/// )
 /// let stream = scheduler.submit(
 ///     input: lmInput,
 ///     parameters: params,
@@ -37,6 +44,26 @@ import Tokenizers
 /// }
 /// ```
 public actor InferenceScheduler {
+
+    /// Configuration controlling how the scheduler constructs and drives batch mode.
+    public struct Configuration: Sendable {
+        public var completionBatchSize: Int
+        public var prefillBatchSize: Int
+        public var prefillStepSize: Int
+        public var cacheClearInterval: Int
+
+        public init(
+            completionBatchSize: Int = 32,
+            prefillBatchSize: Int = 8,
+            prefillStepSize: Int = 2048,
+            cacheClearInterval: Int = 512
+        ) {
+            self.completionBatchSize = completionBatchSize
+            self.prefillBatchSize = prefillBatchSize
+            self.prefillStepSize = prefillStepSize
+            self.cacheClearInterval = cacheClearInterval
+        }
+    }
 
     // MARK: - State Machine
 
@@ -237,6 +264,9 @@ public actor InferenceScheduler {
 
         /// Optional active ticket for this request.
         let wiredMemoryTicket: WiredMemoryTicket?
+
+        /// The request's cache-shaping policy for batch compatibility.
+        let cacheMaxKVSize: Int?
     }
 
     /// State for batched generation.
@@ -282,6 +312,9 @@ public actor InferenceScheduler {
 
         /// Mapping from UID -> active wired-memory ticket.
         var wiredMemoryTickets: [Int: WiredMemoryTicket]
+
+        /// Cache-shaping policy shared by every request in this batch.
+        let cacheMaxKVSize: Int?
     }
 
     // MARK: - Properties
@@ -292,9 +325,14 @@ public actor InferenceScheduler {
     /// Monotonically increasing request ID counter.
     private var requestCounter: Int = 0
 
+    /// Batch construction and housekeeping configuration.
+    private let configuration: Configuration
+
     // MARK: - Init
 
-    public init() {}
+    public init(configuration: Configuration = .init()) {
+        self.configuration = configuration
+    }
 
     // MARK: - Public API
 
@@ -497,6 +535,26 @@ public actor InferenceScheduler {
 
                 switch state {
                 case .pendingUpgrade(let pending) where pending.requestID == singleState.requestID:
+                    guard Self.canShareBatch(
+                        cacheMaxKVSize: pending.cacheMaxKVSize,
+                        parameters: parameters
+                    ) else {
+                        state = .single(singleState)
+                        return try await createSingleStream(
+                            handler: handler,
+                            input: input,
+                            parameters: parameters,
+                            model: model,
+                            cache: cachedKVState ?? cache,
+                            tokenizer: tokenizer,
+                            configuration: configuration,
+                            promptCache: promptCache,
+                            promptCacheModelName: promptCacheModelName,
+                            inputTokens: inputTokens,
+                            wiredMemoryTicket: wiredMemoryTicket,
+                            ticketAlreadyStarted: true
+                        )
+                    }
                     return try await upgradeToBatch(
                         existingSingle: pending,
                         newHandler: handler,
@@ -549,6 +607,24 @@ public actor InferenceScheduler {
             }
 
             // Second request while first is active: upgrade to batch
+            guard Self.canShareBatch(
+                cacheMaxKVSize: singleState.cacheMaxKVSize,
+                parameters: parameters
+            ) else {
+                return try await createSingleStream(
+                    handler: handler,
+                    input: input,
+                    parameters: parameters,
+                    model: model,
+                    cache: cachedKVState ?? cache,
+                    tokenizer: tokenizer,
+                    configuration: configuration,
+                    promptCache: promptCache,
+                    promptCacheModelName: promptCacheModelName,
+                    inputTokens: inputTokens,
+                    wiredMemoryTicket: wiredMemoryTicket
+                )
+            }
             return try await upgradeToBatch(
                 existingSingle: singleState,
                 newHandler: handler,
@@ -603,6 +679,26 @@ public actor InferenceScheduler {
             case .batched(var batchedState):
                 if batchedState.handlers.isEmpty {
                     return try await startSingleRequest(
+                        handler: handler,
+                        input: input,
+                        parameters: parameters,
+                        model: model,
+                        cache: cachedKVState ?? cache,
+                        tokenizer: tokenizer,
+                        configuration: configuration,
+                        promptCache: promptCache,
+                        promptCacheModelName: promptCacheModelName,
+                        inputTokens: inputTokens,
+                        wiredMemoryTicket: wiredMemoryTicket,
+                        ticketAlreadyStarted: ticketAlreadyStarted
+                    )
+                }
+
+                guard Self.canShareBatch(
+                    cacheMaxKVSize: batchedState.cacheMaxKVSize,
+                    parameters: parameters
+                ) else {
+                    return try await createSingleStream(
                         handler: handler,
                         input: input,
                         parameters: parameters,
@@ -706,6 +802,14 @@ public actor InferenceScheduler {
         }
 
         return true
+    }
+
+    /// Requests may only share a batch when their cache-shaping policy matches exactly.
+    private static func canShareBatch(
+        cacheMaxKVSize: Int?,
+        parameters: GenerateParameters
+    ) -> Bool {
+        cacheMaxKVSize == parameters.maxKVSize
     }
 
     // MARK: - Single Request Path
@@ -923,7 +1027,8 @@ public actor InferenceScheduler {
                 inputTokens: inputTokens,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
-                wiredMemoryTicket: wiredMemoryTicket
+                wiredMemoryTicket: wiredMemoryTicket,
+                cacheMaxKVSize: parameters.maxKVSize
             ))
     }
 
@@ -1140,12 +1245,18 @@ public actor InferenceScheduler {
             configuration: configuration,
             tokenizer: tokenizer
         )
+        let batchCacheMaxKVSize = existingSingle.cacheMaxKVSize
 
         // Create the BatchTokenIterator
         let batchIterator = BatchTokenIterator(
             model: model,
             stopTokens: stopTokenIDs,
-            defaultSampler: ArgMaxSampler()
+            defaultSampler: ArgMaxSampler(),
+            completionBatchSize: self.configuration.completionBatchSize,
+            prefillBatchSize: self.configuration.prefillBatchSize,
+            prefillStepSize: self.configuration.prefillStepSize,
+            cacheMaxKVSize: batchCacheMaxKVSize,
+            cacheClearInterval: self.configuration.cacheClearInterval
         )
 
         // Convert each layer's live cache into the appropriate batch cache type.
@@ -1434,7 +1545,8 @@ public actor InferenceScheduler {
                 wiredMemoryTickets: [
                     firstUID: existingSingle.wiredMemoryTicket,
                     secondUID: newRequestWiredMemoryTicket,
-                ].compactMapValues { $0 }
+                ].compactMapValues { $0 },
+                cacheMaxKVSize: batchCacheMaxKVSize
             ))
     }
 
@@ -1646,5 +1758,19 @@ public actor InferenceScheduler {
             return batchedState.batchIterator.activeBatch?.cache
         }
         return nil
+    }
+
+    /// The active batch iterator configuration, for testing/inspection.
+    var activeBatchIteratorConfiguration: Configuration? {
+        guard case .batched(let batchedState) = state else {
+            return nil
+        }
+
+        return Configuration(
+            completionBatchSize: batchedState.batchIterator.completionBatchSize,
+            prefillBatchSize: batchedState.batchIterator.prefillBatchSize,
+            prefillStepSize: batchedState.batchIterator.prefillStepSize,
+            cacheClearInterval: batchedState.batchIterator.cacheClearInterval
+        )
     }
 }
