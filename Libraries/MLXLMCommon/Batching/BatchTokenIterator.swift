@@ -193,6 +193,15 @@ public class BatchTokenIterator: @unchecked Sendable {
     /// Maximum tokens to process per prefill chunk.
     public let prefillStepSize: Int
 
+    /// Optional max KV size to use when batch mode needs to create empty caches.
+    public let cacheMaxKVSize: Int?
+
+    /// Decode-step interval for clearing MLX runtime cache.
+    public let cacheClearInterval: Int
+
+    /// Clear-cache hook used by tests to verify periodic cache clearing deterministically.
+    internal var clearCache: @Sendable () -> Void = { Memory.clearCache() }
+
     // MARK: - Synchronization
 
     /// Lock protecting all mutable state below.
@@ -226,13 +235,17 @@ public class BatchTokenIterator: @unchecked Sendable {
     ///   - completionBatchSize: Maximum concurrent decode sequences. Default: 32.
     ///   - prefillBatchSize: Maximum prompts to prefill at once. Default: 8.
     ///   - prefillStepSize: Maximum tokens per prefill chunk. Default: 2048.
+    ///   - cacheMaxKVSize: Optional max KV size for newly created batch caches.
+    ///   - cacheClearInterval: Decode-step interval for clearing MLX runtime cache. Default: 512.
     public init(
         model: any LanguageModel,
         stopTokens: Set<Int> = [],
         defaultSampler: any LogitSampler = ArgMaxSampler(),
         completionBatchSize: Int = 32,
         prefillBatchSize: Int = 8,
-        prefillStepSize: Int = 2048
+        prefillStepSize: Int = 2048,
+        cacheMaxKVSize: Int? = nil,
+        cacheClearInterval: Int = 512
     ) {
         self.model = model
         self.stopTokens = stopTokens
@@ -240,6 +253,8 @@ public class BatchTokenIterator: @unchecked Sendable {
         self.completionBatchSize = completionBatchSize
         self.prefillBatchSize = prefillBatchSize
         self.prefillStepSize = prefillStepSize
+        self.cacheMaxKVSize = cacheMaxKVSize
+        self.cacheClearInterval = max(1, cacheClearInterval)
     }
 
     // MARK: - Public API
@@ -428,6 +443,9 @@ public class BatchTokenIterator: @unchecked Sendable {
         }
 
         stepCount += 1
+        if stepCount % cacheClearInterval == 0 {
+            clearCache()
+        }
 
         return responses
     }
@@ -519,48 +537,80 @@ public class BatchTokenIterator: @unchecked Sendable {
         return cachedBatch
     }
 
-    /// Process prompts without cached KV state (standard left-pad + full prefill).
+    /// Process prompts without cached KV state using segmented prompt prefill.
+    ///
+    /// Prompts are processed from longest to shortest so shorter prompts do not
+    /// pay the full prefill cost of the longest prompt in the batch. New prompts
+    /// are appended to the active batch only when their first real token becomes
+    /// reachable, and each segment only runs the currently active prompt subset.
+    /// As in the single-request path, the aligned final prompt token is held back
+    /// and replayed through `step(...)` to sample the first decode token.
     private func processUncachedPrompts(_ prompts: [PendingPrompt]) -> ActiveBatch {
-        let inputs = prompts.map(\.tokens)
-        let lengths = inputs.map(\.count)
+        let orderedPrompts = prompts.sorted {
+            if $0.tokens.count != $1.tokens.count {
+                return $0.tokens.count > $1.tokens.count
+            }
+            return $0.uid < $1.uid
+        }
+
+        let lengths = orderedPrompts.map(\.tokens.count)
         let maxLength = lengths.max() ?? 0
         let padding = lengths.map { maxLength - $0 }
 
-        // Left-pad the inputs
-        let paddedInputs = leftPadPrompts(inputs, maxLength: maxLength)
-
-        // Create batch KV cache with one BatchKVCache per layer
-        let promptCache = makeBatchCache(leftPadding: padding)
-
         // Initialize per-request processors with their prompt tokens.
         // This mirrors TokenIterator.prepare() calling processor?.prompt(tokens).
-        var processors = prompts.map(\.processor)
-        for i in 0 ..< prompts.count {
-            let promptArray = MLXArray(prompts[i].tokens.map { Int32($0) })
+        var processors = orderedPrompts.map(\.processor)
+        for i in 0 ..< orderedPrompts.count {
+            let promptArray = MLXArray(orderedPrompts[i].tokens.map { Int32($0) })
             processors[i]?.prompt(promptArray)
         }
 
-        // Process prompt in chunks of prefillStepSize.
-        // We leave the last token for the sampling step below.
-        var remainingInputs = paddedInputs
-        while remainingInputs.dim(1) > 1 {
-            let nToProcess = min(prefillStepSize, remainingInputs.dim(1) - 1)
-            let chunk = remainingInputs[0..., ..<nToProcess]
-            let _ = model(
-                LMInput.Text(tokens: chunk),
-                cache: promptCache.isEmpty ? nil : promptCache,
-                state: nil
-            )
-            eval(promptCache.flatMap { $0.innerState() })
-            remainingInputs = remainingInputs[0..., nToProcess...]
+        var promptCache = [KVCache]()
+        let boundaries = Array(Set(padding)).sorted()
+        // Hold back the aligned final prompt token so the first decode sample
+        // comes from `step(...)` with the same semantics as TokenIterator.
+        let prefillLimit = max(0, maxLength - 1)
+        var activeCount = 0
+
+        for (boundaryIndex, startColumn) in boundaries.enumerated() {
+            let nextBoundary = boundaryIndex + 1 < boundaries.count ? boundaries[boundaryIndex + 1] : maxLength
+            let endColumn = min(nextBoundary, prefillLimit)
+            let previousActiveCount = activeCount
+            while activeCount < orderedPrompts.count && padding[activeCount] == startColumn {
+                activeCount += 1
+            }
+
+            if activeCount > previousActiveCount {
+                let newCount = activeCount - previousActiveCount
+                if promptCache.isEmpty {
+                    promptCache = makeBatchCache(
+                        leftPadding: Array(repeating: startColumn, count: newCount))
+                } else {
+                    appendEmptyBatchEntries(
+                        to: promptCache,
+                        count: newCount,
+                        leftPadding: startColumn
+                    )
+                }
+            }
+
+            let segmentLength = endColumn - startColumn
+            guard segmentLength > 0 else { continue }
+
+            let segmentInputs = (0 ..< activeCount).map { index -> [Int] in
+                let tokenStart = startColumn - padding[index]
+                return Array(orderedPrompts[index].tokens[tokenStart ..< (tokenStart + segmentLength)])
+            }
+            prefillPromptSegments(segmentInputs, cache: promptCache)
         }
 
-        // Final step: process last token and sample the first decode token
-        let tokenArrays = prompts.map { MLXArray($0.tokens) }
+        let lastTokens = orderedPrompts.map { Int32($0.tokens.last ?? 0) }
+        let lastTokenInput = MLXArray(lastTokens, [orderedPrompts.count, 1])
+        let tokenArrays = orderedPrompts.map { MLXArray($0.tokens) }
         let (sampled, _) = step(
-            inputTokens: remainingInputs,
+            inputTokens: lastTokenInput,
             cache: promptCache,
-            samplers: prompts.map(\.sampler),
+            samplers: orderedPrompts.map(\.sampler),
             processors: &processors,
             tokens: tokenArrays
         )
@@ -568,13 +618,13 @@ public class BatchTokenIterator: @unchecked Sendable {
         asyncEval(sampled)
 
         return ActiveBatch(
-            uids: prompts.map(\.uid),
+            uids: orderedPrompts.map(\.uid),
             y: sampled,
             cache: promptCache,
-            samplers: prompts.map(\.sampler),
+            samplers: orderedPrompts.map(\.sampler),
             processors: processors,
-            maxTokens: prompts.map(\.maxTokens),
-            numTokens: Array(repeating: 0, count: prompts.count),
+            maxTokens: orderedPrompts.map(\.maxTokens),
+            numTokens: Array(repeating: 0, count: orderedPrompts.count),
             tokens: tokenArrays
         )
     }
@@ -1024,15 +1074,136 @@ public class BatchTokenIterator: @unchecked Sendable {
         return MLXArray(flat, [prompts.count, maxLength])
     }
 
+    /// Prefill equal-length prompt segments in chunks.
+    private func prefillPromptSegments(_ prompts: [[Int]], cache: [KVCache]) {
+        guard let segmentLength = prompts.first?.count, segmentLength > 0 else { return }
+
+        let flat = prompts.flatMap { prompt in
+            prompt.map { Int32($0) }
+        }
+        var remainingInputs = MLXArray(flat, [prompts.count, segmentLength])
+        while remainingInputs.dim(1) > 0 {
+            let nToProcess = min(prefillStepSize, remainingInputs.dim(1))
+            let chunk = remainingInputs[0..., ..<nToProcess]
+            let _ = model(
+                LMInput.Text(tokens: chunk),
+                cache: cache.isEmpty ? nil : cache,
+                state: nil
+            )
+            eval(cache.flatMap { $0.innerState() })
+            if nToProcess < remainingInputs.dim(1) {
+                remainingInputs = remainingInputs[0..., nToProcess...]
+            } else {
+                break
+            }
+        }
+    }
+
+    /// Append empty batch entries for prompts that join segmented prefill late.
+    ///
+    /// The appended rows are aligned to the current cache index so future updates
+    /// can run on the larger batch without replaying the earlier left-padding.
+    private func appendEmptyBatchEntries(
+        to existing: [KVCache],
+        count: Int,
+        leftPadding: Int
+    ) {
+        precondition(count > 0)
+
+        for existingCache in existing {
+            if let batch = existingCache as? BatchKVCache {
+                appendEmptyBatchEntries(
+                    to: batch,
+                    count: count,
+                    leftPadding: leftPadding
+                )
+            } else if let rotating = existingCache as? BatchRotatingKVCache {
+                appendEmptyBatchEntries(
+                    to: rotating,
+                    count: count,
+                    leftPadding: leftPadding
+                )
+            }
+        }
+    }
+
+    private func appendEmptyBatchEntries(
+        to cache: BatchKVCache,
+        count: Int,
+        leftPadding: Int
+    ) {
+        let leftPaddingArray = MLXArray(Array(repeating: Int32(leftPadding), count: count))
+        let offset = max(0, cache._idx - leftPadding)
+        let batchOffsetsArray = MLXArray(Array(repeating: Int32(offset), count: count))
+
+        guard let keys = cache.keys, let values = cache.values else {
+            cache.leftPadding = concatenated([cache.leftPadding, leftPaddingArray], axis: 0)
+            cache.batchOffsets = concatenated([cache.batchOffsets, batchOffsetsArray], axis: 0)
+            return
+        }
+
+        let appended = BatchKVCache(
+            leftPaddingArray: leftPaddingArray,
+            batchOffsetsArray: batchOffsetsArray
+        )
+        appended._idx = cache._idx
+        appended.keys = MLXArray.zeros(
+            [count, keys.dim(1), keys.dim(2), keys.dim(3)],
+            dtype: keys.dtype
+        )
+        appended.values = MLXArray.zeros(
+            [count, values.dim(1), values.dim(2), values.dim(3)],
+            dtype: values.dtype
+        )
+        cache.extend(other: appended)
+    }
+
+    private func appendEmptyBatchEntries(
+        to cache: BatchRotatingKVCache,
+        count: Int,
+        leftPadding: Int
+    ) {
+        let leftPaddingArray = MLXArray(Array(repeating: Int32(leftPadding), count: count))
+        let offset = max(0, cache._idx - leftPadding)
+        let batchOffsetsArray = MLXArray(Array(repeating: Int32(offset), count: count))
+
+        guard let keys = cache.keys, let values = cache.values else {
+            cache.leftPadding = concatenated([cache.leftPadding, leftPaddingArray], axis: 0)
+            cache.batchOffsets = concatenated([cache.batchOffsets, batchOffsetsArray], axis: 0)
+            return
+        }
+
+        let appended = BatchRotatingKVCache(
+            maxSize: cache.maxSize ?? keys.dim(2),
+            keep: cache.keep,
+            leftPaddingArray: leftPaddingArray,
+            batchOffsetsArray: batchOffsetsArray
+        )
+        appended._idx = cache._idx
+        appended._scalarOffset = cache._scalarOffset
+        appended.rotated = cache.rotated
+        appended.keys = MLXArray.zeros(
+            [count, keys.dim(1), keys.dim(2), keys.dim(3)],
+            dtype: keys.dtype
+        )
+        appended.values = MLXArray.zeros(
+            [count, values.dim(1), values.dim(2), values.dim(3)],
+            dtype: values.dtype
+        )
+        cache.extend(other: appended)
+    }
+
     /// Create a per-layer batch KV cache with the given left-padding.
     ///
-    /// Inspects the template cache from `model.newCache(parameters: nil)` to determine
-    /// whether each layer uses a standard or rotating (sliding-window) cache, and creates
-    /// the corresponding batch cache type. This ensures models with sliding-window
-    /// attention (Gemma3, Mistral3, etc.) get `BatchRotatingKVCache` for the appropriate
+    /// Inspects the template cache from `model.newCache(parameters:)` using the
+    /// iterator's configured cache policy to determine whether each layer uses a
+    /// standard or rotating (sliding-window) cache, and creates the corresponding
+    /// batch cache type. This ensures models with sliding-window attention
+    /// (Gemma3, Mistral3, etc.) get `BatchRotatingKVCache` for the appropriate
     /// layers instead of silently losing window semantics.
     private func makeBatchCache(leftPadding: [Int]) -> [KVCache] {
-        let templateCache = model.newCache(parameters: nil)
+        let parameters = cacheMaxKVSize.map { GenerateParameters(maxKVSize: $0) }
+        let templateCache = model.newCache(parameters: parameters)
         return templateCache.map { layer in
             if let rotatingCache = layer as? RotatingKVCache {
                 return BatchRotatingKVCache(

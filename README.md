@@ -172,6 +172,80 @@ let container = try await loadModelContainer(
 
 Or use the underlying API to control every aspect of the evaluation.
 
+# Continuous Batching
+
+Continuous batching lets a single model serve multiple concurrent requests
+efficiently by interleaving their token generation in a shared decode loop.
+This is an opt-out feature with zero overhead for single requests.
+
+## How It Works
+
+Assign an `InferenceScheduler` to `ModelContainer.scheduler` to enable batching:
+
+```swift
+let container = ModelContainer(context: context)
+container.scheduler = InferenceScheduler()
+```
+
+When only one request is active, the scheduler uses the existing `TokenIterator`
+path — no batch overhead at all. When a second request arrives while the first is
+still generating, the scheduler automatically upgrades to a `BatchTokenIterator`,
+migrating the in-flight KV cache into a batched layout. Third and subsequent
+requests join the existing batch on the fly.
+
+## Usage
+
+Callers use the same `ModelContainer.generate(input:parameters:)` API regardless
+of whether batching is enabled. Concurrent requests are scheduled transparently:
+
+```swift
+let container = ModelContainer(context: context)
+container.scheduler = InferenceScheduler()
+
+// Fire two requests concurrently — the scheduler batches them automatically
+async let stream1 = container.generate(
+    input: try await container.prepare(input: .init(prompt: "Tell me a joke")),
+    parameters: .init()
+)
+async let stream2 = container.generate(
+    input: try await container.prepare(input: .init(prompt: "Explain gravity")),
+    parameters: .init()
+)
+
+for await event in try await stream1 { /* handle events */ }
+for await event in try await stream2 { /* handle events */ }
+```
+
+You can also tune the batch scheduler explicitly:
+
+```swift
+let container = ModelContainer(context: context)
+container.scheduler = InferenceScheduler(
+    configuration: .init(
+        completionBatchSize: 16,
+        prefillBatchSize: 4,
+        prefillStepSize: 1024,
+        cacheClearInterval: 512
+    )
+)
+```
+
+## Compatibility
+
+Continuous batching supports standard transformer-based LLMs. The following
+request types automatically fall back to the sequential `TokenIterator` path:
+
+- **VLMs** (inputs containing images or video)
+- **Hybrid SSM models** (e.g. Mamba-based architectures)
+- **Quantized KV caches** (`kvBits` parameter)
+
+No code changes are needed — incompatible requests are detected and routed to
+the single-request path automatically.
+
+Requests must also agree on `GenerateParameters.maxKVSize` to share a batch.
+If one request uses a different KV window limit, it falls back to the
+single-request path instead of joining the active batch.
+
 ## Migrating to Version 3
 
 Version 3 of MLX Swift LM decouples the tokenizer and downloader implementations. See the [integrations](#Tokenizer-and-Downloader-Integrations) section for details.
@@ -333,4 +407,3 @@ The `defaultHubApi` global has been removed. Hugging Face Hub access is now prov
 - `loadTokenizerConfig(configuration:hub:)` → `AutoTokenizer.from(directory:)`
 - `ModelFactory._load(hub:configuration:progressHandler:)` → `_load(configuration: ResolvedModelConfiguration)`
 - `ModelFactory._loadContainer`: removed (base `loadContainer` now builds the container from `_load`)
-
