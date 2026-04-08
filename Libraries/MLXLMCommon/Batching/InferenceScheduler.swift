@@ -24,18 +24,8 @@ import MLXNN
 /// Most callers install a scheduler on `ModelContainer` rather than submitting
 /// directly:
 /// ```swift
-/// let container = ModelContainer(
-///     context: context,
-///     scheduler: InferenceScheduler(
-///         configuration: .init(
-///             completionBatchSize: 16,
-///             prefillBatchSize: 4,
-///             prefillStepSize: 1024,
-///             cacheClearInterval: 512
-///         )
-///     )
-/// )
-/// let stream = try await container.generate(
+/// let scheduler = InferenceScheduler()
+/// let stream = scheduler.submit(
 ///     input: lmInput,
 ///     parameters: params
 /// )
