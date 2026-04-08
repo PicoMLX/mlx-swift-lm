@@ -156,7 +156,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
                 self._idx = self.keys!.dim(2)
             default:
                 fatalError(
-                    "BatchKVCache state must have 2 arrays (empty) or 4 arrays (keys, values, offset, leftPadding)"
+                    "BatchKVCache state must have 2 arrays (batchOffsets, leftPadding) or 4 arrays (keys, values, batchOffsets, leftPadding)"
                 )
             }
         }
