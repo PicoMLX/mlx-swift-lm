@@ -3,98 +3,114 @@
 import Foundation
 import MLX
 @preconcurrency @testable import MLXLMCommon
-import XCTest
-
 @testable import MLXLLM
+import Testing
 
-final class Gemma2FalconH1BatchMaskTests: XCTestCase {
-
-    private let prefillPrompts: [[Int32]] = [
+@Suite(
+    "Batch Model Regressions",
+    .enabled(if: MLXMetalGuard.isAvailable, MLXMetalGuard.unavailableComment),
+    .serialized
+)
+struct BatchModelRegressionTests {
+    private let prompts: [[Int32]] = [
         [11, 12, 13, 14, 15],
         [21, 22, 23],
     ]
 
     private let decodeTokens: [Int32] = [31, 32]
 
-    func testGemma2BatchPrefillMatchesSingle() throws {
-        try skipIfMetalUnavailable()
-
-        let model = try makeGemma2Model(seed: 100)
-        try assertPrefillMatchesSingle(model: model, prompts: prefillPrompts)
+    @Test("Phi3 batch prefill matches single prefill")
+    func phi3BatchPrefillMatchesSingle() throws {
+        let model = try makePhi3Model(seed: 100)
+        try assertPrefillMatchesSingle(model: model, prompts: prompts)
     }
 
-    func testGemma2BatchDecodeMatchesSingle() throws {
-        try skipIfMetalUnavailable()
-
-        let model = try makeGemma2Model(seed: 101)
+    @Test("Phi3 batch decode matches single decode")
+    func phi3BatchDecodeMatchesSingle() throws {
+        let model = try makePhi3Model(seed: 101)
         try assertDecodeMatchesSingle(
             model: model,
-            prompts: prefillPrompts,
+            prompts: prompts,
             decodeTokens: decodeTokens
         )
     }
 
-    func testGemma2IsBatchCompatibleForTextOnlyRequests() throws {
-        try skipIfMetalUnavailable()
+    @Test("Phi3 remains scheduler batch-compatible")
+    func phi3RemainsBatchCompatible() throws {
+        let model = try makePhi3Model(seed: 102)
+        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
 
-        let model = try makeGemma2Model(seed: 102)
-        assertSchedulerBatchCompatibility(model: model)
+        #expect(
+            InferenceScheduler.isBatchCompatible(
+                input: input,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                cache: nil,
+                model: model
+            )
+        )
     }
 
-    func testFalconH1AttentionBatchDecodeMatchesMergedSingles() throws {
-        try skipIfMetalUnavailable()
+    @Test("FalconH1 remains scheduler batch-incompatible")
+    func falconH1RemainsBatchIncompatible() throws {
+        let model = try makeFalconH1Model(seed: 200)
+        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
 
-        let config = try makeFalconH1Configuration()
-        let attention = withRandomState(MLXRandom.RandomState(seed: 200)) {
-            let attention = FalconH1Attention(config)
+        #expect(
+            InferenceScheduler.isBatchCompatible(
+                input: input,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                cache: nil,
+                model: model
+            ) == false
+        )
+    }
+
+    @Test("FalconH1 attention batched decode matches merged single decode")
+    func falconAttentionDecodeMatchesMergedSingles() throws {
+        let configuration = try makeFalconH1Configuration()
+        let attention = withRandomState(MLXRandom.RandomState(seed: 201)) {
+            let attention = FalconH1Attention(configuration)
             eval(attention)
             return attention
         }
 
         try assertFalconAttentionDecodeMatchesMergedSingles(
             attention: attention,
-            hiddenSize: config.hiddenSize,
-            promptLengths: prefillPrompts.map(\.count)
+            hiddenSize: 16,
+            promptLengths: prompts.map(\.count)
         )
     }
 
-    func testFalconH1IsBatchIncompatibleForTextOnlyRequests() throws {
-        try skipIfMetalUnavailable()
-
-        let model = try makeFalconH1Model(seed: 201)
-        assertSchedulerBatchIncompatibility(model: model)
-    }
-
-    private func makeGemma2Model(seed: UInt64) throws -> Gemma2Model {
-        let config: Gemma2Configuration = try decodeConfig(
+    private func makePhi3Model(seed: UInt64) throws -> Phi3Model {
+        let configuration: Phi3Configuration = try decodeConfiguration(
             """
             {
               "hidden_size": 16,
               "num_hidden_layers": 2,
               "intermediate_size": 32,
               "num_attention_heads": 4,
-              "head_dim": 4,
               "rms_norm_eps": 0.00001,
               "vocab_size": 64,
               "num_key_value_heads": 2,
               "rope_theta": 10000.0,
               "rope_traditional": false,
-              "attn_logit_softcapping": 50.0,
-              "final_logit_softcapping": 30.0,
-              "query_pre_attn_scalar": 16.0
+              "partial_rotary_factor": 1.0,
+              "max_position_embeddings": 128,
+              "original_max_position_embeddings": 128,
+              "tie_word_embeddings": false
             }
             """
         )
 
         return withRandomState(MLXRandom.RandomState(seed: seed)) {
-            let model = Gemma2Model(config)
+            let model = Phi3Model(configuration)
             eval(model)
             return model
         }
     }
 
     private func makeFalconH1Configuration() throws -> FalconH1Configuration {
-        try decodeConfig(
+        try decodeConfiguration(
             """
             {
               "model_type": "falcon_h1",
@@ -119,64 +135,22 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
     }
 
     private func makeFalconH1Model(seed: UInt64) throws -> FalconH1Model {
-        let config = try makeFalconH1Configuration()
+        let configuration = try makeFalconH1Configuration()
 
         return withRandomState(MLXRandom.RandomState(seed: seed)) {
-            let model = FalconH1Model(config)
+            let model = FalconH1Model(configuration)
             eval(model)
             return model
         }
     }
 
-    private func decodeConfig<T: Decodable>(_ json: String) throws -> T {
+    private func decodeConfiguration<T: Decodable>(_ json: String) throws -> T {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
-    }
-
-    private func assertSchedulerBatchCompatibility<M: LanguageModel>(
-        model: M,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
-        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
-
-        XCTAssertTrue(
-            InferenceScheduler.isBatchCompatible(
-                input: input,
-                parameters: parameters,
-                cache: nil,
-                model: model
-            ),
-            file: file,
-            line: line
-        )
-    }
-
-    private func assertSchedulerBatchIncompatibility<M: LanguageModel>(
-        model: M,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
-        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
-
-        XCTAssertFalse(
-            InferenceScheduler.isBatchCompatible(
-                input: input,
-                parameters: parameters,
-                cache: nil,
-                model: model
-            ),
-            file: file,
-            line: line
-        )
     }
 
     private func assertPrefillMatchesSingle<M: LanguageModel & KVCacheDimensionProvider>(
         model: M,
-        prompts: [[Int32]],
-        file: StaticString = #filePath,
-        line: UInt = #line
+        prompts: [[Int32]]
     ) throws {
         let singleResults = prompts.map { prompt in
             prefillSingle(model: model, prompt: prompt)
@@ -188,14 +162,10 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
             let batchValid = batched.logits[index ..< (index + 1), pad..., 0...].asType(.float32)
             let single = singleResults[index].logits.asType(.float32)
 
-            XCTAssertEqual(batchValid.shape, single.shape, file: file, line: line)
-            let diff = maxAbsDifference(batchValid, single)
-            XCTAssertLessThanOrEqual(
-                diff,
-                0.01,
-                "Prefill logits diverged for prompt \(prompt)",
-                file: file,
-                line: line
+            #expect(batchValid.shape == single.shape)
+            #expect(
+                maxAbsDifference(batchValid, single) <= 0.01,
+                "Prefill logits diverged for prompt \(prompt)"
             )
         }
     }
@@ -203,9 +173,7 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
     private func assertDecodeMatchesSingle<M: LanguageModel & KVCacheDimensionProvider>(
         model: M,
         prompts: [[Int32]],
-        decodeTokens: [Int32],
-        file: StaticString = #filePath,
-        line: UInt = #line
+        decodeTokens: [Int32]
     ) throws {
         let singleResults = prompts.enumerated().map { index, prompt in
             var result = prefillSingle(model: model, prompt: prompt)
@@ -226,14 +194,10 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
             let batchRow = batched.logits[index ..< (index + 1), 0..., 0...].asType(.float32)
             let single = singleResults[index].logits.asType(.float32)
 
-            XCTAssertEqual(batchRow.shape, single.shape, file: file, line: line)
-            let diff = maxAbsDifference(batchRow, single)
-            XCTAssertLessThanOrEqual(
-                diff,
-                0.01,
-                "Decode logits diverged for prompt index \(index)",
-                file: file,
-                line: line
+            #expect(batchRow.shape == single.shape)
+            #expect(
+                maxAbsDifference(batchRow, single) <= 0.01,
+                "Decode logits diverged for prompt index \(index)"
             )
         }
     }
@@ -241,14 +205,15 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
     private func assertFalconAttentionDecodeMatchesMergedSingles(
         attention: FalconH1Attention,
         hiddenSize: Int,
-        promptLengths: [Int],
-        file: StaticString = #filePath,
-        line: UInt = #line
+        promptLengths: [Int]
     ) throws {
         let singleCaches: [KVCacheSimple] = promptLengths.enumerated().map { index, length in
             let cache = KVCacheSimple()
             let hidden = makeHiddenStates(
-                length: length, hiddenSize: hiddenSize, base: Float(index + 1))
+                length: length,
+                hiddenSize: hiddenSize,
+                base: Float(index + 1)
+            )
             let mask = createAttentionMask(h: hidden, cache: cache)
             let output = attention(hidden, mask: mask, cache: cache)
             materialize(arrays: [output], cache: [cache])
@@ -276,14 +241,10 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
             let batchRow = batchedOutput[index ..< (index + 1), 0..., 0...].asType(.float32)
             let single = singleOutputs[index].asType(.float32)
 
-            XCTAssertEqual(batchRow.shape, single.shape, file: file, line: line)
-            let diff = maxAbsDifference(batchRow, single)
-            XCTAssertLessThanOrEqual(
-                diff,
-                0.01,
-                "FalconH1 attention decode diverged for prompt index \(index)",
-                file: file,
-                line: line
+            #expect(batchRow.shape == single.shape)
+            #expect(
+                maxAbsDifference(batchRow, single) <= 0.01,
+                "FalconH1 attention decode diverged for prompt index \(index)"
             )
         }
     }
@@ -320,7 +281,7 @@ final class Gemma2FalconH1BatchMaskTests: XCTestCase {
 
     private func makeHiddenStates(length: Int, hiddenSize: Int, base: Float) -> MLXArray {
         let values = (0 ..< (length * hiddenSize)).map { index in
-            base + Float(index) / 100.0
+            base + Float(index) / 100
         }
         return MLXArray(values, [1, length, hiddenSize])
     }
