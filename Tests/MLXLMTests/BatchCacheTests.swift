@@ -16,7 +16,9 @@ struct BatchKVCacheCoverageTests {
 
     @Test("Lifecycle covers update, filter, extend, and extract")
     func lifecycleRoundTrip() {
-        let cache = BatchKVCache(leftPadding: [1, 0])
+        // Use zero-padding here so this test exercises lifecycle bookkeeping,
+        // not left-padding normalization. Padding behavior is covered elsewhere.
+        let cache = BatchKVCache(leftPadding: [0, 0])
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
         _ = cache.update(keys: keys, values: values)
 
@@ -25,12 +27,16 @@ struct BatchKVCacheCoverageTests {
         #expect(cache.leftPadding.shape == [1])
         #expect(cache.leftPadding[0].item(Int32.self) == 0)
 
-        let extensionCache = BatchKVCache(leftPadding: [2])
+        let extensionCache = BatchKVCache(leftPadding: [0])
         let extensionKV = makeKV(batchSize: 1, heads: 2, seqLen: 2, headDim: 4, value: 4)
         _ = extensionCache.update(keys: extensionKV.0, values: extensionKV.1)
         cache.extend(other: extensionCache)
 
         #expect(cache.batchSize == 2)
+        #expect(cache.leftPadding[0].item(Int32.self) == 0)
+        #expect(cache.leftPadding[1].item(Int32.self) == 1)
+        #expect(cache.batchOffsets[0].item(Int32.self) == 3)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 2)
 
         let extractedFirst = cache.extract(idx: 0)
         let extractedSecond = cache.extract(idx: 1)
@@ -82,19 +88,25 @@ struct BatchRotatingKVCacheCoverageTests {
 
     @Test("Lifecycle covers update, filter, extend, and extract")
     func lifecycleRoundTrip() {
-        let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [1, 0], keep: 2)
+        // Use zero-padding here so this test exercises lifecycle bookkeeping,
+        // not left-padding normalization. Padding behavior is covered elsewhere.
+        let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0, 0], keep: 2)
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
         _ = cache.update(keys: keys, values: values)
 
         cache.filter(batchIndices: [0])
         #expect(cache.batchSize == 1)
 
-        let extensionCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [2], keep: 2)
+        let extensionCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0], keep: 2)
         let extensionKV = makeKV(batchSize: 1, heads: 2, seqLen: 2, headDim: 4, value: 5)
         _ = extensionCache.update(keys: extensionKV.0, values: extensionKV.1)
         cache.extend(other: extensionCache)
 
         #expect(cache.batchSize == 2)
+        #expect(cache.leftPadding[0].item(Int32.self) == 0)
+        #expect(cache.leftPadding[1].item(Int32.self) == 1)
+        #expect(cache.batchOffsets[0].item(Int32.self) == 3)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 2)
 
         let extractedFirst = cache.extract(idx: 0)
         let extractedSecond = cache.extract(idx: 1)

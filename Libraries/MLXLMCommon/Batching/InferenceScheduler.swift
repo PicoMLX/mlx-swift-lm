@@ -1395,6 +1395,9 @@ public actor InferenceScheduler {
             // the prompt cache write-back key includes the full sequence:
             // inputTokens + preUpgradeTokens + batchGeneratedTokens.
             generatedTokenIds[firstUID] = firstPreUpgradeTokens
+            // Carry the first request's already-emitted token count into the
+            // batch loop so completion info reflects the full generation span.
+            tokenCounts[firstUID] = liveState.tokenCount
 
             // Store per-UID prompt token counts.
             promptTokenCounts[firstUID] = firstPromptTokenCount
