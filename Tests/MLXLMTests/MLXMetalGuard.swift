@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import Testing
 import XCTest
 
 /// Checks whether the MLX Metal backend is functional (i.e., the metallib is loaded).
@@ -14,6 +15,11 @@ import XCTest
 /// When running through Xcode (which correctly bundles the metallib), all tests
 /// execute normally.
 enum MLXMetalGuard {
+    static let unavailableReason =
+        "MLX Metal library unavailable (SPM debug build) — skipping"
+    static let unavailableComment: Comment =
+        "Requires MLX Metal library (unavailable in SPM debug builds)"
+
     /// Cached result so we only probe once per process.
     private static let _isAvailable: Bool = {
         // Use withError to install the error handler BEFORE any MLX operations.
@@ -46,6 +52,6 @@ enum MLXMetalGuard {
 func skipIfMetalUnavailable() throws {
     try XCTSkipUnless(
         MLXMetalGuard.isAvailable,
-        "MLX Metal library unavailable (SPM debug build) — skipping"
+        MLXMetalGuard.unavailableReason
     )
 }
