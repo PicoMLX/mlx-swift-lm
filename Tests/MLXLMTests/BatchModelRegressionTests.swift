@@ -35,6 +35,56 @@ struct BatchModelRegressionTests {
         )
     }
 
+    @Test("Gemma4Text batch decode matches single decode")
+    func gemma4TextBatchDecodeMatchesSingle() throws {
+        let model = try makeGemma4TextModel(seed: 150)
+        try assertDecodeMatchesSingle(
+            model: model,
+            prompts: prompts,
+            decodeTokens: decodeTokens
+        )
+    }
+
+    @Test("Gemma4 batch decode matches single decode")
+    func gemma4BatchDecodeMatchesSingle() throws {
+        let model = try makeGemma4Model(seed: 152)
+        try assertDecodeMatchesSingle(
+            model: model,
+            prompts: prompts,
+            decodeTokens: decodeTokens
+        )
+    }
+
+    @Test("Gemma4Text remains scheduler batch-compatible")
+    func gemma4TextRemainsBatchCompatible() throws {
+        let model = try makeGemma4TextModel(seed: 151)
+        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
+
+        #expect(
+            InferenceScheduler.isBatchCompatible(
+                input: input,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                cache: nil,
+                model: model
+            )
+        )
+    }
+
+    @Test("Gemma4 remains scheduler batch-compatible")
+    func gemma4RemainsBatchCompatible() throws {
+        let model = try makeGemma4Model(seed: 153)
+        let input = LMInput(tokens: MLXArray([Int32(1), Int32(2), Int32(3)]))
+
+        #expect(
+            InferenceScheduler.isBatchCompatible(
+                input: input,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                cache: nil,
+                model: model
+            )
+        )
+    }
+
     @Test("Phi3 remains scheduler batch-compatible")
     func phi3RemainsBatchCompatible() throws {
         let model = try makePhi3Model(seed: 102)
@@ -134,6 +184,102 @@ struct BatchModelRegressionTests {
         )
     }
 
+    private func makeGemma4TextModel(seed: UInt64) throws -> Gemma4TextModel {
+        let configuration: Gemma4TextConfiguration = try decodeConfiguration(
+            """
+            {
+              "model_type": "gemma4_text",
+              "hidden_size": 16,
+              "num_hidden_layers": 2,
+              "intermediate_size": 32,
+              "num_attention_heads": 4,
+              "head_dim": 4,
+              "global_head_dim": 4,
+              "global_partial_rotary_factor": 1.0,
+              "rms_norm_eps": 0.00001,
+              "vocab_size": 64,
+              "vocab_size_per_layer_input": 64,
+              "num_key_value_heads": 2,
+              "num_kv_shared_layers": 0,
+              "hidden_size_per_layer_input": 0,
+              "sliding_window": 8,
+              "sliding_window_pattern": 2,
+              "max_position_embeddings": 128,
+              "attention_k_eq_v": false,
+              "final_logit_softcapping": 30.0,
+              "use_double_wide_mlp": false,
+              "layer_types": ["full_attention", "full_attention"],
+              "tie_word_embeddings": false,
+              "rope_parameters": {
+                "full_attention": {
+                  "rope_theta": 10000.0,
+                  "partial_rotary_factor": 1.0
+                },
+                "sliding_attention": {
+                  "rope_theta": 10000.0
+                }
+              }
+            }
+            """
+        )
+
+        return withRandomState(MLXRandom.RandomState(seed: seed)) {
+            let model = Gemma4TextModel(configuration)
+            eval(model)
+            return model
+        }
+    }
+
+    private func makeGemma4Model(seed: UInt64) throws -> Gemma4Model {
+        let configuration: Gemma4Configuration = try decodeConfiguration(
+            """
+            {
+              "model_type": "gemma4",
+              "vocab_size": 64,
+              "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "intermediate_size": 32,
+                "num_attention_heads": 4,
+                "head_dim": 4,
+                "global_head_dim": 4,
+                "global_partial_rotary_factor": 1.0,
+                "rms_norm_eps": 0.00001,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "sliding_window": 8,
+                "sliding_window_pattern": 2,
+                "max_position_embeddings": 128,
+                "attention_k_eq_v": false,
+                "final_logit_softcapping": 30.0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["full_attention", "full_attention"],
+                "tie_word_embeddings": false,
+                "rope_parameters": {
+                  "full_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0
+                  },
+                  "sliding_attention": {
+                    "rope_theta": 10000.0
+                  }
+                }
+              }
+            }
+            """
+        )
+
+        return withRandomState(MLXRandom.RandomState(seed: seed)) {
+            let model = Gemma4Model(configuration)
+            eval(model)
+            return model
+        }
+    }
+
     private func makeFalconH1Model(seed: UInt64) throws -> FalconH1Model {
         let configuration = try makeFalconH1Configuration()
 
@@ -148,7 +294,7 @@ struct BatchModelRegressionTests {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
-    private func assertPrefillMatchesSingle<M: LanguageModel & KVCacheDimensionProvider>(
+    private func assertPrefillMatchesSingle<M: LanguageModel>(
         model: M,
         prompts: [[Int32]]
     ) throws {
@@ -170,7 +316,7 @@ struct BatchModelRegressionTests {
         }
     }
 
-    private func assertDecodeMatchesSingle<M: LanguageModel & KVCacheDimensionProvider>(
+    private func assertDecodeMatchesSingle<M: LanguageModel>(
         model: M,
         prompts: [[Int32]],
         decodeTokens: [Int32]
@@ -249,7 +395,7 @@ struct BatchModelRegressionTests {
         }
     }
 
-    private func prefillSingle<M: LanguageModel & KVCacheDimensionProvider>(
+    private func prefillSingle<M: LanguageModel>(
         model: M,
         prompt: [Int32]
     ) -> (logits: MLXArray, cache: [KVCache]) {
@@ -260,7 +406,7 @@ struct BatchModelRegressionTests {
         return (logits, cache)
     }
 
-    private func prefillBatch<M: LanguageModel & KVCacheDimensionProvider>(
+    private func prefillBatch<M: LanguageModel>(
         model: M,
         prompts: [[Int32]]
     ) -> (logits: MLXArray, cache: [KVCache], leftPadding: [Int]) {
@@ -271,8 +417,16 @@ struct BatchModelRegressionTests {
             Array(repeating: Int32(0), count: pad) + prompt
         }
         let input = MLXArray(flat, [prompts.count, maxLength])
-        let cache: [KVCache] = model.kvHeads.map { _ in
-            BatchKVCache(leftPadding: leftPadding)
+        let cache: [KVCache] = model.newCache(parameters: nil).map { layerCache in
+            if let rotatingCache = layerCache as? RotatingKVCache {
+                return BatchRotatingKVCache(
+                    maxSize: rotatingCache.maxSize ?? 0,
+                    leftPadding: leftPadding,
+                    keep: rotatingCache.keep
+                )
+            } else {
+                return BatchKVCache(leftPadding: leftPadding)
+            }
         }
         let logits = model.callAsFunction(input, cache: cache)
         materialize(arrays: [logits], cache: cache)
