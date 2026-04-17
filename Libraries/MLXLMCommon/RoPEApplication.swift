@@ -4,17 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-// MARK: - BatchPositionedKVCache
-
-/// Protocol for KV caches that expose per-sequence RoPE offsets.
-///
-/// This is a forward-compatible hook for batched caches. Current scalar-cache
-/// code paths continue using `KVCache.offset`.
-public protocol BatchPositionedKVCache: KVCache {
-    /// Per-sequence RoPE offsets with shape `[B]`.
-    var batchOffset: MLXArray { get }
-}
-
 // MARK: - applyRotaryPosition Helper
 
 /// Apply rotary position embeddings, dispatching to the appropriate offset type
