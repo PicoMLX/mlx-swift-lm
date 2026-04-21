@@ -22,10 +22,15 @@ public struct ToolCall: Hashable, Codable, Sendable {
         }
     }
 
+    /// An optional id used to correlate tool calls with their corresponding
+    /// tool responses across multi-call turns.
+    public let id: String?
+
     /// The function to be called
     public let function: Function
 
-    public init(function: Function) {
+    public init(id: String? = nil, function: Function) {
+        self.id = id
         self.function = function
     }
 }
