@@ -70,8 +70,8 @@ struct ToolCallIdTests {
         #expect(dict["tool_calls"] == nil)
     }
 
-    @Test("ToolCallProcessor assigns an id when parser does not provide one")
-    func testToolCallProcessorAssignsIdFallback() throws {
+    @Test("ToolCallProcessor leaves id nil when the parser does not provide one")
+    func testToolCallProcessorLeavesIdNil() throws {
         let processor = ToolCallProcessor(format: .json)
         let content = "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"
 
@@ -81,25 +81,7 @@ struct ToolCallIdTests {
         #expect(processor.toolCalls.count == 1)
         let toolCall = try #require(processor.toolCalls.first)
         #expect(toolCall.function.name == "x")
-        let id = try #require(toolCall.id)
-        #expect(!id.isEmpty)
-        #expect(id.hasPrefix("call_"))
-    }
-
-    @Test("ToolCallProcessor assigns unique ids across multiple tool calls")
-    func testToolCallProcessorUniqueIds() throws {
-        let processor = ToolCallProcessor(format: .json)
-        let content =
-            "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>"
-            + "<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>"
-
-        _ = processor.processChunk(content)
-        processor.processEOS()
-
-        #expect(processor.toolCalls.count == 2)
-        let first = try #require(processor.toolCalls.first?.id)
-        let second = try #require(processor.toolCalls.last?.id)
-        #expect(first != second)
+        #expect(toolCall.id == nil)
     }
 
     @Test("ToolCall initialized without id stays nil (source compatibility)")

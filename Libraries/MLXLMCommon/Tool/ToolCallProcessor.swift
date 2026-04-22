@@ -65,15 +65,6 @@ public class ToolCallProcessor {
         parser.startTag?.first
     }
 
-    /// Ensure a parsed ``ToolCall`` has a non-nil id, assigning a UUID-based
-    /// fallback prefixed `"call_"` (OpenAI-style) when the parser did not
-    /// provide one. This lets consumers reliably correlate tool calls with
-    /// their tool responses across multi-call turns.
-    private func ensureId(_ call: ToolCall) -> ToolCall {
-        if call.id != nil { return call }
-        return ToolCall(id: "call_" + UUID().uuidString, function: call.function)
-    }
-
     // MARK: - Public Methods
 
     /// Process a generated text chunk and extract any tool call content.
@@ -101,8 +92,7 @@ public class ToolCallProcessor {
             return
         }
 
-        toolCalls.append(
-            contentsOf: parser.parseEOS(toolCallBuffer, tools: tools).map(ensureId))
+        toolCalls.append(contentsOf: parser.parseEOS(toolCallBuffer, tools: tools))
 
         toolCallBuffer = ""
         state = .normal
@@ -126,7 +116,7 @@ public class ToolCallProcessor {
                 state = .collectingToolCall
 
                 if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    toolCalls.append(ensureId(toolCall))
+                    toolCalls.append(toolCall)
                     toolCallBuffer = ""
                     state = .normal
                     return leading.isEmpty ? nil : leading
@@ -151,7 +141,7 @@ public class ToolCallProcessor {
             toolCallBuffer += chunk
 
             if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                toolCalls.append(ensureId(toolCall))
+                toolCalls.append(toolCall)
                 toolCallBuffer = ""
                 state = .normal
                 return nil
@@ -230,7 +220,7 @@ public class ToolCallProcessor {
 
                 // Parse the tool call using the parser
                 if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    toolCalls.append(ensureId(toolCall))
+                    toolCalls.append(toolCall)
                 }
 
                 state = .normal
