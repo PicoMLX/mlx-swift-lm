@@ -47,7 +47,7 @@ struct ToolCallIdTests {
         #expect(first["type"] as? String == "function")
         let firstFn = try #require(first["function"] as? [String: any Sendable])
         #expect(firstFn["name"] as? String == "get_weather")
-        let firstArgs = try #require(firstFn["arguments"] as? [String: Any])
+        let firstArgs = try #require(firstFn["arguments"] as? [String: any Sendable])
         #expect(firstArgs["location"] as? String == "Paris")
 
         let second = calls[1]
@@ -55,7 +55,7 @@ struct ToolCallIdTests {
         #expect(second["type"] as? String == "function")
         let secondFn = try #require(second["function"] as? [String: any Sendable])
         #expect(secondFn["name"] as? String == "get_time")
-        let secondArgs = try #require(secondFn["arguments"] as? [String: Any])
+        let secondArgs = try #require(secondFn["arguments"] as? [String: any Sendable])
         #expect(secondArgs["timezone"] as? String == "UTC")
     }
 

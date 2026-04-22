@@ -106,7 +106,7 @@ extension MessageGenerator {
                     "type": "function",
                     "function": [
                         "name": call.function.name,
-                        "arguments": call.function.arguments.mapValues { $0.anyValue },
+                        "arguments": call.function.arguments.mapValues { $0.sendableValue },
                     ] as [String: any Sendable],
                 ]
                 if let id = call.id { entry["id"] = id }
@@ -165,7 +165,7 @@ public struct DefaultMessageGenerator: MessageGenerator {
                     "type": "function",
                     "function": [
                         "name": call.function.name,
-                        "arguments": call.function.arguments.mapValues { $0.anyValue },
+                        "arguments": call.function.arguments.mapValues { $0.sendableValue },
                     ] as [String: any Sendable],
                 ]
                 if let id = call.id { entry["id"] = id }
