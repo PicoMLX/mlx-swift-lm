@@ -150,30 +150,6 @@ extension MessageGenerator {
 /// ```
 public struct DefaultMessageGenerator: MessageGenerator {
     public init() {}
-
-    public func generate(message: Chat.Message) -> Message {
-        var dict: Message = [
-            "role": message.role.rawValue,
-            "content": message.content,
-        ]
-        if let id = message.toolCallId {
-            dict["tool_call_id"] = id
-        }
-        if let calls = message.toolCalls {
-            dict["tool_calls"] = calls.map { call -> [String: any Sendable] in
-                var entry: [String: any Sendable] = [
-                    "type": "function",
-                    "function": [
-                        "name": call.function.name,
-                        "arguments": call.function.arguments.mapValues { $0.sendableValue },
-                    ] as [String: any Sendable],
-                ]
-                if let id = call.id { entry["id"] = id }
-                return entry
-            }
-        }
-        return dict
-    }
 }
 
 /// Implementation of ``MessageGenerator`` that produces a
