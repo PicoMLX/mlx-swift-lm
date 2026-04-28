@@ -128,7 +128,7 @@ public enum JSONValue: Hashable, Codable, Sendable {
             return ["type": "object", "properties": props]
         }
     }
-    
+
     /// Convert to a `Sendable`-typed value suitable for use in
     /// `[String: any Sendable]` dictionaries (e.g. ``Message``).
     public var sendableValue: any Sendable {

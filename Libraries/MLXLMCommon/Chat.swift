@@ -18,10 +18,10 @@ public enum Chat {
 
         /// For `.tool` messages: the id of the tool call this message answers.
         public var toolCallId: String?
-        
+
         /// For `.assistant` messages: the tool calls this turn emitted.
         public var toolCalls: [ToolCall]?
-        
+
         public init(
             role: Role, content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
@@ -43,9 +43,12 @@ public enum Chat {
         }
 
         public static func assistant(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = [], toolCalls: [ToolCall]? = nil
+            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = [],
+            toolCalls: [ToolCall]? = nil
         ) -> Self {
-            Self(role: .assistant, content: content, images: images, videos: videos, toolCalls: toolCalls)
+            Self(
+                role: .assistant, content: content, images: images, videos: videos,
+                toolCalls: toolCalls)
         }
 
         public static func user(
