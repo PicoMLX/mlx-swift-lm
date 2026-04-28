@@ -1,5 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
+import Foundation
+
 public enum Chat {
     public struct Message {
         /// The role of the message sender.
@@ -101,17 +103,7 @@ extension MessageGenerator {
             dict["tool_call_id"] = id
         }
         if let calls = message.toolCalls {
-            dict["tool_calls"] = calls.map { call -> [String: any Sendable] in
-                var entry: [String: any Sendable] = [
-                    "type": "function",
-                    "function": [
-                        "name": call.function.name,
-                        "arguments": call.function.arguments.mapValues { $0.sendableValue },
-                    ] as [String: any Sendable],
-                ]
-                if let id = call.id { entry["id"] = id }
-                return entry
-            }
+            dict["tool_calls"] = calls.map(renderToolCall)
         }
         return dict
     }
@@ -168,5 +160,29 @@ public struct NoSystemMessageGenerator: MessageGenerator {
         messages
             .filter { $0.role != .system }
             .map { generate(message: $0) }
+    }
+}
+
+private func renderToolCall(_ call: ToolCall) -> [String: any Sendable] {
+    var entry: [String: any Sendable] = [
+        "type": "function",
+        "function": [
+            "name": call.function.name,
+            "arguments": call.function.arguments.mapValues(toSendable),
+        ] as [String: any Sendable],
+    ]
+    if let id = call.id { entry["id"] = id }
+    return entry
+}
+
+private func toSendable(_ value: JSONValue) -> any Sendable {
+    switch value {
+    case .null: return NSNull()
+    case .bool(let v): return v
+    case .int(let v): return v
+    case .double(let v): return v
+    case .string(let v): return v
+    case .array(let v): return v.map(toSendable)
+    case .object(let v): return v.mapValues(toSendable)
     }
 }
