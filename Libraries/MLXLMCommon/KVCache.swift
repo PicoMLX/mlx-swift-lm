@@ -178,7 +178,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -191,8 +192,19 @@ public func createCausalMask(
     }
 
     if var lengths {
+        // Right-padding semantics (legacy `lengths`): row b can attend to
+        // positions [0, lengths[b]); positions >= lengths[b] are masked.
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    if var leftPadding {
+        // Left-padding semantics (BatchKVCache): row b cannot attend to
+        // positions [0, leftPadding[b]); the leading slots are zero
+        // padding, not real KV. Mirrors mlx_lm.create_causal_mask's
+        // left_padding parameter.
+        leftPadding = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (leftPadding .<= rinds)
     }
 
     return mask
