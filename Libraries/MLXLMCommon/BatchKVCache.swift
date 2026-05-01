@@ -433,6 +433,10 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         }
     }
 
+    public override func innerState() -> [MLXArray] {
+        state
+    }
+
     public override func copy() -> any KVCache {
         BatchKVCache(
             keys: keys.map { $0[.ellipsis] },

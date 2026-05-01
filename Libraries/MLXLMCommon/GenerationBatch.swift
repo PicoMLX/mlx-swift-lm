@@ -58,7 +58,10 @@ public final class GenerationBatch: @unchecked Sendable {
     public let fallbackSampler: RowSampler
     public private(set) var stateMachines: [SequenceStateMachine]
 
-    /// Tokens sampled at the previous step (or seed tokens at construction). `[B]`.
+    /// Tokens queued for the next model call. At construction this is the
+    /// final prompt token for each row. After priming, and after every
+    /// decode step, it holds the sampled token that should be returned on
+    /// the next `next()` call. `[B]`.
     private var nextTokens: MLXArray
     private var numTokens: [Int]
     private var matcherStates: [SequenceStateMachineState]
@@ -88,6 +91,15 @@ public final class GenerationBatch: @unchecked Sendable {
         self.matcherStates = machines.map { $0.makeState() }
         self.numTokens = Array(repeating: 0, count: uids.count)
         self.nextTokens = seedTokens
+
+        // Match upstream mlx_lm.GenerationBatch: immediately run one
+        // decode step in the constructor so the first call to `next()`
+        // returns an already-computed token while scheduling the following
+        // token. This double-buffer keeps the GPU queue ahead of the CPU
+        // token extraction path.
+        if !uids.isEmpty {
+            _ = step()
+        }
     }
 
     /// Run one decode step. Finished rows (length / stop) are filtered out
@@ -199,19 +211,26 @@ public final class GenerationBatch: @unchecked Sendable {
     public var isEmpty: Bool { uids.isEmpty }
     public var batchSize: Int { uids.count }
 
-    /// One forward pass + per-row sample. Synchronous; the async eval
-    /// double-buffering optimization from upstream Python is not implemented.
+    /// One forward pass + per-row sample, double-buffered like upstream
+    /// `mlx_lm.generate.GenerationBatch._step`.
+    ///
+    /// `nextTokens` is treated as the *current* token batch to return from
+    /// this call. We immediately feed it back through the model, sample the
+    /// following token batch, and `asyncEval` that future batch before
+    /// synchronously materializing the current tokens for CPU-side stop
+    /// detection / response dispatch.
     private func step() -> [Int] {
-        let inputs = nextTokens[0..., .newAxis]
+        let currentTokens = nextTokens
+        let inputs = currentTokens[0..., .newAxis]
 
         let logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
 
         // [B, 1, vocab] -> [B, vocab]
         let stepLogits = logits[.ellipsis, -1, 0...]
-        let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
 
         let sampledTokens: MLXArray
         if samplers.contains(where: { $0 != nil }) {
+            let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
             for i in 0 ..< uids.count {
@@ -221,18 +240,26 @@ public final class GenerationBatch: @unchecked Sendable {
             }
             sampledTokens = concatenated(samples, axis: 0)
         } else {
-            sampledTokens = fallbackSampler(logprobs)
+            // Greedy fast path. Avoid the full-vocabulary logSumExp when
+            // all rows are greedy: argMax(logits) == argMax(logprobs),
+            // and Swift does not currently expose logprobs downstream.
+            // This removes one expensive reduction kernel per decode step.
+            sampledTokens = argMax(stepLogits, axis: -1)
         }
 
-        eval(sampledTokens, inputs)
-        let stepTokens = inputs.asArray(Int32.self).map { Int($0) }
-        let outTokens = sampledTokens.asArray(Int32.self).map { Int($0) }
+        // Start computing the next token before forcing the current token
+        // values back to the CPU. This overlaps GPU work with the CPU
+        // extraction / response-building path.
+        nextTokens = sampledTokens
+        asyncEval(sampledTokens)
+
+        eval(currentTokens)
+        let stepTokens = currentTokens.asArray(UInt32.self).map { Int($0) }
 
         for (i, t) in stepTokens.enumerated() {
             tokens[i].append(t)
         }
 
-        nextTokens = sampledTokens
-        return outTokens
+        return stepTokens
     }
 }

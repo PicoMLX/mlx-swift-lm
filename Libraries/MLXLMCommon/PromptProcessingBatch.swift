@@ -99,7 +99,7 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             for t in promptTokens {
                 padded.append(t + Array(repeating: 0, count: maxLength - t.count))
             }
-            let flat: [Int32] = padded.flatMap { $0.map { Int32($0) } }
+            let flat: [UInt32] = padded.flatMap { $0.map { UInt32($0) } }
             inputs = MLXArray(flat).reshaped([promptTokens.count, maxLength])
 
             for cache in promptCache {
@@ -108,7 +108,7 @@ public final class PromptProcessingBatch: @unchecked Sendable {
                 }
             }
         } else {
-            let flat: [Int32] = promptTokens.flatMap { $0.map { Int32($0) } }
+            let flat: [UInt32] = promptTokens.flatMap { $0.map { UInt32($0) } }
             inputs = MLXArray(flat).reshaped([promptTokens.count, maxLength])
         }
 
@@ -156,7 +156,7 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             prompt(prefixes)
         }
 
-        let lastTokens = inputTokens.map { Int32($0.last ?? 0) }
+        let lastTokens = inputTokens.map { UInt32($0.last ?? 0) }
         let seed = MLXArray(lastTokens)
 
         let gen = GenerationBatch(
