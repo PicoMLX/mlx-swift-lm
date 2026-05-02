@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 final class ContinuousBatchingTests: XCTestCase {
 
@@ -327,7 +328,8 @@ private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDim
     }
 }
 
-private final class TokenEchoingCacheLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+private final class TokenEchoingCacheLanguageModel: Module, LanguageModel, KVCacheDimensionProvider
+{
     let vocabularySize = 16
     var kvHeads: [Int] { [1] }
 
