@@ -1,5 +1,3 @@
-// Copyright © 2026 Eigen Labs.
-//
 // Port of mlx_lm.generate.PromptProcessingBatch.
 // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 
@@ -45,10 +43,12 @@ public final class PromptProcessingBatch: @unchecked Sendable {
         self.prefillStepSize = prefillStepSize
         self.samplers = samplers ?? Array(repeating: nil, count: uids.count)
         self.fallbackSampler = fallbackSampler
-        self.stateMachines = stateMachines ?? Array(
-            repeating: SequenceStateMachine(),
-            count: uids.count
-        )
+        self.stateMachines =
+            stateMachines
+            ?? Array(
+                repeating: SequenceStateMachine(),
+                count: uids.count
+            )
     }
 
     public static func empty(
@@ -103,9 +103,7 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             inputs = MLXArray(flat).reshaped([promptTokens.count, maxLength])
 
             for cache in promptCache {
-                if let kv = cache as? BatchKVCache {
-                    kv.prepare(rightPadding: padding)
-                }
+                cache.prepareBatched(leftPadding: nil, lengths: lengths, rightPadding: padding)
             }
         } else {
             let flat: [UInt32] = promptTokens.flatMap { $0.map { UInt32($0) } }
@@ -123,6 +121,9 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             for cache in promptCache {
                 eval(cache.innerState())
             }
+            for cache in promptCache {
+                cache.advanceBatched(n)
+            }
             if n == remaining.dim(1) {
                 break
             }
@@ -131,10 +132,8 @@ public final class PromptProcessingBatch: @unchecked Sendable {
 
         if maxPadding > 0 {
             for cache in promptCache {
-                if let kv = cache as? BatchKVCache {
-                    kv.finalize()
-                    eval(kv.innerState())
-                }
+                cache.finalizeBatched()
+                eval(cache.innerState())
             }
         }
     }

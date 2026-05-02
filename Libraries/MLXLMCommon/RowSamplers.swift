@@ -1,5 +1,3 @@
-// Copyright © 2026 Eigen Labs.
-//
 // Per-row samplers for `BatchGenerator`. Mirrors `mlx_lm.sample_utils`:
 // temperature scaling, top-K truncation, top-P (nucleus) truncation, and
 // optional seeded categorical sampling. Each constructed sampler is

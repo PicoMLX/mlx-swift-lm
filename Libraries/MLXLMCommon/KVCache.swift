@@ -1097,6 +1097,7 @@ public class ChunkedKVCache: KVCacheSimple {
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
+    internal var lengths: MLXArray?
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
@@ -1138,24 +1139,67 @@ public class ArraysCache: BaseKVCache {
         cache = cache.map { c in
             c?[batchIndices]
         }
-        leftPadding = nil
+        leftPadding = leftPadding.map { take($0, batchIndices, axis: 0) }
+        lengths = lengths.map { take($0, batchIndices, axis: 0) }
     }
 
     /// In-place extend this cache with the other cache
     public func extend(other: ArraysCache) {
-        cache = zip(cache, other.cache).map { (c, o) in
-            if let c = c, let o = o {
-                return MLX.concatenated([c, o])
+        let lhsBatch = batchSize
+        let rhsBatch = other.batchSize
+
+        func concatenateOptional(_ lhs: MLXArray?, _ rhs: MLXArray?) -> MLXArray? {
+            var shape: [Int]?
+            var dtype: DType?
+            if let lhs {
+                shape = lhs.shape
+                dtype = lhs.dtype
             }
-            return c ?? o
+            if let rhs {
+                shape = rhs.shape
+                dtype = rhs.dtype
+            }
+            guard let shape, let dtype else { return nil }
+
+            let itemShape = Array(shape.dropFirst())
+            let lhsValue = lhs ?? MLXArray.zeros([lhsBatch] + itemShape, dtype: dtype)
+            let rhsValue = rhs ?? MLXArray.zeros([rhsBatch] + itemShape, dtype: dtype)
+            return MLX.concatenated([lhsValue, rhsValue])
         }
+
+        cache = zip(cache, other.cache).map { (c, o) in
+            concatenateOptional(c, o)
+        }
+        leftPadding = concatenateOptional(leftPadding, other.leftPadding)
+        lengths = concatenateOptional(lengths, other.lengths)
+    }
+
+    open func extract(_ idx: Int) -> ArraysCache {
+        let extracted = ArraysCache(size: cache.count)
+        extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        return extracted
+    }
+
+    public func prepare(lengths: [Int]? = nil) {
+        self.lengths = lengths.map { MLXArray($0.map { Int32($0) }) }
+    }
+
+    public func finalize() {
+        lengths = nil
         leftPadding = nil
+    }
+
+    public func advance(_ n: Int) {
+        lengths = lengths.map { $0 - Int32(n) }
+        leftPadding = leftPadding.map { $0 - Int32(n) }
     }
 
     /// Create attention mask based on left padding
     public func makeMask(N: Int) -> MLXArray? {
-        if cache[0] == nil, let leftPadding = leftPadding {
+        if let leftPadding {
             return MLXArray(0 ..< N) .>= leftPadding[0..., .newAxis]
+        } else if let lengths {
+            return MLXArray(0 ..< N) .< lengths[0..., .newAxis]
         } else {
             return nil
         }
@@ -1219,6 +1263,21 @@ public class ArraysCache: BaseKVCache {
         guard let lp = leftPadding else { return nil }
         return lp.asArray(Int.self)
     }
+
+    private var batchSize: Int {
+        for item in cache {
+            if let item {
+                return item.dim(0)
+            }
+        }
+        if let leftPadding {
+            return leftPadding.dim(0)
+        }
+        if let lengths {
+            return lengths.dim(0)
+        }
+        return 0
+    }
 }
 
 /// Simple cache for Mamba-style state space models
@@ -1236,6 +1295,12 @@ public class MambaCache: ArraysCache {
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new
+    }
+
+    public override func extract(_ idx: Int) -> ArraysCache {
+        let extracted = MambaCache()
+        extracted.state = state.map { $0[idx ..< (idx + 1)] }
+        return extracted
     }
 }
 

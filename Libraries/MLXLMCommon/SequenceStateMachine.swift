@@ -1,5 +1,3 @@
-// Copyright © 2026 Eigen Labs.
-//
 // Port of mlx_lm.generate.SequenceStateMachine.
 // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 
@@ -118,49 +116,67 @@ public struct SequenceStateMachine: Sendable {
         matchedSequence: [Int]?,
         currentState: String?
     ) {
-        guard let node = state.trieNode else {
+        guard state.trieNode != nil, let currentState = state.currentState,
+            let root = state.allStates[currentState]
+        else {
             return (state, nil, state.currentState)
         }
 
-        if let child = node.children[token] {
-            let nextPending = state.pendingMatch + [token]
-            if let transition = child.transition {
-                let nextState = transition.next
-                let nextNode = nextState.flatMap { state.allStates[$0] }
+        var candidate = state.pendingMatch + [token]
+        while !candidate.isEmpty {
+            if let child = Self.findPrefix(candidate, in: root) {
+                if let transition = child.transition {
+                    let nextState = transition.next
+                    let nextNode = nextState.flatMap { state.allStates[$0] }
+                    return (
+                        SequenceStateMachineState(
+                            currentState: nextState,
+                            trieNode: nextNode,
+                            allStates: state.allStates,
+                            pendingMatch: []
+                        ),
+                        transition.matchedSequence,
+                        nextState
+                    )
+                }
                 return (
                     SequenceStateMachineState(
-                        currentState: nextState,
-                        trieNode: nextNode,
+                        currentState: currentState,
+                        trieNode: child,
                         allStates: state.allStates,
-                        pendingMatch: []
+                        pendingMatch: candidate
                     ),
-                    transition.matchedSequence,
-                    nextState
+                    nil,
+                    currentState
                 )
             }
-            return (
-                SequenceStateMachineState(
-                    currentState: state.currentState,
-                    trieNode: child,
-                    allStates: state.allStates,
-                    pendingMatch: nextPending
-                ),
-                nil,
-                state.currentState
-            )
+
+            candidate.removeFirst()
         }
 
-        // Mismatch: reset to the root of the current state's trie.
-        let resetNode = state.allStates[state.currentState ?? ""]
         return (
             SequenceStateMachineState(
-                currentState: state.currentState,
-                trieNode: resetNode,
+                currentState: currentState,
+                trieNode: root,
                 allStates: state.allStates,
                 pendingMatch: []
             ),
             nil,
-            state.currentState
+            currentState
         )
+    }
+
+    private static func findPrefix(
+        _ tokens: [Int],
+        in root: StateMachineTrieNode
+    ) -> StateMachineTrieNode? {
+        var node = root
+        for token in tokens {
+            guard let child = node.children[token] else {
+                return nil
+            }
+            node = child
+        }
+        return node
     }
 }

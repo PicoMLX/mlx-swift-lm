@@ -231,16 +231,17 @@ private class Gemma4Attention: Module {
     let nHeads: Int
     let nKvHeads: Int
     let useKeqV: Bool
+    let usesSharedKV: Bool
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
-    @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale
+    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
+    @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale?
 
     @ModuleInfo var rope: RoPELayer
 
@@ -249,6 +250,8 @@ private class Gemma4Attention: Module {
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.isSliding = layerType == "sliding_attention"
+        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
+        self.usesSharedKV = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
 
         // Full attention uses globalHeadDim, sliding uses headDim
         self.effectiveHeadDim =
@@ -268,15 +271,17 @@ private class Gemma4Attention: Module {
         self.scale = 1.0
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
-        self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
-        if !useKeqV {
-            self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+        if !usesSharedKV {
+            self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            if !useKeqV {
+                self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            }
+            self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
+            self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
         }
         self._oProj.wrappedValue = Linear(nHeads * effectiveHeadDim, dim, bias: false)
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
 
         // RoPE: sliding uses default, full uses proportional with partial rotation
         if isSliding {
@@ -317,6 +322,10 @@ private class Gemma4Attention: Module {
             keys = sharedK
             values = sharedV
         } else {
+            guard let kProj, let kNorm, let vNorm else {
+                preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
+            }
+
             let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)

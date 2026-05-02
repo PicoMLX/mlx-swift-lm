@@ -1,5 +1,3 @@
-// Copyright © 2026 Eigen Labs.
-//
 // Port of mlx_lm.generate.BatchGenerator.
 // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 
@@ -84,13 +82,14 @@ public final class BatchGenerator: @unchecked Sendable {
             let uid = uidCounter
             uidCounter += 1
             assignedUids.append(uid)
-            unprocessed.append(QueuedRequest(
-                uid: uid,
-                tokens: prompts[i],
-                maxTokens: maxTokens?[i] ?? defaultMaxTokens,
-                sampler: samplers?[i],
-                stateMachine: stateMachines?[i] ?? defaultStateMachine
-            ))
+            unprocessed.append(
+                QueuedRequest(
+                    uid: uid,
+                    tokens: prompts[i],
+                    maxTokens: maxTokens?[i] ?? defaultMaxTokens,
+                    sampler: samplers?[i],
+                    stateMachine: stateMachines?[i] ?? defaultStateMachine
+                ))
         }
         return assignedUids
     }
@@ -191,8 +190,13 @@ public final class BatchGenerator: @unchecked Sendable {
             if layer is MambaCache {
                 return MambaCache(leftPadding: zeroLeftPadding)
             }
-            if layer is ArraysCache {
-                return ArraysCache(size: layer.state.count, leftPadding: zeroLeftPadding)
+            if let arrays = layer as? ArraysCache {
+                return ArraysCache(size: arrays.slotCount, leftPadding: zeroLeftPadding)
+            }
+            if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
+                let keep = Int(rotating.metaState.first ?? "0") ?? 0
+                precondition(keep == 0, "RotatingKVCache with keep tokens is not supported")
+                return BatchRotatingKVCache(maxSize: maxSize, leftPadding: zeroLeftPadding)
             }
             return BatchKVCache(leftPadding: zeroLeftPadding)
         }

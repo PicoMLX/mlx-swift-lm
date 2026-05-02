@@ -1,5 +1,3 @@
-// Copyright © 2026 Eigen Labs.
-//
 // Port of mlx_lm.generate.GenerationBatch.
 // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 
@@ -38,7 +36,7 @@ public struct GenerationBatchResponse: @unchecked Sendable {
 
     /// Single-row prompt cache for prefix caching across requests.
     /// Set only on the final response.
-    public let promptCache: [KVCacheSimple]?
+    public let promptCache: [any KVCache]?
 }
 
 /// Decode-phase batch over a shared `[any BatchedCache]` (one per layer).
@@ -131,29 +129,29 @@ public final class GenerationBatch: @unchecked Sendable {
             }
 
             if finishReason != nil {
-                let extracted: [KVCacheSimple] = promptCache.compactMap {
-                    ($0 as? BatchKVCache)?.extract(i)
-                }
-                responses.append(GenerationBatchResponse(
-                    uid: uids[i],
-                    token: stepTokens[i],
-                    finishReason: finishReason,
-                    matchedSequence: matchedSequence,
-                    currentState: currentState,
-                    allTokens: tokens[i],
-                    promptCache: extracted
-                ))
+                let extracted: [any KVCache] = promptCache.map { $0.extractBatched(i) }
+                responses.append(
+                    GenerationBatchResponse(
+                        uid: uids[i],
+                        token: stepTokens[i],
+                        finishReason: finishReason,
+                        matchedSequence: matchedSequence,
+                        currentState: currentState,
+                        allTokens: tokens[i],
+                        promptCache: extracted
+                    ))
             } else {
                 keep.append(i)
-                responses.append(GenerationBatchResponse(
-                    uid: uids[i],
-                    token: stepTokens[i],
-                    finishReason: nil,
-                    matchedSequence: matchedSequence,
-                    currentState: currentState,
-                    allTokens: nil,
-                    promptCache: nil
-                ))
+                responses.append(
+                    GenerationBatchResponse(
+                        uid: uids[i],
+                        token: stepTokens[i],
+                        finishReason: nil,
+                        matchedSequence: matchedSequence,
+                        currentState: currentState,
+                        allTokens: nil,
+                        promptCache: nil
+                    ))
             }
         }
 
