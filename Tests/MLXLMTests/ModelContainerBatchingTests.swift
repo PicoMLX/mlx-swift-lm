@@ -126,6 +126,142 @@ struct ModelContainerBatchingTests {
         #expect(info2.generationTokenCount == 5)
     }
 
+    @Test("Explicit batched token generation starts directly in batch mode")
+    func explicitBatchedTokenGenerationStartsInBatchMode() async throws {
+        let scheduler = InferenceScheduler()
+        let (container, _, _) = makeContainer(scheduler: scheduler, callDelay: 0.002)
+
+        let streams = try await container.generateTokensBatched([
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(1), Int32(2)])),
+                parameters: GenerateParameters(maxTokens: 3, temperature: 0)
+            ),
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(8), Int32(9)])),
+                parameters: GenerateParameters(maxTokens: 4, temperature: 0)
+            ),
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(12), Int32(13)])),
+                parameters: GenerateParameters(maxTokens: 5, temperature: 0)
+            ),
+        ])
+
+        #expect(streams.count == 3)
+        #expect(await waitForSchedulerState(scheduler, equals: "batched"))
+
+        async let result0 = collectTokenOutput(streams[0])
+        async let result1 = collectTokenOutput(streams[1])
+        async let result2 = collectTokenOutput(streams[2])
+        let (output0, output1, output2) = await (result0, result1, result2)
+
+        #expect(output0.info?.generationTokenCount == 3)
+        #expect(output1.info?.generationTokenCount == 4)
+        #expect(output2.info?.generationTokenCount == 5)
+    }
+
+    @Test("Explicit batched token generation inserts into a running batch")
+    func explicitBatchedTokenGenerationInsertsIntoRunningBatch() async throws {
+        let scheduler = InferenceScheduler()
+        let (container, _, _) = makeContainer(scheduler: scheduler, callDelay: 0.003)
+
+        let initialStreams = try await container.generateTokensBatched([
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(1), Int32(2)])),
+                parameters: GenerateParameters(maxTokens: 12, temperature: 0)
+            ),
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(4), Int32(5)])),
+                parameters: GenerateParameters(maxTokens: 12, temperature: 0)
+            ),
+        ])
+
+        #expect(await waitForSchedulerState(scheduler, equals: "batched"))
+
+        let insertedStreams = try await container.generateTokensBatched([
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(8), Int32(9)])),
+                parameters: GenerateParameters(maxTokens: 3, temperature: 0)
+            ),
+            GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(14), Int32(15)])),
+                parameters: GenerateParameters(maxTokens: 4, temperature: 0)
+            ),
+        ])
+
+        async let result0 = collectTokenOutput(initialStreams[0])
+        async let result1 = collectTokenOutput(initialStreams[1])
+        async let result2 = collectTokenOutput(insertedStreams[0])
+        async let result3 = collectTokenOutput(insertedStreams[1])
+        let (output0, output1, output2, output3) = await (result0, result1, result2, result3)
+
+        #expect(output0.info?.generationTokenCount == 12)
+        #expect(output1.info?.generationTokenCount == 12)
+        #expect(output2.info?.generationTokenCount == 3)
+        #expect(output3.info?.generationTokenCount == 4)
+    }
+
+    @Test("Explicit batched token generation rejects a busy single path")
+    func explicitBatchedTokenGenerationRejectsBusySinglePath() async throws {
+        let scheduler = InferenceScheduler()
+        let (container, _, _) = makeContainer(scheduler: scheduler, callDelay: 0.003)
+
+        let stream = try await container.generateTokens(
+            input: LMInput(tokens: MLXArray([Int32(1), Int32(2)])),
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0)
+        )
+
+        #expect(await waitForSchedulerState(scheduler, equals: "single"))
+
+        do {
+            _ = try await container.generateTokensBatched([
+                GenerationRequest(
+                    input: LMInput(tokens: MLXArray([Int32(8), Int32(9)])),
+                    parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+                ),
+                GenerationRequest(
+                    input: LMInput(tokens: MLXArray([Int32(10), Int32(11)])),
+                    parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+                ),
+            ])
+            Issue.record("Expected schedulerBusy")
+        } catch BatchedGenerationError.schedulerBusy {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        _ = await collectTokenOutput(stream)
+    }
+
+    @Test("Explicit batched token generation validates request counts")
+    func explicitBatchedTokenGenerationValidatesRequestCounts() async throws {
+        let scheduler = InferenceScheduler()
+        let (container, _, _) = makeContainer(scheduler: scheduler)
+
+        do {
+            _ = try await container.generateTokensBatched([
+                GenerationRequest(
+                    input: LMInput(tokens: MLXArray([Int32(1), Int32(2)])),
+                    parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+                )
+            ])
+            Issue.record("Expected batchTooSmall")
+        } catch BatchedGenerationError.batchTooSmall {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        do {
+            _ = try await container.generateTokensBatched(
+                input: [LMInput(tokens: MLXArray([Int32(1), Int32(2)]))],
+                parameters: []
+            )
+            Issue.record("Expected mismatchedRequestCounts")
+        } catch BatchedGenerationError.mismatchedRequestCounts {
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
     @Test("Cancelling one scheduler-backed stream does not stop the other request")
     func cancellingOneStreamDoesNotStopTheOther() async throws {
         let scheduler = InferenceScheduler()

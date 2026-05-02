@@ -21,7 +21,35 @@ import MLXNN
 ///
 /// State machine: `.idle` → `.single` → `.batched`
 ///
-/// Usage:
+/// Most callers install a scheduler on `ModelContainer` rather than submitting
+/// directly:
+/// ```swift
+/// let container = ModelContainer(
+///     context: context,
+///     scheduler: InferenceScheduler(
+///         configuration: .init(
+///             completionBatchSize: 16,
+///             prefillBatchSize: 4,
+///             prefillStepSize: 1024,
+///             cacheClearInterval: 512
+///         )
+///     )
+/// )
+/// let stream = try await container.generate(
+///     input: lmInput,
+///     parameters: params
+/// )
+/// ```
+///
+/// Explicit same-call batching is exposed through `ModelContainer`:
+/// ```swift
+/// let streams = try await container.generateTokensBatched([
+///     GenerationRequest(input: inputA, parameters: paramsA),
+///     GenerationRequest(input: inputB, parameters: paramsB),
+/// ])
+/// ```
+///
+/// The scheduler itself remains public so callers can configure it:
 /// ```swift
 /// let scheduler = InferenceScheduler(
 ///     configuration: .init(
@@ -31,17 +59,6 @@ import MLXNN
 ///         cacheClearInterval: 512
 ///     )
 /// )
-/// let stream = scheduler.submit(
-///     input: lmInput,
-///     parameters: params,
-///     model: model,
-///     cache: nil,
-///     tokenizer: tokenizer,
-///     configuration: config
-/// )
-/// for await generation in stream {
-///     // handle generation events
-/// }
 /// ```
 public actor InferenceScheduler {
 
@@ -317,6 +334,12 @@ public actor InferenceScheduler {
         let cacheMaxKVSize: Int?
     }
 
+    /// A scheduler request paired with the stream handler that receives its output.
+    private struct BatchSubmission {
+        let handler: SchedulerTokenHandler
+        let request: SchedulerRequest
+    }
+
     // MARK: - Properties
 
     /// Current scheduler state.
@@ -356,7 +379,7 @@ public actor InferenceScheduler {
     ///     cache write-back.
     ///   - wiredMemoryTicket: Optional wired-memory ticket for this request.
     /// - Returns: An `AsyncStream<Generation>` yielding generation events for this request.
-    public func submit(
+    func submit(
         input: LMInput,
         parameters: GenerateParameters,
         model: any LanguageModel,
@@ -416,7 +439,7 @@ public actor InferenceScheduler {
     ///   - inputTokens: The full token sequence for prompt cache write-back.
     ///   - wiredMemoryTicket: Optional wired-memory ticket for this request.
     /// - Returns: An `AsyncStream<TokenGeneration>` yielding raw token events.
-    public func submitTokens(
+    func submitTokens(
         input: LMInput,
         parameters: GenerateParameters,
         model: any LanguageModel,
@@ -452,6 +475,65 @@ public actor InferenceScheduler {
         )
 
         return stream
+    }
+
+    /// Submit multiple text-generation requests as a batch from the first scheduler step.
+    func submitBatch(
+        _ requests: [SchedulerRequest],
+        model: any LanguageModel
+    ) async throws -> [AsyncStream<Generation>] {
+        let streamsAndSubmissions = requests.map { request in
+            let toolCallFormat = request.configuration.toolCallFormat ?? .json
+            let (stream, continuation) = AsyncStream<Generation>.makeStream()
+            let handler = SchedulerTokenHandler.text(
+                continuation: continuation,
+                tokenizer: request.tokenizer,
+                toolCallFormat: toolCallFormat
+            )
+            return (
+                stream,
+                BatchSubmission(
+                    handler: handler,
+                    request: request
+                )
+            )
+        }
+
+        try await routeBatchSubmissions(
+            streamsAndSubmissions.map { $0.1 },
+            model: model
+        )
+
+        return streamsAndSubmissions.map { $0.0 }
+    }
+
+    /// Submit multiple raw-token generation requests as a batch from the first scheduler step.
+    func submitBatchTokens(
+        _ requests: [SchedulerRequest],
+        model: any LanguageModel,
+        includeStopToken: Bool = false
+    ) async throws -> [AsyncStream<TokenGeneration>] {
+        let streamsAndSubmissions = requests.map { request in
+            let (stream, continuation) = AsyncStream<TokenGeneration>.makeStream()
+            let handler = SchedulerTokenHandler.rawToken(
+                continuation: continuation,
+                includeStopToken: includeStopToken
+            )
+            return (
+                stream,
+                BatchSubmission(
+                    handler: handler,
+                    request: request
+                )
+            )
+        }
+
+        try await routeBatchSubmissions(
+            streamsAndSubmissions.map { $0.1 },
+            model: model
+        )
+
+        return streamsAndSubmissions.map { $0.0 }
     }
 
     // MARK: - State Machine Routing
@@ -757,6 +839,102 @@ public actor InferenceScheduler {
                     ticketAlreadyStarted: ticketAlreadyStarted
                 )
             }
+        }
+    }
+
+    /// Route an explicit multi-request submission through the batch-only path.
+    private func routeBatchSubmissions(
+        _ submissions: [BatchSubmission],
+        model: any LanguageModel
+    ) async throws {
+        guard submissions.count >= 2 else {
+            throw BatchedGenerationError.batchTooSmall
+        }
+
+        let incompatibleIndices = submissions.enumerated().compactMap { index, submission in
+            let request = submission.request
+            return Self.isBatchCompatible(
+                input: request.input,
+                parameters: request.parameters,
+                cache: request.cachedKVState ?? request.cache,
+                model: model
+            ) ? nil : index
+        }
+        guard incompatibleIndices.isEmpty else {
+            throw BatchedGenerationError.incompatibleRequests(incompatibleIndices)
+        }
+
+        try validateSubmissionsCanShareBatch(submissions)
+
+        try validateBatchStateAllowsSubmission(submissions)
+        let startedTickets: [WiredMemoryTicket]
+        do {
+            startedTickets = try await awaitTicketAdmissions(
+                submissions.compactMap { $0.request.wiredMemoryTicket }
+            )
+        } catch {
+            throw error
+        }
+
+        do {
+            switch state {
+            case .idle:
+                try validateSubmissionsCanShareBatch(submissions)
+                startFreshBatch(submissions, model: model)
+
+            case .batched(var batchedState):
+                try validateSubmissionsCanShareRunningBatch(
+                    submissions,
+                    cacheMaxKVSize: batchedState.cacheMaxKVSize
+                )
+                try joinExistingBatch(
+                    submissions: submissions,
+                    batchedState: &batchedState
+                )
+
+            case .single, .pendingUpgrade, .upgrading:
+                throw BatchedGenerationError.schedulerBusy
+            }
+        } catch {
+            await endTickets(startedTickets)
+            throw error
+        }
+    }
+
+    private func validateBatchStateAllowsSubmission(_ submissions: [BatchSubmission]) throws {
+        switch state {
+        case .idle:
+            try validateSubmissionsCanShareBatch(submissions)
+        case .batched(let batchedState):
+            try validateSubmissionsCanShareRunningBatch(
+                submissions,
+                cacheMaxKVSize: batchedState.cacheMaxKVSize
+            )
+        case .single, .pendingUpgrade, .upgrading:
+            throw BatchedGenerationError.schedulerBusy
+        }
+    }
+
+    private func validateSubmissionsCanShareBatch(_ submissions: [BatchSubmission]) throws {
+        guard let first = submissions.first else { return }
+        try validateSubmissionsCanShareRunningBatch(
+            submissions,
+            cacheMaxKVSize: first.request.parameters.maxKVSize
+        )
+    }
+
+    private func validateSubmissionsCanShareRunningBatch(
+        _ submissions: [BatchSubmission],
+        cacheMaxKVSize: Int?
+    ) throws {
+        let failingIndices = submissions.enumerated().compactMap { index, submission in
+            Self.canShareBatch(
+                cacheMaxKVSize: cacheMaxKVSize,
+                parameters: submission.request.parameters
+            ) ? nil : index
+        }
+        guard failingIndices.isEmpty else {
+            throw BatchedGenerationError.cannotShareBatch(failingIndices)
         }
     }
 
@@ -1172,6 +1350,246 @@ public actor InferenceScheduler {
         }
     }
 
+    // MARK: - Explicit Batch Path
+
+    private func makeBatchIterator(
+        model: any LanguageModel,
+        stopTokenIDs: Set<Int>,
+        cacheMaxKVSize: Int?
+    ) -> BatchTokenIterator {
+        BatchTokenIterator(
+            model: model,
+            stopTokens: stopTokenIDs,
+            defaultSampler: ArgMaxSampler(),
+            completionBatchSize: self.configuration.completionBatchSize,
+            prefillBatchSize: self.configuration.prefillBatchSize,
+            prefillStepSize: self.configuration.prefillStepSize,
+            cacheMaxKVSize: cacheMaxKVSize,
+            cacheClearInterval: self.configuration.cacheClearInterval
+        )
+    }
+
+    private func startFreshBatch(
+        _ submissions: [BatchSubmission],
+        model: any LanguageModel
+    ) {
+        precondition(submissions.isEmpty == false)
+
+        let firstRequest = submissions[0].request
+        let stopTokenIDs = Self.buildStopTokenIDs(
+            configuration: firstRequest.configuration,
+            tokenizer: firstRequest.tokenizer
+        )
+        let batchCacheMaxKVSize = firstRequest.parameters.maxKVSize
+        let batchIterator = makeBatchIterator(
+            model: model,
+            stopTokenIDs: stopTokenIDs,
+            cacheMaxKVSize: batchCacheMaxKVSize
+        )
+
+        let uids = insertBatchSubmissions(submissions, into: batchIterator)
+        let promptTokenCounts = Dictionary(
+            uniqueKeysWithValues: zip(uids, submissions).map {
+                ($0.0, $0.1.request.input.text.tokens.size)
+            }
+        )
+        let task = startBatchGenerationLoop(
+            batchIterator: batchIterator,
+            stopTokenIDs: stopTokenIDs,
+            tokenizer: firstRequest.tokenizer,
+            initialUIDs: uids,
+            initialPromptTokenCounts: promptTokenCounts
+        )
+
+        var batchedState = BatchedState(
+            batchIterator: batchIterator,
+            task: task,
+            handlers: [:],
+            promptTokenCounts: [:],
+            submitTimes: [:],
+            inputTokens: [:],
+            model: model,
+            tokenizer: firstRequest.tokenizer,
+            configuration: firstRequest.configuration,
+            stopTokenIDs: stopTokenIDs,
+            promptCache: firstRequest.promptCache,
+            promptCacheModelName: firstRequest.promptCacheModelName,
+            wiredMemoryTickets: [:],
+            cacheMaxKVSize: batchCacheMaxKVSize
+        )
+
+        registerBatchSubmissions(
+            submissions,
+            uids: uids,
+            in: &batchedState
+        )
+        state = .batched(batchedState)
+    }
+
+    @discardableResult
+    private func insertBatchSubmissions(
+        _ submissions: [BatchSubmission],
+        into batchIterator: BatchTokenIterator
+    ) -> [Int] {
+        batchIterator.insert(
+            prompts: submissions.map { $0.request.input.text.tokens.asArray(Int.self) },
+            maxTokens: submissions.map { $0.request.parameters.maxTokens ?? 1000 },
+            samplers: submissions.map { $0.request.parameters.sampler() },
+            processors: submissions.map { $0.request.parameters.processor() },
+            cachedKVStates: submissions.map { $0.request.cachedKVState }
+        )
+    }
+
+    private func registerBatchSubmissions(
+        _ submissions: [BatchSubmission],
+        uids: [Int],
+        in batchedState: inout BatchedState
+    ) {
+        let now = Date()
+
+        for (uid, submission) in zip(uids, submissions) {
+            let request = submission.request
+            let handler = submission.handler
+
+            handler.onCancellation {
+                [weak self, weak batchIterator = batchedState.batchIterator] in
+                batchIterator?.remove(uids: [uid])
+                Task {
+                    await self?.cancelBatchedRequest(uid: uid)
+                }
+            }
+
+            let promptTokens = request.input.text.tokens.asArray(Int.self)
+            batchedState.handlers[uid] = handler
+            batchedState.promptTokenCounts[uid] = request.input.text.tokens.size
+            batchedState.submitTimes[uid] = now
+            batchedState.inputTokens[uid] = request.inputTokens ?? promptTokens
+            if let wiredMemoryTicket = request.wiredMemoryTicket {
+                batchedState.wiredMemoryTickets[uid] = wiredMemoryTicket
+            }
+        }
+    }
+
+    private func startBatchGenerationLoop(
+        batchIterator: BatchTokenIterator,
+        stopTokenIDs: Set<Int>,
+        tokenizer: Tokenizer,
+        initialUIDs: [Int],
+        initialPromptTokenCounts: [Int: Int],
+        initialPromptTimes: [Int: TimeInterval] = [:],
+        initialTokenCounts: [Int: Int] = [:],
+        initialGeneratedTokenIds: [Int: [Int]] = [:]
+    ) -> Task<Void, Never> {
+        Task { [weak self] in
+            var starts: [Int: Date] = [:]
+            var promptTimes: [Int: TimeInterval] = [:]
+            var promptTokenCounts = initialPromptTokenCounts
+            var tokenCounts: [Int: Int] = [:]
+            var generatedTokenIds = initialGeneratedTokenIds
+            var initializedUIDs = Set(initialUIDs)
+
+            let now = Date.timeIntervalSinceReferenceDate
+            for uid in initialUIDs {
+                starts[uid] = Date(timeIntervalSinceReferenceDate: now)
+                promptTimes[uid] = 0
+                tokenCounts[uid] = 0
+            }
+
+            for (uid, promptTime) in initialPromptTimes {
+                promptTimes[uid] = promptTime
+            }
+            for (uid, tokenCount) in initialTokenCounts {
+                tokenCounts[uid] = tokenCount
+            }
+
+            while let responses = batchIterator.next(), !responses.isEmpty {
+                if Task.isCancelled { break }
+
+                for response in responses {
+                    let uid = response.uid
+                    guard let handler = await self?.getHandler(uid: uid) else { continue }
+
+                    if !initializedUIDs.contains(uid) {
+                        initializedUIDs.insert(uid)
+                        starts[uid] =
+                            await self?.getSubmitTime(uid: uid) ?? Date()
+                        promptTimes[uid] = 0
+                        tokenCounts[uid] = 0
+                        if promptTokenCounts[uid] == nil {
+                            promptTokenCounts[uid] =
+                                await self?.getPromptTokenCount(uid: uid) ?? 0
+                        }
+                    }
+
+                    let token = response.token
+
+                    if promptTimes[uid] == 0 {
+                        let start = starts[uid]?.timeIntervalSinceReferenceDate ?? now
+                        promptTimes[uid] = Date.timeIntervalSinceReferenceDate - start
+                        starts[uid] = Date(
+                            timeIntervalSinceReferenceDate:
+                                Date.timeIntervalSinceReferenceDate)
+                    }
+
+                    if stopTokenIDs.contains(token)
+                        || token == tokenizer.unknownTokenId
+                    {
+                        if case .rawTokens(includeStopToken: true) = handler.mode {
+                            tokenCounts[uid, default: 0] += 1
+                            generatedTokenIds[uid, default: []].append(token)
+                        }
+                        _ = handler.processStopToken(token)
+                    } else {
+                        tokenCounts[uid, default: 0] += 1
+                        generatedTokenIds[uid, default: []].append(token)
+                        _ = handler.processToken(token)
+                    }
+
+                    if response.finishReason != nil {
+                        handler.processEndOfSequence()
+
+                        let generateTime =
+                            Date.timeIntervalSinceReferenceDate
+                            - (starts[uid]?.timeIntervalSinceReferenceDate ?? now)
+                        let info = GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCounts[uid] ?? 0,
+                            generationTokenCount: tokenCounts[uid] ?? 0,
+                            promptTime: promptTimes[uid] ?? 0,
+                            generationTime: generateTime,
+                            stopReason: response.finishReason ?? .stop
+                        )
+                        handler.yieldInfo(info)
+
+                        if let finalCache = response.finalCache,
+                            let inputToks = await self?.getInputTokens(uid: uid),
+                            !inputToks.isEmpty
+                        {
+                            let (pCache, modelName) =
+                                await self?.getPromptCacheInfo() ?? (nil, nil)
+                            if let pCache, let modelName {
+                                let fullTokenSequence =
+                                    inputToks + (generatedTokenIds[uid] ?? [])
+                                pCache.insertCache(
+                                    model: modelName,
+                                    tokens: fullTokenSequence,
+                                    promptCache: finalCache
+                                )
+                            }
+                        }
+
+                        await self?.endBatchedTicket(uid: uid)
+                        handler.finish()
+                        await self?.removeHandler(uid: uid)
+                    }
+                }
+            }
+
+            await self?.endAllBatchedTickets()
+            await self?.finishAllHandlers()
+            await self?.handleBatchFinished()
+        }
+    }
+
     // MARK: - Upgrade to Batch
 
     /// Upgrade from single to batched mode when a second request arrives.
@@ -1566,37 +1984,42 @@ public actor InferenceScheduler {
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) throws {
         let promptTokens = input.text.tokens.asArray(Int.self)
-        let maxTokens = parameters.maxTokens ?? 1000
-        let sampler = parameters.sampler()
-        let processor = parameters.processor()
-
-        let uids = batchedState.batchIterator.insert(
-            prompts: [promptTokens],
-            maxTokens: [maxTokens],
-            samplers: [sampler],
-            processors: [processor],
-            cachedKVStates: [cachedKVState]
+        let request = SchedulerRequest(
+            input: input,
+            parameters: parameters,
+            cache: nil,
+            tokenizer: tokenizer,
+            configuration: batchedState.configuration,
+            cachedKVState: cachedKVState,
+            inputTokens: promptTokens,
+            wiredMemoryTicket: wiredMemoryTicket
         )
 
-        let uid = uids[0]
+        try joinExistingBatch(
+            submissions: [
+                BatchSubmission(
+                    handler: handler,
+                    request: request
+                )
+            ],
+            batchedState: &batchedState
+        )
+    }
 
-        handler.onCancellation {
-            [weak self, weak batchIterator = batchedState.batchIterator] in
-            batchIterator?.remove(uids: [uid])
-            Task {
-                await self?.cancelBatchedRequest(uid: uid)
-            }
-        }
-
-        batchedState.handlers[uid] = handler
-        batchedState.promptTokenCounts[uid] = input.text.tokens.size
-        batchedState.submitTimes[uid] = Date()
-        batchedState.inputTokens[uid] = promptTokens
-        if let wiredMemoryTicket {
-            batchedState.wiredMemoryTickets[uid] = wiredMemoryTicket
-        }
-
-        // Update state
+    /// Add multiple new requests to the existing batch with one iterator insertion.
+    private func joinExistingBatch(
+        submissions: [BatchSubmission],
+        batchedState: inout BatchedState
+    ) throws {
+        let uids = insertBatchSubmissions(
+            submissions,
+            into: batchedState.batchIterator
+        )
+        registerBatchSubmissions(
+            submissions,
+            uids: uids,
+            in: &batchedState
+        )
         state = .batched(batchedState)
     }
 
@@ -1690,6 +2113,29 @@ public actor InferenceScheduler {
             throw error
         }
         return true
+    }
+
+    private func awaitTicketAdmissions(_ tickets: [WiredMemoryTicket]) async throws
+        -> [WiredMemoryTicket]
+    {
+        var startedTickets = [WiredMemoryTicket]()
+        do {
+            for ticket in tickets {
+                _ = await ticket.start()
+                try Task.checkCancellation()
+                startedTickets.append(ticket)
+            }
+        } catch {
+            await endTickets(startedTickets)
+            throw error
+        }
+        return startedTickets
+    }
+
+    private func endTickets(_ tickets: [WiredMemoryTicket]) async {
+        for ticket in tickets {
+            _ = await ticket.end()
+        }
     }
 
     /// End and forget the active ticket for a batched UID.
