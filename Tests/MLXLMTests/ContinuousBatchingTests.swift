@@ -180,6 +180,59 @@ final class ContinuousBatchingTests: XCTestCase {
         XCTAssertEqual(generator.promptTokensProcessed, 3)
         XCTAssertFalse(generator.hasWork)
     }
+
+    func testBatchGeneratorCancelRemovesQueuedRequest() {
+        let generator = BatchGenerator(
+            model: IncrementingLanguageModel(),
+            defaultMaxTokens: 3,
+            prefillBatchSize: 1,
+            completionBatchSize: 1
+        )
+
+        let uids = generator.insert(prompts: [[1], [8]], maxTokens: [3, 3])
+        XCTAssertTrue(generator.cancel(uid: uids[1]))
+        XCTAssertFalse(generator.cancel(uid: 999))
+
+        var seenUIDs = Set<Int>()
+        var steps = 0
+        while generator.hasWork {
+            steps += 1
+            XCTAssertLessThan(steps, 10)
+            for response in generator.next() {
+                seenUIDs.insert(response.uid)
+            }
+        }
+
+        XCTAssertEqual(seenUIDs, [uids[0]])
+    }
+
+    func testBatchGeneratorCancelRemovesActiveRequest() {
+        let generator = BatchGenerator(
+            model: IncrementingLanguageModel(),
+            defaultMaxTokens: 4,
+            prefillBatchSize: 2,
+            completionBatchSize: 2
+        )
+
+        let uids = generator.insert(prompts: [[1], [8]], maxTokens: [4, 4])
+        let firstStep = generator.next()
+        XCTAssertEqual(Set(firstStep.map(\.uid)), Set(uids))
+
+        XCTAssertTrue(generator.cancel(uid: uids[0]))
+
+        var laterUIDs = Set<Int>()
+        var steps = 0
+        while generator.hasWork {
+            steps += 1
+            XCTAssertLessThan(steps, 10)
+            for response in generator.next() {
+                laterUIDs.insert(response.uid)
+            }
+        }
+
+        XCTAssertFalse(laterUIDs.contains(uids[0]))
+        XCTAssertTrue(laterUIDs.contains(uids[1]))
+    }
 }
 
 private func makeCache(keys: [Float], values: [Float]) -> KVCacheSimple {

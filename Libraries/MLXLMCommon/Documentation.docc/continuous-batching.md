@@ -30,6 +30,9 @@ context at a time. Each call to `next()` may prefill queued prompts, run one
 decode step for active rows, and return one response per active row. A response
 with a non-`nil` `finishReason` is the final response for that UID.
 
+Call `cancel(uid:)` to remove a queued or active row. The method returns `true`
+when it found the UID and filtered that row out of the generator state.
+
 ## Custom Sampling
 
 Pass per-row `RowSampler` values to `insert(prompts:maxTokens:samplers:)` to

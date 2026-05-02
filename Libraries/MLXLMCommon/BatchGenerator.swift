@@ -128,6 +128,32 @@ public final class BatchGenerator: @unchecked Sendable {
     public var queuedCount: Int { unprocessed.count }
     public var activeCount: Int { generationBatch?.batchSize ?? 0 }
 
+    /// Remove a queued or active request from the generator.
+    @discardableResult
+    public func cancel(uid: Int) -> Bool {
+        if let queuedIndex = unprocessed.firstIndex(where: { $0.uid == uid }) {
+            unprocessed.remove(at: queuedIndex)
+            return true
+        }
+
+        if let active = generationBatch, let row = active.uids.firstIndex(of: uid) {
+            let keep = active.uids.indices.filter { $0 != row }
+            active.filter(keep: keep)
+            if active.isEmpty {
+                generationBatch = nil
+            }
+            return true
+        }
+
+        if let row = promptBatch.uids.firstIndex(of: uid) {
+            let keep = promptBatch.uids.indices.filter { $0 != row }
+            promptBatch.filter(keep: keep)
+            return true
+        }
+
+        return false
+    }
+
     public func close() {
         unprocessed.removeAll()
         generationBatch = nil
