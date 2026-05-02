@@ -1,10 +1,15 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
 final class ContinuousBatchingTests: XCTestCase {
+
+    func testGenerationBatchResponseIsSendable() {
+        func requireSendable<T: Sendable>(_: T.Type) {}
+        requireSendable(GenerationBatchResponse.self)
+    }
 
     func testBatchKVCacheMergeExtendFilterAndExtract() {
         let first = makeCache(keys: [1, 2], values: [11, 12])
@@ -145,6 +150,31 @@ final class ContinuousBatchingTests: XCTestCase {
         }
     }
 
+    func testGenerationBatchCapturesFinishedCachesBeforeFiltering() throws {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let batch = GenerationBatch(
+            model: TokenEchoingCacheLanguageModel(),
+            uids: [10, 11],
+            seedTokens: MLXArray([UInt32(2), UInt32(7)]),
+            promptCache: [cache],
+            tokens: [[], []],
+            maxTokens: [1, 3]
+        )
+
+        let result = batch.next(capturingFinalCaches: true)
+
+        XCTAssertEqual(result.responses.map(\.uid), [10, 11])
+        XCTAssertEqual(result.responses.first?.finishReason, "length")
+        XCTAssertNil(result.responses.last?.finishReason)
+        XCTAssertEqual(result.finishedCaches.count, 1)
+        XCTAssertEqual(result.finishedCaches[0].uid, 10)
+        XCTAssertEqual(result.finishedCaches[0].allTokens, [2, 3])
+        XCTAssertEqual(batch.uids, [11])
+
+        let finalLayer = try XCTUnwrap(result.finishedCaches[0].finalCache.first as? KVCacheSimple)
+        XCTAssertEqual(finalLayer.state[0].asArray(Float.self), [2, 3])
+    }
+
     func testBatchGeneratorAdmitsQueuedRowsAndReportsFinishReasons() {
         let generator = BatchGenerator(
             model: IncrementingLanguageModel(),
@@ -278,6 +308,47 @@ private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDim
         }
 
         let inputTokens = inputs.asArray(UInt32.self).map { Int($0) }
+        var logits = Array(
+            repeating: Float(-1_000),
+            count: batchSize * sequenceLength * vocabularySize
+        )
+
+        for batchIndex in 0 ..< batchSize {
+            for tokenIndex in 0 ..< sequenceLength {
+                let inputIndex = batchIndex * sequenceLength + tokenIndex
+                let nextToken = (inputTokens[inputIndex] + 1) % vocabularySize
+                let logitIndex =
+                    (batchIndex * sequenceLength + tokenIndex) * vocabularySize + nextToken
+                logits[logitIndex] = 0
+            }
+        }
+
+        return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
+    }
+}
+
+private final class TokenEchoingCacheLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let vocabularySize = 16
+    var kvHeads: [Int] { [1] }
+
+    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        let batchSize = inputs.dim(0)
+        let sequenceLength = inputs.dim(1)
+        let inputTokens = inputs.asArray(UInt32.self).map { Int($0) }
+
+        if let cache {
+            let keys = MLXArray(inputTokens.map { Float($0) })
+                .reshaped([batchSize, 1, sequenceLength, 1])
+            let values = keys + 100
+            for layerCache in cache {
+                _ = layerCache.update(keys: keys, values: values)
+            }
+        }
+
         var logits = Array(
             repeating: Float(-1_000),
             count: batchSize * sequenceLength * vocabularySize

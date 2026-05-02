@@ -14,11 +14,7 @@ public typealias RowSampler = @Sendable (MLXArray) -> MLXArray
 }
 
 /// Per-row response from a single decode step.
-///
-/// Marked `@unchecked Sendable` because `promptCache` carries non-Sendable
-/// `KVCacheSimple` references for cross-request prefix caching; cross-actor
-/// transfer is the caller's responsibility.
-public struct GenerationBatchResponse: @unchecked Sendable {
+public struct GenerationBatchResponse: Sendable {
     public let uid: Int
     public let token: Int
 
@@ -33,10 +29,14 @@ public struct GenerationBatchResponse: @unchecked Sendable {
 
     /// All produced tokens for this row. Set only on the final response.
     public let allTokens: [Int]?
+}
 
-    /// Single-row prompt cache for prefix caching across requests.
-    /// Set only on the final response.
-    public let promptCache: [any KVCache]?
+/// Internal handoff for prompt-cache write-back paths. This intentionally
+/// does not conform to `Sendable` because `finalCache` carries mutable caches.
+struct FinishedGenerationCache {
+    let uid: Int
+    let allTokens: [Int]
+    let finalCache: [any KVCache]
 }
 
 /// Decode-phase batch over a shared `[any BatchedCache]` (one per layer).
@@ -104,12 +104,22 @@ public final class GenerationBatch: @unchecked Sendable {
     /// of the active set after this call; their final responses appear with
     /// non-nil `finishReason`.
     public func next() -> [GenerationBatchResponse] {
-        if uids.isEmpty { return [] }
+        next(capturingFinalCaches: false).responses
+    }
+
+    /// Internal variant for scheduler-level prompt-cache write-back. When
+    /// enabled, finished rows are extracted before the active batch is
+    /// filtered so row indices still refer to the pre-filtered cache.
+    func next(capturingFinalCaches: Bool) -> (
+        responses: [GenerationBatchResponse], finishedCaches: [FinishedGenerationCache]
+    ) {
+        if uids.isEmpty { return ([], []) }
 
         let stepTokens = step()
 
         var keep: [Int] = []
         var responses: [GenerationBatchResponse] = []
+        var finishedCaches: [FinishedGenerationCache] = []
         responses.reserveCapacity(uids.count)
 
         for i in 0 ..< uids.count {
@@ -129,7 +139,15 @@ public final class GenerationBatch: @unchecked Sendable {
             }
 
             if finishReason != nil {
-                let extracted: [any KVCache] = promptCache.map { $0.extractBatched(i) }
+                let allTokens = tokens[i]
+                if capturingFinalCaches {
+                    finishedCaches.append(
+                        FinishedGenerationCache(
+                            uid: uids[i],
+                            allTokens: allTokens,
+                            finalCache: promptCache.map { $0.extractBatched(i) }
+                        ))
+                }
                 responses.append(
                     GenerationBatchResponse(
                         uid: uids[i],
@@ -137,8 +155,7 @@ public final class GenerationBatch: @unchecked Sendable {
                         finishReason: finishReason,
                         matchedSequence: matchedSequence,
                         currentState: currentState,
-                        allTokens: tokens[i],
-                        promptCache: extracted
+                        allTokens: allTokens
                     ))
             } else {
                 keep.append(i)
@@ -149,8 +166,7 @@ public final class GenerationBatch: @unchecked Sendable {
                         finishReason: nil,
                         matchedSequence: matchedSequence,
                         currentState: currentState,
-                        allTokens: nil,
-                        promptCache: nil
+                        allTokens: nil
                     ))
             }
         }
@@ -159,7 +175,7 @@ public final class GenerationBatch: @unchecked Sendable {
             filter(keep: keep)
         }
 
-        return responses
+        return (responses, finishedCaches)
     }
 
     /// In-place keep only the rows at the given indices.
