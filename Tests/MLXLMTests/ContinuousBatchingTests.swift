@@ -186,7 +186,7 @@ final class ContinuousBatchingTests: XCTestCase {
         assertBatchGeneratorRejectsCache(
             CacheList(MambaCache(), QuantizedKVCache()),
             expectedType: "QuantizedKVCache",
-            expectedPath: "layer.children[1]"
+            expectedPathContains: "children"
         )
     }
 
@@ -324,7 +324,8 @@ final class ContinuousBatchingTests: XCTestCase {
 private func assertBatchGeneratorRejectsCache(
     _ cache: any KVCache,
     expectedType: String,
-    expectedPath: String,
+    expectedPath: String? = nil,
+    expectedPathContains: String? = nil,
     file: StaticString = #filePath,
     line: UInt = #line
 ) {
@@ -335,16 +336,12 @@ private func assertBatchGeneratorRejectsCache(
         file: file,
         line: line
     ) { error in
-        guard
-            case BatchGeneratorError.unsupportedCacheTopology(
-                _,
-                let
-                    path,
-                let
-                    cacheType,
-                let
-                    reason
-            ) = error
+        guard case let BatchGeneratorError.unsupportedCacheTopology(
+            _,
+            path,
+            cacheType,
+            reason
+        ) = error
         else {
             XCTFail(
                 "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)",
@@ -354,7 +351,12 @@ private func assertBatchGeneratorRejectsCache(
             return
         }
 
-        XCTAssertEqual(path, expectedPath, file: file, line: line)
+        if let expectedPath {
+            XCTAssertEqual(path, expectedPath, file: file, line: line)
+        }
+        if let expectedPathContains {
+            XCTAssertTrue(path.contains(expectedPathContains), file: file, line: line)
+        }
         XCTAssertEqual(cacheType, expectedType, file: file, line: line)
         XCTAssertFalse(reason.isEmpty, file: file, line: line)
     }

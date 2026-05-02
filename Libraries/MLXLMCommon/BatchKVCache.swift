@@ -33,21 +33,15 @@ public protocol BatchedCache: KVCache {
 /// nested topology instead of treating the composite as full attention.
 public final class BatchedCacheList: CacheList, BatchedCache {
 
+    private let batchedCaches: [any BatchedCache]
+
     internal init(caches: [any BatchedCache]) {
+        self.batchedCaches = caches
         super.init(caches: caches.map { $0 as any KVCache })
     }
 
-    private var batchedChildren: [any BatchedCache] {
-        children.map { child in
-            guard let batched = child as? any BatchedCache else {
-                preconditionFailure("BatchedCacheList contains a non-batched child cache")
-            }
-            return batched
-        }
-    }
-
     public func filterBatched(batchIndices: MLXArray) {
-        for cache in batchedChildren {
+        for cache in batchedCaches {
             cache.filterBatched(batchIndices: batchIndices)
         }
     }
@@ -56,20 +50,18 @@ public final class BatchedCacheList: CacheList, BatchedCache {
         guard let other = other as? BatchedCacheList else {
             preconditionFailure("BatchedCacheList.extendBatched requires another BatchedCacheList")
         }
-        let lhs = batchedChildren
-        let rhs = other.batchedChildren
         precondition(
-            lhs.count == rhs.count,
+            batchedCaches.count == other.batchedCaches.count,
             "Cannot extend BatchedCacheList with different child count"
         )
 
-        for (a, b) in zip(lhs, rhs) {
+        for (a, b) in zip(batchedCaches, other.batchedCaches) {
             a.extendBatched(b)
         }
     }
 
     public func prepareBatched(leftPadding: [Int]?, lengths: [Int]?, rightPadding: [Int]?) {
-        for cache in batchedChildren {
+        for cache in batchedCaches {
             cache.prepareBatched(
                 leftPadding: leftPadding,
                 lengths: lengths,
@@ -79,17 +71,17 @@ public final class BatchedCacheList: CacheList, BatchedCache {
     }
 
     public func finalizeBatched() {
-        for cache in batchedChildren {
+        for cache in batchedCaches {
             cache.finalizeBatched()
         }
     }
 
     public func extractBatched(_ idx: Int) -> any KVCache {
-        CacheList(caches: batchedChildren.map { $0.extractBatched(idx) })
+        CacheList(caches: batchedCaches.map { $0.extractBatched(idx) })
     }
 
     public func advanceBatched(_ n: Int) {
-        for cache in batchedChildren {
+        for cache in batchedCaches {
             cache.advanceBatched(n)
         }
     }

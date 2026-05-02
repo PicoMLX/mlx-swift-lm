@@ -272,6 +272,8 @@ public final class BatchGenerator: @unchecked Sendable {
             }
         }
 
+        // Exact-type matches avoid misclassifying subclasses such as
+        // MambaCache : ArraysCache and ChunkedKVCache : KVCacheSimple.
         if Swift.type(of: cache) == MambaCache.self {
             return { leftPadding in MambaCache(leftPadding: leftPadding) }
         }
