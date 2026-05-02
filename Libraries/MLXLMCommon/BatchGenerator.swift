@@ -4,6 +4,18 @@
 import Foundation
 import MLX
 
+public enum BatchGeneratorError: Error, CustomStringConvertible, Equatable {
+    case unsupportedCacheTopology(layer: Int, path: String, cacheType: String, reason: String)
+
+    public var description: String {
+        switch self {
+        case .unsupportedCacheTopology(let layer, let path, let cacheType, let reason):
+            return "Unsupported cache topology at layer \(layer), \(path): "
+                + "\(cacheType). \(reason)"
+        }
+    }
+}
+
 /// Continuous-batching engine.
 ///
 ///   1. `insert(prompts:)` queues new requests and returns their UIDs.
@@ -28,6 +40,7 @@ public final class BatchGenerator: @unchecked Sendable {
     private var unprocessed: [QueuedRequest] = []
     private var promptBatch: PromptProcessingBatch
     private var generationBatch: GenerationBatch?
+    private let cacheFactories: [BatchedCacheFactory]
 
     public private(set) var promptTokensProcessed: Int = 0
     public private(set) var generatedTokens: Int = 0
@@ -38,8 +51,9 @@ public final class BatchGenerator: @unchecked Sendable {
         defaultMaxTokens: Int = 128,
         prefillStepSize: Int = 2048,
         prefillBatchSize: Int = 8,
-        completionBatchSize: Int = 32
-    ) {
+        completionBatchSize: Int = 32,
+        cacheParameters: GenerateParameters? = nil
+    ) throws {
         self.model = model
         self.prefillStepSize = prefillStepSize
         self.prefillBatchSize = prefillBatchSize
@@ -47,6 +61,9 @@ public final class BatchGenerator: @unchecked Sendable {
         self.defaultMaxTokens = defaultMaxTokens
         self.defaultEosTokens = eosTokens
         self.defaultSampler = greedySampler
+        self.cacheFactories = try Self.makeBatchedCacheFactories(
+            for: model.newCache(parameters: cacheParameters)
+        )
 
         if eosTokens.isEmpty {
             self.defaultStateMachine = SequenceStateMachine()
@@ -204,29 +221,89 @@ public final class BatchGenerator: @unchecked Sendable {
         }
     }
 
-    /// Allocate one batched cache per layer. The model's
-    /// `newCache(parameters:)` describes the per-layer cache topology
-    /// (`KVCacheSimple` / `RotatingKVCache` for full attention, `MambaCache`
-    /// or other `ArraysCache` subclasses for SSM-style layers); we build a
-    /// batched analog of each.
+    /// Allocate one batched cache per layer using the topology validated at init time.
     private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
-        let probe = model.newCache(parameters: nil)
         let zeroLeftPadding = Array(repeating: 0, count: B)
-        return probe.map { layer -> any BatchedCache in
-            if layer is MambaCache {
-                return MambaCache(leftPadding: zeroLeftPadding)
-            }
-            if let arrays = layer as? ArraysCache {
-                return ArraysCache(size: arrays.slotCount, leftPadding: zeroLeftPadding)
-            }
-            if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
-                let keep = Int(rotating.metaState.first ?? "0") ?? 0
-                precondition(keep == 0, "RotatingKVCache with keep tokens is not supported")
-                return BatchRotatingKVCache(maxSize: maxSize, leftPadding: zeroLeftPadding)
-            }
-            return BatchKVCache(leftPadding: zeroLeftPadding)
+        return cacheFactories.map { $0(zeroLeftPadding) }
+    }
+
+    private static func makeBatchedCacheFactories(
+        for probe: [any KVCache]
+    ) throws -> [BatchedCacheFactory] {
+        try probe.enumerated().map { layer, cache in
+            try makeBatchedCacheFactory(for: cache, layer: layer, path: "layer")
         }
     }
+
+    private static func makeBatchedCacheFactory(
+        for cache: any KVCache,
+        layer: Int,
+        path: String
+    ) throws -> BatchedCacheFactory {
+        let cacheType = String(describing: Swift.type(of: cache))
+
+        func unsupported(_ reason: String) -> BatchGeneratorError {
+            .unsupportedCacheTopology(
+                layer: layer,
+                path: path,
+                cacheType: cacheType,
+                reason: reason
+            )
+        }
+
+        if cache is QuantizedKVCache {
+            throw unsupported("Quantized KV caches are not supported by continuous batching.")
+        }
+
+        if cache is ChunkedKVCache {
+            throw unsupported("Chunked KV caches are not supported by continuous batching.")
+        }
+
+        if let cacheList = cache as? CacheList {
+            let childFactories = try cacheList.children.enumerated().map { childIndex, child in
+                try makeBatchedCacheFactory(
+                    for: child,
+                    layer: layer,
+                    path: "\(path).children[\(childIndex)]"
+                )
+            }
+            return { leftPadding in
+                BatchedCacheList(caches: childFactories.map { $0(leftPadding) })
+            }
+        }
+
+        if Swift.type(of: cache) == MambaCache.self {
+            return { leftPadding in MambaCache(leftPadding: leftPadding) }
+        }
+
+        if Swift.type(of: cache) == ArraysCache.self, let arrays = cache as? ArraysCache {
+            let slotCount = arrays.slotCount
+            return { leftPadding in ArraysCache(size: slotCount, leftPadding: leftPadding) }
+        }
+
+        if let rotating = cache as? RotatingKVCache {
+            guard let maxSize = rotating.maxSize else {
+                throw unsupported("RotatingKVCache must have a non-nil maxSize.")
+            }
+
+            let keep = Int(rotating.metaState.first ?? "0") ?? 0
+            guard keep == 0 else {
+                throw unsupported("RotatingKVCache with keep tokens is not supported.")
+            }
+
+            return { leftPadding in
+                BatchRotatingKVCache(maxSize: maxSize, leftPadding: leftPadding)
+            }
+        }
+
+        if Swift.type(of: cache) == KVCacheSimple.self {
+            return { leftPadding in BatchKVCache(leftPadding: leftPadding) }
+        }
+
+        throw unsupported("No batched cache implementation exists for this cache type.")
+    }
+
+    private typealias BatchedCacheFactory = (_ leftPadding: [Int]) -> any BatchedCache
 
     private struct QueuedRequest: Sendable {
         let uid: Int

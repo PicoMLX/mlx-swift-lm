@@ -28,6 +28,73 @@ public protocol BatchedCache: KVCache {
     func advanceBatched(_ n: Int)
 }
 
+/// Batched wrapper for composite per-layer caches. Some hybrid models keep
+/// multiple cache objects per logical layer, so batching has to preserve that
+/// nested topology instead of treating the composite as full attention.
+public final class BatchedCacheList: CacheList, BatchedCache {
+
+    internal init(caches: [any BatchedCache]) {
+        super.init(caches: caches.map { $0 as any KVCache })
+    }
+
+    private var batchedChildren: [any BatchedCache] {
+        children.map { child in
+            guard let batched = child as? any BatchedCache else {
+                preconditionFailure("BatchedCacheList contains a non-batched child cache")
+            }
+            return batched
+        }
+    }
+
+    public func filterBatched(batchIndices: MLXArray) {
+        for cache in batchedChildren {
+            cache.filterBatched(batchIndices: batchIndices)
+        }
+    }
+
+    public func extendBatched(_ other: any BatchedCache) {
+        guard let other = other as? BatchedCacheList else {
+            preconditionFailure("BatchedCacheList.extendBatched requires another BatchedCacheList")
+        }
+        let lhs = batchedChildren
+        let rhs = other.batchedChildren
+        precondition(
+            lhs.count == rhs.count,
+            "Cannot extend BatchedCacheList with different child count"
+        )
+
+        for (a, b) in zip(lhs, rhs) {
+            a.extendBatched(b)
+        }
+    }
+
+    public func prepareBatched(leftPadding: [Int]?, lengths: [Int]?, rightPadding: [Int]?) {
+        for cache in batchedChildren {
+            cache.prepareBatched(
+                leftPadding: leftPadding,
+                lengths: lengths,
+                rightPadding: rightPadding
+            )
+        }
+    }
+
+    public func finalizeBatched() {
+        for cache in batchedChildren {
+            cache.finalizeBatched()
+        }
+    }
+
+    public func extractBatched(_ idx: Int) -> any KVCache {
+        CacheList(caches: batchedChildren.map { $0.extractBatched(idx) })
+    }
+
+    public func advanceBatched(_ n: Int) {
+        for cache in batchedChildren {
+            cache.advanceBatched(n)
+        }
+    }
+}
+
 /// Continuous-batching KV cache.
 ///
 /// Storage is right-justified along axis=2: for each row `b`, real keys

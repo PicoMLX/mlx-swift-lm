@@ -8,7 +8,7 @@ Use it when you need explicit control over request admission and per-row
 streaming responses:
 
 ```swift
-let generator = BatchGenerator(
+let generator = try BatchGenerator(
     model: model,
     eosTokens: [[eosToken]],
     defaultMaxTokens: 128,
@@ -50,6 +50,9 @@ request.
 ## Cache Model
 
 Continuous batching uses `BatchKVCache` for attention layers and `ArraysCache`
-or `MambaCache` for array-backed state-space layers. `BatchKVCache` keeps rows
-right-aligned so requests with different prompt lengths can share one cache and
-attention mask while still preserving per-row positions for RoPE.
+or `MambaCache` for array-backed state-space layers. Composite `CacheList`
+layers are preserved when every child cache has a supported batched analog.
+Unsupported cache topologies fail during `BatchGenerator` initialization.
+`BatchKVCache` keeps rows right-aligned so requests with different prompt
+lengths can share one cache and attention mask while still preserving per-row
+positions for RoPE.
