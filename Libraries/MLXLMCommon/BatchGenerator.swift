@@ -12,7 +12,12 @@ import MLX
 ///      are filtered out and their slots become available for new
 ///      admissions on the next call.
 ///   3. `close()` releases resources.
-public final class BatchGenerator: @unchecked Sendable {
+///
+/// `BatchGenerator` is stateful and intentionally not `Sendable`. Drive each
+/// instance from one execution context at a time. For concurrent request
+/// admission, cancellation, or streaming, wrap the generator in an actor or
+/// scheduler that serializes access to `insert`, `cancel`, `next`, and `close`.
+public final class BatchGenerator {
 
     public let model: any LanguageModel
     public let prefillStepSize: Int

@@ -10,7 +10,11 @@ import MLX
 /// chunked prefill through the model, then rolls each row into right-aligned
 /// position via per-cache finalization. Transition into a `GenerationBatch`
 /// via `generate(lastTokensOf:)`.
-public final class PromptProcessingBatch: @unchecked Sendable {
+///
+/// This is mutable engine state owned by `BatchGenerator` and is intentionally
+/// not `Sendable`. Do not share a prompt-processing batch across concurrent
+/// tasks.
+public final class PromptProcessingBatch {
 
     public let model: any LanguageModel
     public private(set) var uids: [Int]

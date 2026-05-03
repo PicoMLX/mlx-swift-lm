@@ -44,7 +44,11 @@ struct FinishedGenerationCache {
 /// `BatchKVCache` for full attention, `ArraysCache`/`MambaCache` for SSM.
 /// Construct after prefill has populated the caches; call `next()` to
 /// drive generation one step at a time.
-public final class GenerationBatch: @unchecked Sendable {
+///
+/// This is mutable decode engine state owned by `BatchGenerator` and is
+/// intentionally not `Sendable`. `GenerationBatchResponse` is the Sendable
+/// value type for crossing concurrency domains.
+public final class GenerationBatch {
 
     public let model: any LanguageModel
     public private(set) var uids: [Int]
