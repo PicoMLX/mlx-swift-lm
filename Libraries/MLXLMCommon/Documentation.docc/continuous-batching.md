@@ -45,9 +45,10 @@ try await generator.drain(wiredMemoryTicket: ticket) { response in
 The ticket stays active until the generator has no queued or active rows, or
 until the response handler throws or the task is cancelled. In those cases, the
 error propagates, the ticket is released, and the generator keeps any remaining
-state. Do not call `insert`, `cancel`, `next`, or `close` concurrently with
-`drain`; serialize server-side admission and driving through one owner, such as
-an actor.
+state. Responses delivered before the throw or cancellation are not replayed or
+rolled back. Do not call `insert`, `cancel`, `next`, or `close` concurrently
+with `drain`; serialize server-side admission and driving through one owner,
+such as an actor.
 
 For long-running services that keep inserting work, wrap shorter driver windows
 directly in `ticket.withWiredLimit` so one never-ending drain does not block
