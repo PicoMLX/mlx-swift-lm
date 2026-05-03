@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -142,6 +142,77 @@ final class ContinuousBatchingTests: XCTestCase {
 
         for _ in 0 ..< 5 {
             XCTAssertEqual(sampler(logprobs).item(Int.self), 1)
+        }
+    }
+
+    func testDrainResponsesHelperScopesWrapperAroundFullLoop() async throws {
+        var batches = [
+            [makeResponse(uid: 1, token: 10)],
+            [
+                makeResponse(uid: 2, token: 20),
+                makeResponse(uid: 3, token: 30),
+            ],
+        ]
+        var events: [String] = []
+
+        try await BatchGenerator.drainResponses(
+            hasWork: { !batches.isEmpty },
+            next: {
+                events.append("next")
+                return batches.removeFirst()
+            },
+            withScope: { body in
+                events.append("enter")
+                defer { events.append("exit") }
+                try await body()
+            },
+            onResponse: { response in
+                events.append("response:\(response.uid)")
+            }
+        )
+
+        XCTAssertEqual(
+            events,
+            [
+                "enter",
+                "next",
+                "response:1",
+                "next",
+                "response:2",
+                "response:3",
+                "exit",
+            ]
+        )
+    }
+
+    func testDrainResponsesHelperChecksCancellationBeforeNextStep() async {
+        var cancellationChecks = 0
+        var didCallNext = false
+
+        do {
+            try await BatchGenerator.drainResponses(
+                hasWork: { true },
+                next: {
+                    didCallNext = true
+                    return []
+                },
+                withScope: { body in
+                    try await body()
+                },
+                checkCancellation: {
+                    cancellationChecks += 1
+                    throw CancellationError()
+                },
+                onResponse: { _ in
+                    XCTFail("Cancellation should stop before response handling.")
+                }
+            )
+            XCTFail("Expected cancellation to stop the drain loop.")
+        } catch is CancellationError {
+            XCTAssertEqual(cancellationChecks, 1)
+            XCTAssertFalse(didCallNext)
+        } catch {
+            XCTFail("Expected CancellationError, got \(error).")
         }
     }
 
@@ -360,6 +431,18 @@ private func assertBatchGeneratorRejectsCache(
         XCTAssertEqual(cacheType, expectedType, file: file, line: line)
         XCTAssertFalse(reason.isEmpty, file: file, line: line)
     }
+}
+
+private func makeResponse(uid: Int, token: Int) -> GenerationBatchResponse {
+    GenerationBatchResponse(
+        uid: uid,
+        token: token,
+        finishReason: nil,
+        matchedSequence: nil,
+        currentState: nil,
+        allTokens: nil,
+        promptCache: nil
+    )
 }
 
 private func makeCache(keys: [Float], values: [Float]) -> KVCacheSimple {
