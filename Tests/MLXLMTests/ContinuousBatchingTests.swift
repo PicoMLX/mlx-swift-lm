@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 final class ContinuousBatchingTests: XCTestCase {
 
@@ -407,12 +408,16 @@ private func assertBatchGeneratorRejectsCache(
         file: file,
         line: line
     ) { error in
-        guard case let BatchGeneratorError.unsupportedCacheTopology(
-            _,
-            path,
-            cacheType,
-            reason
-        ) = error
+        guard
+            case BatchGeneratorError.unsupportedCacheTopology(
+                _,
+                let
+                    path,
+                let
+                    cacheType,
+                let
+                    reason
+            ) = error
         else {
             XCTFail(
                 "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)",
