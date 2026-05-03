@@ -150,12 +150,17 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             "PromptProcessingBatch.generate: token list length \(inputTokens.count) "
                 + "does not match batch size \(uids.count)"
         )
+        precondition(
+            !inputTokens.contains(where: { $0.isEmpty }),
+            "PromptProcessingBatch.generate requires non-empty token rows; "
+                + "BatchGenerator.insert validates this public invariant"
+        )
         if inputTokens.contains(where: { $0.count > 1 }) {
             let prefixes = inputTokens.map { Array($0.dropLast()) }
             prompt(prefixes)
         }
 
-        let lastTokens = inputTokens.map { UInt32($0.last ?? 0) }
+        let lastTokens = inputTokens.map { UInt32($0.last!) }
         let seed = MLXArray(lastTokens)
 
         let gen = GenerationBatch(

@@ -6,12 +6,24 @@ import MLX
 
 public enum BatchGeneratorError: Error, CustomStringConvertible, Equatable {
     case unsupportedCacheTopology(layer: Int, path: String, cacheType: String, reason: String)
+    case invalidConfiguration(field: String, value: Int)
+    case emptyPrompt(rowIndex: Int)
+    case requestArrayLengthMismatch(field: String, expected: Int, got: Int)
+    case nonPositiveMaxTokens(rowIndex: Int, value: Int)
 
     public var description: String {
         switch self {
         case .unsupportedCacheTopology(let layer, let path, let cacheType, let reason):
             return "Unsupported cache topology at layer \(layer), \(path): "
                 + "\(cacheType). \(reason)"
+        case .invalidConfiguration(let field, let value):
+            return "\(field) must be greater than zero; got \(value)"
+        case .emptyPrompt(let rowIndex):
+            return "prompts[\(rowIndex)] must not be empty"
+        case .requestArrayLengthMismatch(let field, let expected, let got):
+            return "\(field).count must equal prompts.count; expected \(expected), got \(got)"
+        case .nonPositiveMaxTokens(let rowIndex, let value):
+            return "maxTokens[\(rowIndex)] must be greater than zero; got \(value)"
         }
     }
 }
@@ -54,6 +66,13 @@ public final class BatchGenerator: @unchecked Sendable {
         completionBatchSize: Int = 32,
         cacheParameters: GenerateParameters? = nil
     ) throws {
+        try Self.validateConfiguration(
+            defaultMaxTokens: defaultMaxTokens,
+            prefillStepSize: prefillStepSize,
+            prefillBatchSize: prefillBatchSize,
+            completionBatchSize: completionBatchSize
+        )
+
         self.model = model
         self.prefillStepSize = prefillStepSize
         self.prefillBatchSize = prefillBatchSize
@@ -80,16 +99,21 @@ public final class BatchGenerator: @unchecked Sendable {
     }
 
     /// Append a batch of prompts. Returns the assigned UIDs in input order.
+    ///
+    /// Throws `BatchGeneratorError` for empty prompt rows, mismatched per-row
+    /// option counts, or nonpositive max-token limits.
     @discardableResult
     public func insert(
         prompts: [[Int]],
         maxTokens: [Int]? = nil,
         samplers: [RowSampler?]? = nil,
         stateMachines: [SequenceStateMachine]? = nil
-    ) -> [Int] {
-        precondition(
-            maxTokens == nil || maxTokens?.count == prompts.count,
-            "maxTokens.count must equal prompts.count"
+    ) throws -> [Int] {
+        try Self.validateRequest(
+            prompts: prompts,
+            maxTokens: maxTokens,
+            samplers: samplers,
+            stateMachines: stateMachines
         )
 
         var assignedUids: [Int] = []
@@ -109,6 +133,60 @@ public final class BatchGenerator: @unchecked Sendable {
                 ))
         }
         return assignedUids
+    }
+
+    private static func validateConfiguration(
+        defaultMaxTokens: Int,
+        prefillStepSize: Int,
+        prefillBatchSize: Int,
+        completionBatchSize: Int
+    ) throws {
+        for (field, value) in [
+            ("defaultMaxTokens", defaultMaxTokens),
+            ("prefillStepSize", prefillStepSize),
+            ("prefillBatchSize", prefillBatchSize),
+            ("completionBatchSize", completionBatchSize),
+        ] where value <= 0 {
+            throw BatchGeneratorError.invalidConfiguration(field: field, value: value)
+        }
+    }
+
+    private static func validateRequest(
+        prompts: [[Int]],
+        maxTokens: [Int]?,
+        samplers: [RowSampler?]?,
+        stateMachines: [SequenceStateMachine]?
+    ) throws {
+        if let rowIndex = prompts.firstIndex(where: { $0.isEmpty }) {
+            throw BatchGeneratorError.emptyPrompt(rowIndex: rowIndex)
+        }
+
+        try validateRequestArrayLength("maxTokens", maxTokens?.count, prompts.count)
+        try validateRequestArrayLength("samplers", samplers?.count, prompts.count)
+        try validateRequestArrayLength("stateMachines", stateMachines?.count, prompts.count)
+
+        if let maxTokens {
+            for (rowIndex, value) in maxTokens.enumerated() where value <= 0 {
+                throw BatchGeneratorError.nonPositiveMaxTokens(
+                    rowIndex: rowIndex,
+                    value: value
+                )
+            }
+        }
+    }
+
+    private static func validateRequestArrayLength(
+        _ field: String,
+        _ count: Int?,
+        _ expected: Int
+    ) throws {
+        if let count, count != expected {
+            throw BatchGeneratorError.requestArrayLengthMismatch(
+                field: field,
+                expected: expected,
+                got: count
+            )
+        }
     }
 
     /// Run one engine step. Returns per-uid responses for the active rows;

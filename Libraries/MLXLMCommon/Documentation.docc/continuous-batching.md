@@ -16,7 +16,7 @@ let generator = try BatchGenerator(
     completionBatchSize: 32
 )
 
-let ids = generator.insert(prompts: [[1, 2, 3], [4, 5]])
+let ids = try generator.insert(prompts: [[1, 2, 3], [4, 5]])
 
 while generator.hasWork {
     for response in generator.next() {
@@ -29,6 +29,9 @@ The engine is intentionally stateful and should be driven from one execution
 context at a time. Each call to `next()` may prefill queued prompts, run one
 decode step for active rows, and return one response per active row. A response
 with a non-`nil` `finishReason` is the final response for that UID.
+
+Prompt rows must be non-empty. If a model expects generation from BOS, pass
+the model's BOS token explicitly.
 
 Call `cancel(uid:)` to remove a queued or active row. The method returns `true`
 when it found the UID and filtered that row out of the generator state.

@@ -208,16 +208,12 @@ final class ContinuousBatchingTests: XCTestCase {
                 cacheParameters: GenerateParameters(maxKVSize: 17)
             )
         ) { error in
-            guard
-                case BatchGeneratorError.unsupportedCacheTopology(
-                    _,
-                    let
-                        path,
-                    let
-                        cacheType,
-                    let
-                        reason
-                ) = error
+            guard case let BatchGeneratorError.unsupportedCacheTopology(
+                _,
+                path,
+                cacheType,
+                reason
+            ) = error
             else {
                 XCTFail(
                     "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)"
@@ -231,6 +227,53 @@ final class ContinuousBatchingTests: XCTestCase {
         }
     }
 
+    func testBatchGeneratorRejectsInvalidConfiguration() {
+        assertBatchGeneratorRejectsConfiguration(
+            defaultMaxTokens: 0,
+            expected: .invalidConfiguration(field: "defaultMaxTokens", value: 0)
+        )
+        assertBatchGeneratorRejectsConfiguration(
+            prefillStepSize: 0,
+            expected: .invalidConfiguration(field: "prefillStepSize", value: 0)
+        )
+        assertBatchGeneratorRejectsConfiguration(
+            prefillBatchSize: 0,
+            expected: .invalidConfiguration(field: "prefillBatchSize", value: 0)
+        )
+        assertBatchGeneratorRejectsConfiguration(
+            completionBatchSize: 0,
+            expected: .invalidConfiguration(field: "completionBatchSize", value: 0)
+        )
+    }
+
+    func testBatchGeneratorRejectsInvalidInsertRequestsBeforeMutation() throws {
+        let generator = try BatchGenerator(model: IncrementingLanguageModel())
+
+        assertBatchGeneratorThrows(
+            try generator.insert(prompts: [[1], []]),
+            expected: .emptyPrompt(rowIndex: 1)
+        )
+        assertBatchGeneratorThrows(
+            try generator.insert(prompts: [[1], [2]], maxTokens: [1]),
+            expected: .requestArrayLengthMismatch(field: "maxTokens", expected: 2, got: 1)
+        )
+        assertBatchGeneratorThrows(
+            try generator.insert(prompts: [[1], [2]], samplers: [nil]),
+            expected: .requestArrayLengthMismatch(field: "samplers", expected: 2, got: 1)
+        )
+        assertBatchGeneratorThrows(
+            try generator.insert(prompts: [[1], [2]], stateMachines: [SequenceStateMachine()]),
+            expected: .requestArrayLengthMismatch(field: "stateMachines", expected: 2, got: 1)
+        )
+        assertBatchGeneratorThrows(
+            try generator.insert(prompts: [[1], [2]], maxTokens: [1, 0]),
+            expected: .nonPositiveMaxTokens(rowIndex: 1, value: 0)
+        )
+
+        XCTAssertEqual(generator.queuedCount, 0)
+        XCTAssertEqual(try generator.insert(prompts: [[9]], maxTokens: [1]), [0])
+    }
+
     func testBatchGeneratorAdmitsQueuedRowsAndReportsFinishReasons() throws {
         let generator = try BatchGenerator(
             model: IncrementingLanguageModel(),
@@ -240,7 +283,7 @@ final class ContinuousBatchingTests: XCTestCase {
             completionBatchSize: 2
         )
 
-        let uids = generator.insert(prompts: [[1, 2], [8]], maxTokens: [4, 2])
+        let uids = try generator.insert(prompts: [[1, 2], [8]], maxTokens: [4, 2])
         XCTAssertEqual(uids, [0, 1])
 
         var tokensByUID: [Int: [Int]] = [:]
@@ -275,7 +318,7 @@ final class ContinuousBatchingTests: XCTestCase {
             completionBatchSize: 1
         )
 
-        let uids = generator.insert(prompts: [[1], [8]], maxTokens: [3, 3])
+        let uids = try generator.insert(prompts: [[1], [8]], maxTokens: [3, 3])
         XCTAssertTrue(generator.cancel(uid: uids[1]))
         XCTAssertFalse(generator.cancel(uid: 999))
 
@@ -300,7 +343,7 @@ final class ContinuousBatchingTests: XCTestCase {
             completionBatchSize: 2
         )
 
-        let uids = generator.insert(prompts: [[1], [8]], maxTokens: [4, 4])
+        let uids = try generator.insert(prompts: [[1], [8]], maxTokens: [4, 4])
         let firstStep = generator.next()
         XCTAssertEqual(Set(firstStep.map(\.uid)), Set(uids))
 
@@ -318,6 +361,48 @@ final class ContinuousBatchingTests: XCTestCase {
 
         XCTAssertFalse(laterUIDs.contains(uids[0]))
         XCTAssertTrue(laterUIDs.contains(uids[1]))
+    }
+}
+
+private func assertBatchGeneratorRejectsConfiguration(
+    defaultMaxTokens: Int = 128,
+    prefillStepSize: Int = 2048,
+    prefillBatchSize: Int = 8,
+    completionBatchSize: Int = 32,
+    expected: BatchGeneratorError,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    assertBatchGeneratorThrows(
+        try BatchGenerator(
+            model: IncrementingLanguageModel(),
+            defaultMaxTokens: defaultMaxTokens,
+            prefillStepSize: prefillStepSize,
+            prefillBatchSize: prefillBatchSize,
+            completionBatchSize: completionBatchSize
+        ),
+        expected: expected,
+        file: file,
+        line: line
+    )
+}
+
+private func assertBatchGeneratorThrows<T>(
+    _ expression: @autoclosure () throws -> T,
+    expected: BatchGeneratorError,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    XCTAssertThrowsError(
+        try expression(),
+        file: file,
+        line: line
+    ) { error in
+        guard let error = error as? BatchGeneratorError else {
+            XCTFail("Expected BatchGeneratorError, got \(error)", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(error, expected, file: file, line: line)
     }
 }
 
