@@ -136,6 +136,67 @@ public final class BatchGenerator: @unchecked Sendable {
         return next()
     }
 
+    /// Drain all currently queued and active work.
+    ///
+    /// If `wiredMemoryTicket` is provided, the ticket is held for the full
+    /// drain loop rather than started and ended for each `next()` step. This
+    /// is best suited to bounded batches. Long-running servers that keep
+    /// inserting work should scope wired-memory tickets around bounded driver
+    /// windows instead.
+    ///
+    /// `BatchGenerator` remains a single-driver type while draining: do not
+    /// call `insert`, `cancel`, `next`, or `close` concurrently with this
+    /// method. Serialize server-side admission and driving through one owner,
+    /// such as an actor.
+    ///
+    /// If `onResponse` throws, or if the surrounding task is cancelled, the
+    /// error propagates and the generator is left partially drained at the
+    /// point where draining stopped.
+    public func drain(
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        onResponse: @escaping (GenerationBatchResponse) async throws -> Void
+    ) async throws {
+        if let wiredMemoryTicket {
+            try await Self.drainResponses(
+                hasWork: { self.hasWork },
+                next: { self.next() },
+                withScope: { body in
+                    try await wiredMemoryTicket.withWiredLimit(body)
+                },
+                onResponse: onResponse
+            )
+        } else {
+            try await Self.drainResponses(
+                hasWork: { self.hasWork },
+                next: { self.next() },
+                withScope: { body in
+                    try await body()
+                },
+                onResponse: onResponse
+            )
+        }
+    }
+
+    internal static func drainResponses(
+        hasWork: @escaping () -> Bool,
+        next: @escaping () -> [GenerationBatchResponse],
+        withScope: (@escaping () async throws -> Void) async throws -> Void,
+        checkCancellation: @escaping () throws -> Void = {
+            try Task.checkCancellation()
+        },
+        onResponse: @escaping (GenerationBatchResponse) async throws -> Void
+    ) async throws {
+        try await withScope {
+            while hasWork() {
+                try checkCancellation()
+                for response in next() {
+                    try checkCancellation()
+                    try await onResponse(response)
+                }
+            }
+        }
+    }
+
     public var hasWork: Bool {
         !unprocessed.isEmpty
             || (generationBatch?.isEmpty == false)
