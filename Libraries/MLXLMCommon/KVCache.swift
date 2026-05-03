@@ -1177,6 +1177,9 @@ public class ArraysCache: BaseKVCache {
     open func extract(_ idx: Int) -> ArraysCache {
         let extracted = ArraysCache(size: cache.count)
         extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        extracted.offset = offset
+        extracted.leftPadding = leftPadding.map { $0[idx ..< (idx + 1)] }
+        extracted.lengths = lengths.map { $0[idx ..< (idx + 1)] }
         return extracted
     }
 
@@ -1297,9 +1300,12 @@ public class MambaCache: ArraysCache {
         return new
     }
 
-    public override func extract(_ idx: Int) -> ArraysCache {
+    public override func extract(_ idx: Int) -> MambaCache {
         let extracted = MambaCache()
         extracted.state = state.map { $0[idx ..< (idx + 1)] }
+        extracted.offset = offset
+        extracted.leftPadding = leftPadding.map { $0[idx ..< (idx + 1)] }
+        extracted.lengths = lengths.map { $0[idx ..< (idx + 1)] }
         return extracted
     }
 }

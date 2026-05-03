@@ -38,7 +38,6 @@ public final class BatchGenerator: @unchecked Sendable {
 
     private var uidCounter: Int = 0
     private var unprocessed: [QueuedRequest] = []
-    private var promptBatch: PromptProcessingBatch
     private var generationBatch: GenerationBatch?
     private let cacheFactories: [BatchedCacheFactory]
 
@@ -73,10 +72,6 @@ public final class BatchGenerator: @unchecked Sendable {
                 initial: "normal"
             )
         }
-        self.promptBatch = PromptProcessingBatch.empty(
-            model: model,
-            prefillStepSize: prefillStepSize
-        )
     }
 
     /// Append a batch of prompts. Returns the assigned UIDs in input order.
@@ -139,7 +134,6 @@ public final class BatchGenerator: @unchecked Sendable {
     public var hasWork: Bool {
         !unprocessed.isEmpty
             || (generationBatch?.isEmpty == false)
-            || !promptBatch.isEmpty
     }
 
     public var queuedCount: Int { unprocessed.count }
@@ -162,22 +156,12 @@ public final class BatchGenerator: @unchecked Sendable {
             return true
         }
 
-        if let row = promptBatch.uids.firstIndex(of: uid) {
-            let keep = promptBatch.uids.indices.filter { $0 != row }
-            promptBatch.filter(keep: keep)
-            return true
-        }
-
         return false
     }
 
     public func close() {
         unprocessed.removeAll()
         generationBatch = nil
-        promptBatch = PromptProcessingBatch.empty(
-            model: model,
-            prefillStepSize: prefillStepSize
-        )
     }
 
     /// Admit up to `min(prefillBatchSize, free completion slots)` queued

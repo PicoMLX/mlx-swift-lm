@@ -580,6 +580,16 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         set { _idx = newValue }
     }
 
+    private func trimLeftPadding(by trimSize: Int) {
+        guard trimSize > 0 else { return }
+
+        // Trimming stored window context should not turn admission padding negative.
+        leftPadding = MLX.maximum(
+            leftPadding - Int32(trimSize),
+            MLXArray.zeros(leftPadding.shape, dtype: leftPadding.dtype)
+        )
+    }
+
     public func filterBatched(batchIndices: MLXArray) {
         filter(batchIndices: batchIndices)
     }
@@ -623,7 +633,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
                 if trimSize > 0 {
                     self.keys = self.keys![.ellipsis, trimSize..., 0...]
                     self.values = self.values![.ellipsis, trimSize..., 0...]
-                    leftPadding = leftPadding - Int32(trimSize)
+                    trimLeftPadding(by: trimSize)
                     _idx -= trimSize
                 }
             }
@@ -639,7 +649,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             let trimSize = _idx - maxCacheSize
             self.keys = self.keys![.ellipsis, trimSize..., 0...]
             self.values = self.values![.ellipsis, trimSize..., 0...]
-            leftPadding = leftPadding - Int32(trimSize)
+            trimLeftPadding(by: trimSize)
             _idx = maxCacheSize
         }
 

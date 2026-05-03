@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -41,6 +41,7 @@ final class ContinuousBatchingTests: XCTestCase {
         )
 
         XCTAssertEqual(cache.size(), 3)
+        XCTAssertGreaterThanOrEqual(cache.leftPadding.asArray(Int32.self).min()!, 0)
         XCTAssertEqual(cache.state[0].asArray(Float.self), [3, 4, 9, 7, 8, 10])
 
         let extracted = cache.extract(0)
@@ -69,6 +70,36 @@ final class ContinuousBatchingTests: XCTestCase {
                 false, false, true,
                 false, true, true,
             ])
+    }
+
+    func testArraysCacheExtractPreservesBatchMetadata() {
+        let cache = ArraysCache(size: 1, leftPadding: [0, 2])
+        cache.offset = 7
+        cache.prepare(lengths: [3, 5])
+        cache[0] = MLXArray([1, 2] as [Float]).reshaped([2, 1])
+
+        let extracted = cache.extract(1)
+
+        XCTAssertEqual(extracted.offset, 7)
+        XCTAssertEqual(extracted.state[0].asArray(Float.self), [2])
+        XCTAssertEqual(extracted.leftPadding?.asArray(Int.self), [2])
+        XCTAssertEqual(extracted.lengths?.asArray(Int.self), [5])
+    }
+
+    func testMambaCacheExtractPreservesBatchMetadata() {
+        let cache = MambaCache(leftPadding: [0, 3])
+        cache.offset = 11
+        cache.prepare(lengths: [4, 6])
+        cache[0] = MLXArray([1, 2] as [Float]).reshaped([2, 1])
+        cache[1] = MLXArray([3, 4] as [Float]).reshaped([2, 1])
+
+        let extracted = cache.extract(1)
+
+        XCTAssertEqual(extracted.offset, 11)
+        XCTAssertEqual(extracted.state[0].asArray(Float.self), [2])
+        XCTAssertEqual(extracted.state[1].asArray(Float.self), [4])
+        XCTAssertEqual(extracted.leftPadding?.asArray(Int.self), [3])
+        XCTAssertEqual(extracted.lengths?.asArray(Int.self), [6])
     }
 
     func testArraysCacheAdvancesLengthsForChunkedPrefill() {
@@ -318,6 +349,8 @@ final class ContinuousBatchingTests: XCTestCase {
 
         XCTAssertFalse(laterUIDs.contains(uids[0]))
         XCTAssertTrue(laterUIDs.contains(uids[1]))
+        XCTAssertFalse(generator.hasWork)
+        XCTAssertTrue(generator.next().isEmpty)
     }
 }
 
