@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 final class ContinuousBatchingTests: XCTestCase {
 
@@ -90,6 +91,7 @@ final class ContinuousBatchingTests: XCTestCase {
                 true, false, false,
                 true, true, true,
             ])
+        // leftPadding should remain fixed while lengths tracks chunk progress.
         XCTAssertEqual(cache.metaState.last, "0,3")
     }
 
@@ -137,6 +139,7 @@ final class ContinuousBatchingTests: XCTestCase {
                 true, false, false,
                 true, true, true,
             ])
+        // leftPadding should remain fixed while lengths tracks chunk progress.
         XCTAssertEqual(mamba.metaState.last, "0,3")
 
         composite.finalizeBatched()
@@ -387,12 +390,16 @@ private func assertBatchGeneratorRejectsCache(
         file: file,
         line: line
     ) { error in
-        guard case let BatchGeneratorError.unsupportedCacheTopology(
-            _,
-            path,
-            cacheType,
-            reason
-        ) = error
+        guard
+            case BatchGeneratorError.unsupportedCacheTopology(
+                _,
+                let
+                    path,
+                let
+                    cacheType,
+                let
+                    reason
+            ) = error
         else {
             XCTFail(
                 "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)",

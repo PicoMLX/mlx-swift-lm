@@ -1190,6 +1190,8 @@ public class ArraysCache: BaseKVCache {
     }
 
     public func advance(_ n: Int) {
+        // During prefill, advance only chunk-local lengths; leftPadding is fixed
+        // admission metadata.
         if lengths != nil {
             lengths = lengths.map { $0 - Int32(n) }
         } else {
