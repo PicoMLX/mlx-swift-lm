@@ -151,7 +151,8 @@ public final class BatchGenerator: @unchecked Sendable {
     ///
     /// If `onResponse` throws, or if the surrounding task is cancelled, the
     /// error propagates and the generator is left partially drained at the
-    /// point where draining stopped.
+    /// point where draining stopped. Responses delivered before the throw or
+    /// cancellation are not replayed or rolled back.
     public func drain(
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         onResponse: @escaping (GenerationBatchResponse) async throws -> Void
