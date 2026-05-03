@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -72,7 +72,7 @@ final class ContinuousBatchingTests: XCTestCase {
     }
 
     func testArraysCacheAdvancesLengthsForChunkedPrefill() {
-        let cache = ArraysCache(size: 1)
+        let cache = ArraysCache(size: 1, leftPadding: [0, 3])
         cache.prepare(lengths: [3, 5])
 
         XCTAssertEqual(
@@ -90,6 +90,57 @@ final class ContinuousBatchingTests: XCTestCase {
                 true, false, false,
                 true, true, true,
             ])
+        XCTAssertEqual(cache.metaState.last, "0,3")
+    }
+
+    func testArraysCacheMasksRightPaddingBeforeLeftPaddingDuringPrefill() {
+        let cache = ArraysCache(size: 1, leftPadding: [0, 3])
+        cache.prepare(lengths: [3, 5])
+
+        XCTAssertEqual(
+            cache.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+
+        let mamba = MambaCache(leftPadding: [0, 3])
+        mamba.prepare(lengths: [3, 5])
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+    }
+
+    func testBatchedCacheListForwardsSSMPrefillMetadata() {
+        let mamba = MambaCache(leftPadding: [0, 3])
+        let attention = BatchKVCache(leftPadding: [0, 0])
+        let composite = BatchedCacheList(caches: [mamba, attention])
+
+        composite.prepareBatched(leftPadding: nil, lengths: [3, 5], rightPadding: [2, 0])
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+
+        composite.advanceBatched(2)
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 3)?.asArray(Bool.self),
+            [
+                true, false, false,
+                true, true, true,
+            ])
+        XCTAssertEqual(mamba.metaState.last, "0,3")
+
+        composite.finalizeBatched()
+        XCTAssertNil(mamba.makeMask(N: 3))
     }
 
     func testSequenceStateMachineMatchesMultiTokenStopsAndTransitions() {

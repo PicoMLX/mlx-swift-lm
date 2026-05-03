@@ -1190,16 +1190,21 @@ public class ArraysCache: BaseKVCache {
     }
 
     public func advance(_ n: Int) {
-        lengths = lengths.map { $0 - Int32(n) }
-        leftPadding = leftPadding.map { $0 - Int32(n) }
+        if lengths != nil {
+            lengths = lengths.map { $0 - Int32(n) }
+        } else {
+            leftPadding = leftPadding.map { $0 - Int32(n) }
+        }
     }
 
-    /// Create attention mask based on left padding
+    /// Create the chunk-local SSM mask.
     public func makeMask(N: Int) -> MLXArray? {
-        if let leftPadding {
-            return MLXArray(0 ..< N) .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
+        // During ragged prefill, lengths masks right padding for the current chunk.
+        // leftPadding is merge/admission metadata and must not shadow those lengths.
+        if let lengths {
             return MLXArray(0 ..< N) .< lengths[0..., .newAxis]
+        } else if let leftPadding {
+            return MLXArray(0 ..< N) .>= leftPadding[0..., .newAxis]
         } else {
             return nil
         }
