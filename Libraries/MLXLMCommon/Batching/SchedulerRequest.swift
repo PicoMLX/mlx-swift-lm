@@ -9,6 +9,7 @@ struct SchedulerRequest: @unchecked Sendable {
     var tokenizer: Tokenizer
     var configuration: ModelConfiguration
     var cachedKVState: [KVCache]?
+    var cachedPromptRemainder: [Int]?
     var promptCache: LRUPromptCache?
     var promptCacheModelName: String?
     var inputTokens: [Int]?
@@ -21,6 +22,7 @@ struct SchedulerRequest: @unchecked Sendable {
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
         inputTokens: [Int]? = nil,
@@ -32,6 +34,7 @@ struct SchedulerRequest: @unchecked Sendable {
         self.tokenizer = tokenizer
         self.configuration = configuration
         self.cachedKVState = cachedKVState
+        self.cachedPromptRemainder = cachedPromptRemainder
         self.promptCache = promptCache
         self.promptCacheModelName = promptCacheModelName
         self.inputTokens = inputTokens

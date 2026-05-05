@@ -306,6 +306,200 @@ struct InferenceSchedulerTests {
         #expect(firstLayer.offset == fullSequence.count)
     }
 
+    @Test("Single path uses cached prefix remainder instead of replaying the full prompt")
+    func singlePathUsesCachedPrefixRemainder() async throws {
+        let scheduler = InferenceScheduler()
+        let model = SchedulerMockModel()
+        let tokenizer = TestTokenizer()
+        let configuration = ModelConfiguration(id: "single-cache-remainder")
+        let promptCache = LRUPromptCache(maxSize: 10)
+        let cachedPrefix = [1, 2, 3]
+        let prompt = [1, 2, 3, 4, 5]
+
+        promptCache.insertCache(
+            model: configuration.name,
+            tokens: cachedPrefix,
+            promptCache: makeSchedulerPromptCache(seqLen: cachedPrefix.count)
+        )
+
+        let (cached, remainder) = promptCache.fetchNearestCache(
+            model: configuration.name,
+            tokens: prompt
+        )
+        let cachedState = try #require(cached)
+        #expect(remainder == [4, 5])
+
+        let stream = try await scheduler.submitTokens(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            model: model,
+            cache: nil,
+            tokenizer: tokenizer,
+            configuration: configuration,
+            cachedKVState: cachedState,
+            cachedPromptRemainder: remainder,
+            promptCache: promptCache,
+            promptCacheModelName: configuration.name,
+            inputTokens: prompt
+        )
+
+        _ = await collectTokenGenerations(stream)
+
+        #expect(model.inputShapes.first == [1, 2])
+        #expect(model.inputShapes.contains([1, prompt.count]) == false)
+    }
+
+    @Test("Text-mode stop-token write-back includes the stop token in the cache key")
+    func textModeStopTokenWriteBackIncludesStopToken() async throws {
+        let scheduler = InferenceScheduler()
+        let model = SchedulerMockModel(vocabSize: 128)
+        let tokenizer = TestTokenizer(vocabularySize: 128)
+        var configuration = ModelConfiguration(id: "text-stop-writeback")
+        let promptCache = LRUPromptCache(maxSize: 10)
+        let prompt = [100]
+        let stopToken = try #require(tokenizer.eosTokenId)
+        configuration.eosTokenIds = [stopToken]
+
+        let stream = try await scheduler.submit(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+            model: model,
+            cache: nil,
+            tokenizer: tokenizer,
+            configuration: configuration,
+            promptCache: promptCache,
+            promptCacheModelName: configuration.name,
+            inputTokens: prompt
+        )
+
+        let collected = await collectGenerations(stream)
+        let info = try #require(collected.info)
+        let expectedKey = prompt + [stopToken]
+        let (cached, remainder) = promptCache.fetchNearestCache(
+            model: configuration.name,
+            tokens: expectedKey
+        )
+        let firstLayer = try #require(cached?.first)
+
+        #expect(info.generationTokenCount == 0)
+        #expect(remainder.isEmpty)
+        #expect(firstLayer.offset == expectedKey.count)
+    }
+
+    @Test("Raw-token stop-token write-back remains aligned when stop token is emitted")
+    func rawTokenStopTokenWriteBackIncludesEmittedStopToken() async throws {
+        let scheduler = InferenceScheduler()
+        let model = SchedulerMockModel(vocabSize: 128)
+        let tokenizer = TestTokenizer(vocabularySize: 128)
+        var configuration = ModelConfiguration(id: "raw-stop-writeback")
+        let promptCache = LRUPromptCache(maxSize: 10)
+        let prompt = [100]
+        let stopToken = try #require(tokenizer.eosTokenId)
+        configuration.eosTokenIds = [stopToken]
+
+        let stream = try await scheduler.submitTokens(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+            model: model,
+            cache: nil,
+            tokenizer: tokenizer,
+            configuration: configuration,
+            includeStopToken: true,
+            promptCache: promptCache,
+            promptCacheModelName: configuration.name,
+            inputTokens: prompt
+        )
+
+        let collected = await collectTokenGenerations(stream)
+        let info = try #require(collected.info)
+        let expectedKey = prompt + [stopToken]
+        let (cached, remainder) = promptCache.fetchNearestCache(
+            model: configuration.name,
+            tokens: expectedKey
+        )
+        let firstLayer = try #require(cached?.first)
+
+        #expect(collected.tokens == [stopToken])
+        #expect(info.generationTokenCount == 1)
+        #expect(remainder.isEmpty)
+        #expect(firstLayer.offset == expectedKey.count)
+    }
+
+    @Test("Cached prefixes are ignored for incompatible single-path fallbacks")
+    func cachedPrefixesAreIgnoredForIncompatibleFallbacks() async throws {
+        let tokenizer = TestTokenizer()
+        let configuration = ModelConfiguration(id: "incompatible-cache-fallback")
+        let prompt = [1, 2, 3]
+
+        do {
+            let scheduler = InferenceScheduler()
+            let model = SchedulerMockModel(syntheticHeadDim: 32)
+            let stream = try await scheduler.submitTokens(
+                input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
+                parameters: GenerateParameters(
+                    maxTokens: 0,
+                    kvBits: 4,
+                    kvGroupSize: 32,
+                    temperature: 0
+                ),
+                model: model,
+                cache: nil,
+                tokenizer: tokenizer,
+                configuration: configuration,
+                cachedKVState: makeSchedulerPromptCache(seqLen: 2),
+                cachedPromptRemainder: [3],
+                inputTokens: prompt
+            )
+
+            _ = await collectTokenGenerations(stream)
+            #expect(model.inputShapes.first == [1, prompt.count])
+        }
+
+        do {
+            let scheduler = InferenceScheduler()
+            let model = SchedulerMockModel()
+            let imageInput = LMInput(
+                text: .init(tokens: MLXArray(prompt.map(Int32.init))),
+                image: .init(pixels: MLXArray.zeros([1, 3, 8, 8]))
+            )
+            let stream = try await scheduler.submitTokens(
+                input: imageInput,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                model: model,
+                cache: nil,
+                tokenizer: tokenizer,
+                configuration: configuration,
+                cachedKVState: makeSchedulerPromptCache(seqLen: 2),
+                cachedPromptRemainder: [3],
+                inputTokens: prompt
+            )
+
+            _ = await collectTokenGenerations(stream)
+            #expect(model.inputShapes.first == [1, prompt.count])
+        }
+
+        do {
+            let scheduler = InferenceScheduler()
+            let model = SchedulerMockModel()
+            let quantizedCache = QuantizedKVCache()
+            quantizedCache.offset = 2
+            let stream = try await scheduler.submitTokens(
+                input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                model: model,
+                cache: nil,
+                tokenizer: tokenizer,
+                configuration: configuration,
+                cachedKVState: [quantizedCache],
+                cachedPromptRemainder: [3],
+                inputTokens: prompt
+            )
+
+            _ = await collectTokenGenerations(stream)
+            #expect(model.inputShapes.first == [1, prompt.count])
+        }
+    }
+
     @Test("Batch-path prompt cache write-back stores both generated sequences")
     func batchPathWritesBackToPromptCache() async throws {
         let scheduler = InferenceScheduler()
@@ -570,19 +764,43 @@ private func appendSchedulerSyntheticKV(
     }
 }
 
+private func makeSchedulerPromptCache(
+    layers: Int = 1,
+    seqLen: Int,
+    heads: Int = 4,
+    headDim: Int = 8
+) -> [KVCache] {
+    (0 ..< layers).map { layer in
+        let cache = KVCacheSimple()
+        let keys = MLXArray.ones([1, heads, seqLen, headDim]) * Float(layer + 1)
+        let values = MLXArray.ones([1, heads, seqLen, headDim]) * Float(layer + 2)
+        _ = cache.update(keys: keys, values: values)
+        return cache
+    }
+}
+
 private final class SchedulerMockModel: Module, LanguageModel, KVCacheDimensionProvider,
     @unchecked Sendable
 {
     let vocabSize: Int
     let numLayers: Int
     let callDelay: TimeInterval
+    let syntheticHeadDim: Int
 
     var kvHeads: [Int] { Array(repeating: 4, count: numLayers) }
+    var inputShapes = [[Int]]()
+    var totalTokensProcessed = 0
 
-    init(vocabSize: Int = 32, numLayers: Int = 1, callDelay: TimeInterval = 0) {
+    init(
+        vocabSize: Int = 32,
+        numLayers: Int = 1,
+        callDelay: TimeInterval = 0,
+        syntheticHeadDim: Int = 8
+    ) {
         self.vocabSize = vocabSize
         self.numLayers = numLayers
         self.callDelay = callDelay
+        self.syntheticHeadDim = syntheticHeadDim
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
@@ -598,11 +816,17 @@ private final class SchedulerMockModel: Module, LanguageModel, KVCacheDimensionP
             Thread.sleep(forTimeInterval: callDelay)
         }
 
-        appendSchedulerSyntheticKV(to: cache, inputTokens: input.tokens)
+        appendSchedulerSyntheticKV(
+            to: cache,
+            inputTokens: input.tokens,
+            defaultHeadDim: syntheticHeadDim
+        )
 
         let tokens = input.tokens
         let batchSize = tokens.dim(0)
         let steps = tokens.dim(1)
+        inputShapes.append(tokens.shape)
+        totalTokensProcessed += batchSize * steps
         var logitsFlat = [Float]()
         logitsFlat.reserveCapacity(batchSize * steps * vocabSize)
 
@@ -625,6 +849,11 @@ private final class SchedulerMockModel: Module, LanguageModel, KVCacheDimensionP
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
+    }
+
+    func resetCounters() {
+        inputShapes = []
+        totalTokensProcessed = 0
     }
 }
 

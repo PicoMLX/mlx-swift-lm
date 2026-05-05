@@ -371,6 +371,7 @@ public actor InferenceScheduler {
     ///   - cachedKVState: Optional cached KV state from `LRUPromptCache`. When provided,
     ///     the cached prefix is loaded directly into the batch cache and only the uncached
     ///     suffix tokens go through model prefill.
+    ///   - cachedPromptRemainder: Tokens not covered by `cachedKVState`.
     ///   - promptCache: Optional `LRUPromptCache` for writing back final KV state after
     ///     generation completes. When provided, the final per-request KV cache is stored
     ///     so future requests with the same prefix can skip prefill.
@@ -387,6 +388,7 @@ public actor InferenceScheduler {
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
         inputTokens: [Int]? = nil,
@@ -409,6 +411,7 @@ public actor InferenceScheduler {
             tokenizer: tokenizer,
             configuration: configuration,
             cachedKVState: cachedKVState,
+            cachedPromptRemainder: cachedPromptRemainder,
             promptCache: promptCache,
             promptCacheModelName: promptCacheModelName,
             inputTokens: inputTokens,
@@ -434,6 +437,7 @@ public actor InferenceScheduler {
     ///   - includeStopToken: When `true`, the terminating EOS/unknown token is yielded
     ///     before finishing. Defaults to `false`.
     ///   - cachedKVState: Optional cached KV state from `LRUPromptCache`.
+    ///   - cachedPromptRemainder: Tokens not covered by `cachedKVState`.
     ///   - promptCache: Optional `LRUPromptCache` for writing back final KV state.
     ///   - promptCacheModelName: Model name used as key for prompt cache operations.
     ///   - inputTokens: The full token sequence for prompt cache write-back.
@@ -448,6 +452,7 @@ public actor InferenceScheduler {
         configuration: ModelConfiguration,
         includeStopToken: Bool = false,
         cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
         inputTokens: [Int]? = nil,
@@ -468,6 +473,7 @@ public actor InferenceScheduler {
             tokenizer: tokenizer,
             configuration: configuration,
             cachedKVState: cachedKVState,
+            cachedPromptRemainder: cachedPromptRemainder,
             promptCache: promptCache,
             promptCacheModelName: promptCacheModelName,
             inputTokens: inputTokens,
@@ -551,6 +557,7 @@ public actor InferenceScheduler {
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
         inputTokens: [Int]? = nil,
@@ -560,7 +567,7 @@ public actor InferenceScheduler {
         let compatible = Self.isBatchCompatible(
             input: input,
             parameters: parameters,
-            cache: cache,
+            cache: cachedKVState ?? cache,
             model: model
         )
 
@@ -571,7 +578,9 @@ public actor InferenceScheduler {
                 input: input,
                 parameters: parameters,
                 model: model,
-                cache: cachedKVState ?? cache,
+                cache: cache,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 tokenizer: tokenizer,
                 configuration: configuration,
                 promptCache: promptCache,
@@ -589,7 +598,9 @@ public actor InferenceScheduler {
                 input: input,
                 parameters: parameters,
                 model: model,
-                cache: cachedKVState ?? cache,
+                cache: cache,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 tokenizer: tokenizer,
                 configuration: configuration,
                 promptCache: promptCache,
@@ -627,7 +638,9 @@ public actor InferenceScheduler {
                             input: input,
                             parameters: parameters,
                             model: model,
-                            cache: cachedKVState ?? cache,
+                            cache: cache,
+                            cachedKVState: cachedKVState,
+                            cachedPromptRemainder: cachedPromptRemainder,
                             tokenizer: tokenizer,
                             configuration: configuration,
                             promptCache: promptCache,
@@ -647,6 +660,7 @@ public actor InferenceScheduler {
                         tokenizer: tokenizer,
                         configuration: configuration,
                         cachedKVState: cachedKVState,
+                        cachedPromptRemainder: cachedPromptRemainder,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
                         inputTokens: inputTokens,
@@ -660,7 +674,9 @@ public actor InferenceScheduler {
                         input: input,
                         parameters: parameters,
                         model: model,
-                        cache: cachedKVState ?? cache,
+                        cache: cache,
+                        cachedKVState: cachedKVState,
+                        cachedPromptRemainder: cachedPromptRemainder,
                         tokenizer: tokenizer,
                         configuration: configuration,
                         promptCache: promptCache,
@@ -676,7 +692,9 @@ public actor InferenceScheduler {
                         input: input,
                         parameters: parameters,
                         model: model,
-                        cache: cachedKVState ?? cache,
+                        cache: cache,
+                        cachedKVState: cachedKVState,
+                        cachedPromptRemainder: cachedPromptRemainder,
                         tokenizer: tokenizer,
                         configuration: configuration,
                         promptCache: promptCache,
@@ -698,7 +716,9 @@ public actor InferenceScheduler {
                     input: input,
                     parameters: parameters,
                     model: model,
-                    cache: cachedKVState ?? cache,
+                    cache: cache,
+                    cachedKVState: cachedKVState,
+                    cachedPromptRemainder: cachedPromptRemainder,
                     tokenizer: tokenizer,
                     configuration: configuration,
                     promptCache: promptCache,
@@ -717,6 +737,7 @@ public actor InferenceScheduler {
                 tokenizer: tokenizer,
                 configuration: configuration,
                 cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
                 inputTokens: inputTokens
@@ -729,7 +750,9 @@ public actor InferenceScheduler {
                 input: input,
                 parameters: parameters,
                 model: model,
-                cache: cachedKVState ?? cache,
+                cache: cache,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 tokenizer: tokenizer,
                 configuration: configuration,
                 promptCache: promptCache,
@@ -745,7 +768,9 @@ public actor InferenceScheduler {
                 input: input,
                 parameters: parameters,
                 model: model,
-                cache: cachedKVState ?? cache,
+                cache: cache,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 tokenizer: tokenizer,
                 configuration: configuration,
                 promptCache: promptCache,
@@ -765,7 +790,9 @@ public actor InferenceScheduler {
                         input: input,
                         parameters: parameters,
                         model: model,
-                        cache: cachedKVState ?? cache,
+                        cache: cache,
+                        cachedKVState: cachedKVState,
+                        cachedPromptRemainder: cachedPromptRemainder,
                         tokenizer: tokenizer,
                         configuration: configuration,
                         promptCache: promptCache,
@@ -785,7 +812,9 @@ public actor InferenceScheduler {
                         input: input,
                         parameters: parameters,
                         model: model,
-                        cache: cachedKVState ?? cache,
+                        cache: cache,
+                        cachedKVState: cachedKVState,
+                        cachedPromptRemainder: cachedPromptRemainder,
                         tokenizer: tokenizer,
                         configuration: configuration,
                         promptCache: promptCache,
@@ -813,7 +842,9 @@ public actor InferenceScheduler {
                     input: input,
                     parameters: parameters,
                     model: model,
-                    cache: cachedKVState ?? cache,
+                    cache: cache,
+                    cachedKVState: cachedKVState,
+                    cachedPromptRemainder: cachedPromptRemainder,
                     tokenizer: tokenizer,
                     configuration: configuration,
                     promptCache: promptCache,
@@ -829,7 +860,9 @@ public actor InferenceScheduler {
                     input: input,
                     parameters: parameters,
                     model: model,
-                    cache: cachedKVState ?? cache,
+                    cache: cache,
+                    cachedKVState: cachedKVState,
+                    cachedPromptRemainder: cachedPromptRemainder,
                     tokenizer: tokenizer,
                     configuration: configuration,
                     promptCache: promptCache,
@@ -990,6 +1023,121 @@ public actor InferenceScheduler {
         cacheMaxKVSize == parameters.maxKVSize
     }
 
+    private static func makeSinglePathIterator(
+        logicalInput input: LMInput,
+        parameters: GenerateParameters,
+        model: any LanguageModel,
+        cache: [KVCache]?,
+        cachedKVState: [KVCache]?,
+        cachedPromptRemainder: [Int]?
+    ) throws -> TokenIterator {
+        let plan = singlePathPrefillPlan(
+            logicalInput: input,
+            parameters: parameters,
+            model: model,
+            cache: cache,
+            cachedKVState: cachedKVState,
+            cachedPromptRemainder: cachedPromptRemainder
+        )
+
+        if plan.promptTokensForProcessor != nil {
+            return try TokenIterator(
+                input: plan.prefillInput,
+                promptTokensForProcessor: input.text.tokens,
+                model: model,
+                cache: plan.cache,
+                parameters: parameters
+            )
+        }
+
+        return try TokenIterator(
+            input: plan.prefillInput,
+            model: model,
+            cache: plan.cache,
+            parameters: parameters
+        )
+    }
+
+    private static func singlePathPrefillPlan(
+        logicalInput input: LMInput,
+        parameters: GenerateParameters,
+        model: any LanguageModel,
+        cache: [KVCache]?,
+        cachedKVState: [KVCache]?,
+        cachedPromptRemainder: [Int]?
+    ) -> (prefillInput: LMInput, cache: [KVCache]?, promptTokensForProcessor: MLXArray?) {
+        guard parameters.kvBits == nil,
+            input.image == nil,
+            input.video == nil,
+            let cachedKVState,
+            let cachedPromptRemainder,
+            !cachedKVState.isEmpty,
+            MLXLMCommon.isBatchCompatible(cachedKVState),
+            MLXLMCommon.isBatchCompatible(model.newCache(parameters: parameters))
+        else {
+            return (input, cache, nil)
+        }
+
+        let promptLength = input.text.tokens.size
+        guard promptLength > 0, cachedPromptRemainder.count < promptLength else {
+            return (input, cache, nil)
+        }
+
+        let expectedCachedLength = promptLength - cachedPromptRemainder.count
+        guard cachedKVState.first?.offset == expectedCachedLength else {
+            return (input, cache, nil)
+        }
+
+        if cachedPromptRemainder.isEmpty {
+            guard canTrimPromptCache(cachedKVState) else {
+                return (input, cache, nil)
+            }
+
+            trimPromptCache(cachedKVState, numTokens: 1)
+            let lastTokenInput = LMInput(
+                text: input.text[(promptLength - 1)...],
+                image: input.image,
+                video: input.video
+            )
+            return (lastTokenInput, cachedKVState, input.text.tokens)
+        }
+
+        let suffixStart = promptLength - cachedPromptRemainder.count
+        guard suffixStart > 0 else {
+            return (input, cache, nil)
+        }
+
+        let suffixInput = LMInput(
+            text: input.text[suffixStart...],
+            image: input.image,
+            video: input.video
+        )
+        return (suffixInput, cachedKVState, input.text.tokens)
+    }
+
+    private static func writePromptCache(
+        promptCache: LRUPromptCache?,
+        modelName: String?,
+        inputTokens: [Int]?,
+        cacheTokenIds: [Int],
+        cache: [KVCache]
+    ) {
+        guard let promptCache, let modelName, let inputTokens, !inputTokens.isEmpty else {
+            return
+        }
+
+        let fullTokenSequence = inputTokens + cacheTokenIds
+        if let cacheOffset = cache.first?.offset, cacheOffset != fullTokenSequence.count {
+            return
+        }
+
+        promptCache.insertCache(
+            model: modelName,
+            tokens: fullTokenSequence,
+            promptCache: cache
+        )
+    }
+
     // MARK: - Single Request Path
 
     /// Start a single request using `TokenIterator` — the existing fast path.
@@ -999,6 +1147,8 @@ public actor InferenceScheduler {
         parameters: GenerateParameters,
         model: any LanguageModel,
         cache: [KVCache]?,
+        cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         promptCache: LRUPromptCache? = nil,
@@ -1009,11 +1159,13 @@ public actor InferenceScheduler {
     ) async throws {
         let iterator: TokenIterator
         do {
-            iterator = try TokenIterator(
-                input: input,
+            iterator = try Self.makeSinglePathIterator(
+                logicalInput: input,
+                parameters: parameters,
                 model: model,
                 cache: cache,
-                parameters: parameters
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder
             )
         } catch {
             if ticketAlreadyStarted, let wiredMemoryTicket {
@@ -1063,9 +1215,12 @@ public actor InferenceScheduler {
             var promptTime: TimeInterval = 0
             var tokenCount = 0
             var generatedTokenIds = [Int]()
+            var cacheTokenIds = [Int]()
             var stopReason: GenerateStopReason?
 
             while let token = iter.next() {
+                cacheTokenIds.append(token)
+
                 if Task.isCancelled {
                     stopReason = .cancelled
                     break
@@ -1162,16 +1317,13 @@ public actor InferenceScheduler {
             handler.yieldInfo(info)
 
             // Write back final KV cache to prompt cache for future reuse.
-            if let promptCache, let modelName = promptCacheModelName,
-                let tokens = inputTokens, !tokens.isEmpty
-            {
-                let fullTokenSequence = tokens + generatedTokenIds
-                promptCache.insertCache(
-                    model: modelName,
-                    tokens: fullTokenSequence,
-                    promptCache: iter.cache
-                )
-            }
+            Self.writePromptCache(
+                promptCache: promptCache,
+                modelName: promptCacheModelName,
+                inputTokens: inputTokens,
+                cacheTokenIds: cacheTokenIds,
+                cache: iter.cache
+            )
 
             if ownsTicket, let wiredMemoryTicket {
                 ownsTicket = false
@@ -1217,6 +1369,8 @@ public actor InferenceScheduler {
         parameters: GenerateParameters,
         model: any LanguageModel,
         cache: [KVCache]?,
+        cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         promptCache: LRUPromptCache? = nil,
@@ -1227,11 +1381,13 @@ public actor InferenceScheduler {
     ) async throws {
         let iterator: TokenIterator
         do {
-            iterator = try TokenIterator(
-                input: input,
+            iterator = try Self.makeSinglePathIterator(
+                logicalInput: input,
+                parameters: parameters,
                 model: model,
                 cache: cache,
-                parameters: parameters
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder
             )
         } catch {
             if ticketAlreadyStarted, let wiredMemoryTicket {
@@ -1268,9 +1424,12 @@ public actor InferenceScheduler {
             var promptTime: TimeInterval = 0
             var tokenCount = 0
             var generatedTokenIds = [Int]()
+            var cacheTokenIds = [Int]()
             var stopReason: GenerateStopReason?
 
             while let token = iter.next() {
+                cacheTokenIds.append(token)
+
                 if Task.isCancelled {
                     stopReason = .cancelled
                     break
@@ -1325,16 +1484,13 @@ public actor InferenceScheduler {
             )
             handler.yieldInfo(info)
 
-            if let promptCache, let modelName = promptCacheModelName,
-                let tokens = inputTokens, !tokens.isEmpty
-            {
-                let fullTokenSequence = tokens + generatedTokenIds
-                promptCache.insertCache(
-                    model: modelName,
-                    tokens: fullTokenSequence,
-                    promptCache: iter.cache
-                )
-            }
+            Self.writePromptCache(
+                promptCache: promptCache,
+                modelName: promptCacheModelName,
+                inputTokens: inputTokens,
+                cacheTokenIds: cacheTokenIds,
+                cache: iter.cache
+            )
 
             if ownsTicket, let wiredMemoryTicket {
                 ownsTicket = false
@@ -1486,6 +1642,7 @@ public actor InferenceScheduler {
             var promptTokenCounts = initialPromptTokenCounts
             var tokenCounts: [Int: Int] = [:]
             var generatedTokenIds = initialGeneratedTokenIds
+            var cacheTokenIds = initialGeneratedTokenIds
             var initializedUIDs = Set(initialUIDs)
 
             let now = Date.timeIntervalSinceReferenceDate
@@ -1522,6 +1679,7 @@ public actor InferenceScheduler {
                     }
 
                     let token = response.token
+                    cacheTokenIds[uid, default: []].append(token)
 
                     if promptTimes[uid] == 0 {
                         let start = starts[uid]?.timeIntervalSinceReferenceDate ?? now
@@ -1566,15 +1724,13 @@ public actor InferenceScheduler {
                         {
                             let (pCache, modelName) =
                                 await self?.getPromptCacheInfo() ?? (nil, nil)
-                            if let pCache, let modelName {
-                                let fullTokenSequence =
-                                    inputToks + (generatedTokenIds[uid] ?? [])
-                                pCache.insertCache(
-                                    model: modelName,
-                                    tokens: fullTokenSequence,
-                                    promptCache: finalCache
-                                )
-                            }
+                            Self.writePromptCache(
+                                promptCache: pCache,
+                                modelName: modelName,
+                                inputTokens: inputToks,
+                                cacheTokenIds: cacheTokenIds[uid] ?? [],
+                                cache: finalCache
+                            )
                         }
 
                         await self?.endBatchedTicket(uid: uid)
@@ -1614,6 +1770,7 @@ public actor InferenceScheduler {
         tokenizer: Tokenizer,
         configuration: ModelConfiguration,
         cachedKVState: [KVCache]? = nil,
+        cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
         inputTokens: [Int]? = nil,
@@ -1644,7 +1801,9 @@ public actor InferenceScheduler {
                 input: newInput,
                 parameters: newParameters,
                 model: model,
-                cache: cachedKVState ?? cache,
+                cache: cache,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 tokenizer: tokenizer,
                 configuration: configuration,
                 promptCache: promptCache,
@@ -1797,6 +1956,7 @@ public actor InferenceScheduler {
             var promptTokenCounts: [Int: Int] = [:]
             var tokenCounts: [Int: Int] = [:]
             var generatedTokenIds: [Int: [Int]] = [:]
+            var cacheTokenIds: [Int: [Int]] = [:]
             // Track which UIDs have been seen (for lazy init of 3rd+ requests)
             var initializedUIDs: Set<Int> = []
 
@@ -1813,6 +1973,7 @@ public actor InferenceScheduler {
             // the prompt cache write-back key includes the full sequence:
             // inputTokens + preUpgradeTokens + batchGeneratedTokens.
             generatedTokenIds[firstUID] = firstPreUpgradeTokens
+            cacheTokenIds[firstUID] = firstPreUpgradeTokens
             // Carry the first request's already-emitted token count into the
             // batch loop so completion info reflects the full generation span.
             tokenCounts[firstUID] = liveState.tokenCount
@@ -1852,6 +2013,7 @@ public actor InferenceScheduler {
                     }
 
                     let token = response.token
+                    cacheTokenIds[uid, default: []].append(token)
 
                     // Track timing
                     if promptTimes[uid] == 0 {
@@ -1903,15 +2065,13 @@ public actor InferenceScheduler {
                         {
                             let (pCache, modelName) =
                                 await self?.getPromptCacheInfo() ?? (nil, nil)
-                            if let pCache, let modelName {
-                                let fullTokenSequence =
-                                    inputToks + (generatedTokenIds[uid] ?? [])
-                                pCache.insertCache(
-                                    model: modelName,
-                                    tokens: fullTokenSequence,
-                                    promptCache: finalCache
-                                )
-                            }
+                            Self.writePromptCache(
+                                promptCache: pCache,
+                                modelName: modelName,
+                                inputTokens: inputToks,
+                                cacheTokenIds: cacheTokenIds[uid] ?? [],
+                                cache: finalCache
+                            )
                         }
 
                         await self?.endBatchedTicket(uid: uid)

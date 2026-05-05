@@ -603,6 +603,37 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// Initialize with a physical prefill input that may be shorter than the
+    /// logical prompt already observed by logit processors.
+    ///
+    /// This is used by prompt-cache callers that have a KV cache covering a
+    /// prefix of the prompt: processors still see the full prompt, while the
+    /// model only prefills the uncached suffix.
+    init(
+        input: LMInput, promptTokensForProcessor: MLXArray, model: any LanguageModel,
+        cache: [KVCache]? = nil, parameters: GenerateParameters
+    ) throws {
+        self.model = model
+        self.y = input.text
+        self.cache = cache ?? model.newCache(parameters: parameters)
+
+        self.processor = parameters.processor()
+        self.sampler = parameters.sampler()
+        self.maxTokens = parameters.maxTokens
+
+        self.kvBits = parameters.kvBits
+        self.kvGroupSize = parameters.kvGroupSize
+        self.quantizedKVStart = parameters.quantizedKVStart
+
+        self.promptPrefillTime = try measure {
+            try prepare(
+                input: input,
+                promptTokensForProcessor: promptTokensForProcessor,
+                windowSize: parameters.prefillStepSize
+            )
+        }
+    }
+
     /// Initialize a `TokenIterator` with the given input and logit handling.
     ///
     /// - Parameters:
@@ -636,8 +667,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
     }
 
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
-        processor?.prompt(input.text.tokens)
+    mutating func prepare(
+        input: LMInput,
+        promptTokensForProcessor: MLXArray? = nil,
+        windowSize: Int? = nil
+    ) throws {
+        processor?.prompt(promptTokensForProcessor ?? input.text.tokens)
 
         switch try model.prepare(input, cache: cache, windowSize: windowSize) {
         case .tokens(let tokens):
