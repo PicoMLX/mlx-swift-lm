@@ -31,6 +31,25 @@ import MLXNN
 /// ```
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
+    private let loadedAsVLM: Bool
+
+    /// Optional inference scheduler for transparent batching support.
+    ///
+    /// When set, compatible generation requests are routed through the scheduler,
+    /// enabling automatic batching when multiple concurrent requests arrive.
+    /// When `nil` (default), the existing direct `TokenIterator` path is used unchanged.
+    ///
+    /// - Note: `InferenceScheduler` is a Swift actor and inherently `Sendable`.
+    public nonisolated(unsafe) var scheduler: InferenceScheduler?
+
+    /// Optional prompt cache for reusing KV state across requests with shared prefixes.
+    ///
+    /// When set alongside a scheduler, cached KV state is fetched before submitting
+    /// to the scheduler and stored after generation completes. This reduces prefill
+    /// time for repeated or prefix-sharing prompts.
+    ///
+    /// - Note: `LRUPromptCache` is thread-safe via internal locking.
+    public nonisolated(unsafe) var promptCache: LRUPromptCache?
 
     public var configuration: ModelConfiguration {
         get async {
@@ -50,8 +69,10 @@ public final class ModelContainer: Sendable {
         }
     }
 
-    public init(context: consuming ModelContext) {
+    public init(context: consuming ModelContext, scheduler: InferenceScheduler? = nil) {
+        self.loadedAsVLM = context.loadedAsVLM
         self.context = .init(context)
+        self.scheduler = scheduler
     }
 
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
@@ -188,6 +209,58 @@ public final class ModelContainer: Sendable {
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
 
+        // When a scheduler is set, route through InferenceScheduler for
+        // transparent batching. VLMs are excluded at this level (!loadedAsVLM);
+        // the scheduler handles remaining compatibility checks (multimodal
+        // inputs, kvBits, SSM models) and falls back to single TokenIterator.
+        if let scheduler, !loadedAsVLM {
+            let lmInput = input.consume()
+
+            // Read model, tokenizer, and configuration from the context.
+            // Uses SendableBox to safely transfer non-Sendable types across
+            // isolation boundaries (matching existing patterns in this codebase).
+            let (modelBox, tokenizerBox, configuration) = await context.read { context in
+                (
+                    SendableBox(context.model as AnyObject),
+                    SendableBox(context.tokenizer as AnyObject),
+                    context.configuration
+                )
+            }
+
+            // Use nonisolated(unsafe) to safely transfer the model across the actor
+            // boundary. The value is consumed by the scheduler and never accessed again
+            // from this context — the SendableBox ensures single-ownership semantics.
+            nonisolated(unsafe) let resolvedModel = modelBox.consume() as! any LanguageModel
+            let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
+
+            // Check the prompt cache for a cached KV state matching the input tokens.
+            var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
+            let inputTokens = lmInput.text.tokens.asArray(Int.self)
+            if let promptCache {
+                let (cached, remainder) = promptCache.fetchNearestCache(
+                    model: configuration.name, tokens: inputTokens)
+                cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
+            }
+
+            return try await scheduler.submit(
+                input: lmInput,
+                parameters: parameters,
+                model: resolvedModel,
+                cache: nil,
+                tokenizer: resolvedTokenizer,
+                configuration: configuration,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
+                promptCache: promptCache,
+                promptCacheModelName: configuration.name,
+                inputTokens: inputTokens,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+
+        // No scheduler: use existing direct path unchanged
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no
         // shared mutable state.
@@ -201,6 +274,247 @@ public final class ModelContainer: Sendable {
                 parameters: parameters,
                 context: context,
                 wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
+    /// Generate text for multiple prepared inputs, starting them as a batch when possible.
+    public func generateBatched(
+        _ requests: consuming sending [GenerationRequest]
+    ) async throws -> [AsyncStream<Generation>] {
+        let requests = SendableBox(requests).consume()
+        guard requests.count >= 2 else {
+            throw BatchedGenerationError.batchTooSmall
+        }
+
+        guard let scheduler, !loadedAsVLM else {
+            var streams = [AsyncStream<Generation>]()
+            streams.reserveCapacity(requests.count)
+            for request in requests {
+                let input = SendableBox(request.input)
+                let stream = try await generate(
+                    input: input.consume(),
+                    parameters: request.parameters,
+                    wiredMemoryTicket: request.wiredMemoryTicket
+                )
+                streams.append(stream)
+            }
+            return streams
+        }
+
+        let (modelBox, tokenizerBox, configuration) = await context.read { context in
+            (
+                SendableBox(context.model as AnyObject),
+                SendableBox(context.tokenizer as AnyObject),
+                context.configuration
+            )
+        }
+
+        nonisolated(unsafe) let resolvedModel = modelBox.consume() as! any LanguageModel
+        let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
+        let schedulerRequests = makeSchedulerRequests(
+            from: requests,
+            tokenizer: resolvedTokenizer,
+            configuration: configuration
+        )
+
+        return try await scheduler.submitBatch(
+            schedulerRequests,
+            model: resolvedModel
+        )
+    }
+
+    /// Generate text for multiple prepared inputs supplied as parallel arrays.
+    public func generateBatched(
+        input: consuming sending [LMInput],
+        parameters: [GenerateParameters]
+    ) async throws -> [AsyncStream<Generation>] {
+        let input = SendableBox(input).consume()
+        guard input.count == parameters.count else {
+            throw BatchedGenerationError.mismatchedRequestCounts
+        }
+        let requests = zip(input, parameters).map {
+            GenerationRequest(input: $0.0, parameters: $0.1)
+        }
+        return try await generateBatched(requests)
+    }
+
+    /// Generate raw token IDs from prepared input, returning an AsyncStream.
+    ///
+    /// This is the raw-token counterpart of `generate()`. Instead of decoded text
+    /// chunks and tool calls, the returned stream yields `.token(Int)` for each
+    /// generated token ID and `.info(GenerateCompletionInfo)` at the end.
+    ///
+    /// When a scheduler is set, routes through `InferenceScheduler.submitTokens()`
+    /// for transparent batching. Otherwise uses the direct `generateTokens()` free
+    /// function.
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input (transferred via `sending`)
+    ///   - parameters: Generation parameters
+    ///   - includeStopToken: When `true`, the terminating EOS/unknown token is
+    ///     yielded before finishing. Defaults to `false`.
+    ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination
+    /// - Returns: An AsyncStream of raw token generation events
+    public func generateTokens(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        includeStopToken: Bool = false,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<TokenGeneration> {
+        let input = SendableBox(input)
+
+        if let scheduler, !loadedAsVLM {
+            let lmInput = input.consume()
+
+            let (modelBox, tokenizerBox, configuration) = await context.read { context in
+                (
+                    SendableBox(context.model as AnyObject),
+                    SendableBox(context.tokenizer as AnyObject),
+                    context.configuration
+                )
+            }
+
+            nonisolated(unsafe) let resolvedModel = modelBox.consume() as! any LanguageModel
+            let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
+
+            var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
+            let inputTokens = lmInput.text.tokens.asArray(Int.self)
+            if let promptCache {
+                let (cached, remainder) = promptCache.fetchNearestCache(
+                    model: configuration.name, tokens: inputTokens)
+                cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
+            }
+
+            return try await scheduler.submitTokens(
+                input: lmInput,
+                parameters: parameters,
+                model: resolvedModel,
+                cache: nil,
+                tokenizer: resolvedTokenizer,
+                configuration: configuration,
+                includeStopToken: includeStopToken,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
+                promptCache: promptCache,
+                promptCacheModelName: configuration.name,
+                inputTokens: inputTokens,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+
+        // No scheduler: use existing direct path
+        return try await context.read { context in
+            try MLXLMCommon.generateTokens(
+                input: input.consume(),
+                parameters: parameters,
+                context: context,
+                includeStopToken: includeStopToken,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
+    /// Generate raw token IDs for multiple prepared inputs, starting them as a batch when possible.
+    public func generateTokensBatched(
+        _ requests: consuming sending [GenerationRequest],
+        includeStopToken: Bool = false
+    ) async throws -> [AsyncStream<TokenGeneration>] {
+        let requests = SendableBox(requests).consume()
+        guard requests.count >= 2 else {
+            throw BatchedGenerationError.batchTooSmall
+        }
+
+        guard let scheduler, !loadedAsVLM else {
+            var streams = [AsyncStream<TokenGeneration>]()
+            streams.reserveCapacity(requests.count)
+            for request in requests {
+                let input = SendableBox(request.input)
+                let stream = try await generateTokens(
+                    input: input.consume(),
+                    parameters: request.parameters,
+                    includeStopToken: includeStopToken,
+                    wiredMemoryTicket: request.wiredMemoryTicket
+                )
+                streams.append(stream)
+            }
+            return streams
+        }
+
+        let (modelBox, tokenizerBox, configuration) = await context.read { context in
+            (
+                SendableBox(context.model as AnyObject),
+                SendableBox(context.tokenizer as AnyObject),
+                context.configuration
+            )
+        }
+
+        nonisolated(unsafe) let resolvedModel = modelBox.consume() as! any LanguageModel
+        let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
+        let schedulerRequests = makeSchedulerRequests(
+            from: requests,
+            tokenizer: resolvedTokenizer,
+            configuration: configuration
+        )
+
+        return try await scheduler.submitBatchTokens(
+            schedulerRequests,
+            model: resolvedModel,
+            includeStopToken: includeStopToken
+        )
+    }
+
+    /// Generate raw token IDs for multiple prepared inputs supplied as parallel arrays.
+    public func generateTokensBatched(
+        input: consuming sending [LMInput],
+        parameters: [GenerateParameters],
+        includeStopToken: Bool = false
+    ) async throws -> [AsyncStream<TokenGeneration>] {
+        let input = SendableBox(input).consume()
+        guard input.count == parameters.count else {
+            throw BatchedGenerationError.mismatchedRequestCounts
+        }
+        let requests = zip(input, parameters).map {
+            GenerationRequest(input: $0.0, parameters: $0.1)
+        }
+        return try await generateTokensBatched(
+            requests,
+            includeStopToken: includeStopToken
+        )
+    }
+
+    private func makeSchedulerRequests(
+        from requests: [GenerationRequest],
+        tokenizer: Tokenizer,
+        configuration: ModelConfiguration
+    ) -> [SchedulerRequest] {
+        requests.map { request in
+            let inputTokens = request.input.text.tokens.asArray(Int.self)
+            var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
+            if let promptCache {
+                let (cached, remainder) = promptCache.fetchNearestCache(
+                    model: configuration.name,
+                    tokens: inputTokens
+                )
+                cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
+            }
+
+            return SchedulerRequest(
+                input: request.input,
+                parameters: request.parameters,
+                cache: nil,
+                tokenizer: tokenizer,
+                configuration: configuration,
+                cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
+                promptCache: promptCache,
+                promptCacheModelName: configuration.name,
+                inputTokens: inputTokens,
+                wiredMemoryTicket: request.wiredMemoryTicket
             )
         }
     }

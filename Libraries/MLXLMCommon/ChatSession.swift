@@ -368,6 +368,82 @@ public final class ChatSession {
                         messages.append(.system(instructions))
                     }
 
+                    // When a scheduler is present, route through
+                    // ModelContainer.generate() for transparent batching.
+                    // The prompt cache on ModelContainer caches KV state
+                    // across requests, so follow-up turns that re-tokenize
+                    // the full conversation history will hit the cache for
+                    // the shared prefix — only new tokens need prefill.
+                    if model.scheduler != nil {
+                        // Build full message history for scheduler path.
+                        // Collect the prior turns so we can persist them later.
+                        var history: [Chat.Message] = []
+                        switch cache {
+                        case .empty:
+                            break
+                        case .kvcache:
+                            // Transitioning from non-scheduler KV cache state to
+                            // scheduler path. The KV caches cannot be inserted into
+                            // the prompt cache because we don't have the exact token
+                            // sequence that was processed (the non-scheduler path
+                            // doesn't store message history). The cache is discarded;
+                            // the full conversation will be re-tokenized and processed
+                            // fresh, with the scheduler writing back the new KV state
+                            // under the correct token key for future reuse.
+                            break
+                        case .history(let h):
+                            history = h
+                            messages.append(contentsOf: h)
+                        }
+
+                        let userMessage = message.consume()
+                        messages.append(userMessage)
+                        history.append(userMessage)
+
+                        var assistantText = ""
+
+                        restart: while !messages.isEmpty {
+                            let userInput = UserInput(
+                                chat: messages, processing: processing,
+                                tools: tools, additionalContext: additionalContext)
+                            let lmInput = try await processor.prepare(input: userInput)
+                            messages.removeAll()
+
+                            let stream = try await model.generate(
+                                input: SendableBox(lmInput).consume(),
+                                parameters: generateParameters
+                            )
+
+                            for await item in stream {
+                                if let toolCall = item.toolCall, let toolDispatch {
+                                    let toolResult = try await toolDispatch(toolCall)
+                                    messages = [.tool(toolResult)]
+                                    break
+                                }
+
+                                if let chunk = item.chunk {
+                                    assistantText += chunk
+                                }
+
+                                if let value = transform(item) {
+                                    if case .terminated = continuation.yield(value) {
+                                        break
+                                    }
+                                }
+                            }
+                        }
+
+                        // Persist the updated session state: prior history +
+                        // user message (already appended above) + assistant response.
+                        if !assistantText.isEmpty {
+                            history.append(.assistant(assistantText))
+                        }
+                        cache = .history(history)
+
+                        continuation.finish()
+                        return
+                    }
+
                     // prepare the cache, if needed.  note:
                     // this is using the LanguageModel (not Sendable) outside
                     // the protective lock.  Assuming the weights are not
