@@ -340,6 +340,38 @@ struct ModelContainerBatchingTests {
         #expect(secondTotal < firstTotal)
     }
 
+    @Test("Sequential overlapping prompts reuse cached prefix without full replay")
+    func sequentialOverlappingPromptsReuseCachedPrefix() async throws {
+        let scheduler = InferenceScheduler()
+        let promptCache = LRUPromptCache(maxSize: 10)
+        let (container, model, _) = makeContainer(
+            scheduler: scheduler,
+            promptCache: promptCache
+        )
+
+        let firstPrompt = [1, 2, 3, 4]
+        let firstStream = try await container.generate(
+            input: LMInput(tokens: MLXArray(firstPrompt.map(Int32.init))),
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        _ = await collectGenerationOutput(firstStream)
+
+        model.resetCounters()
+
+        let overlappingPrompt = [1, 2, 3, 4, 5, 6]
+        let secondStream = try await container.generate(
+            input: LMInput(tokens: MLXArray(overlappingPrompt.map(Int32.init))),
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        let secondOutput = await collectGenerationOutput(secondStream)
+        let info = try #require(secondOutput.info)
+
+        #expect(info.promptTokenCount == overlappingPrompt.count)
+        #expect(model.sawPreloadedCache)
+        #expect(model.inputShapes.first == [1, 1])
+        #expect(model.inputShapes.contains([1, overlappingPrompt.count]) == false)
+    }
+
     @Test("Scheduler and prompt cache properties remain assignable on the container")
     func schedulerAndPromptCachePropertiesRemainAssignable() {
         let (container, _, _) = makeContainer()
@@ -435,19 +467,7 @@ private final class CallTrackingModel: Module, LanguageModel, KVCacheDimensionPr
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        let cachedLength = cache.first?.offset ?? 0
-        let promptLength = input.text.tokens.size
-
-        if cachedLength >= promptLength, promptLength > 0 {
-            _ = trimPromptCache(cache, numTokens: 1)
-            return .tokens(input.text[(promptLength - 1)...])
-        }
-
-        if cachedLength > 0 {
-            return .tokens(input.text[cachedLength...])
-        }
-
-        return .tokens(input.text)
+        .tokens(input.text)
     }
 
     func callAsFunction(

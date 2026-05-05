@@ -235,11 +235,13 @@ public final class ModelContainer: Sendable {
 
             // Check the prompt cache for a cached KV state matching the input tokens.
             var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
             if let promptCache {
-                let (cached, _) = promptCache.fetchNearestCache(
+                let (cached, remainder) = promptCache.fetchNearestCache(
                     model: configuration.name, tokens: inputTokens)
                 cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
             }
 
             return try await scheduler.submit(
@@ -250,6 +252,7 @@ public final class ModelContainer: Sendable {
                 tokenizer: resolvedTokenizer,
                 configuration: configuration,
                 cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
                 inputTokens: inputTokens,
@@ -376,11 +379,13 @@ public final class ModelContainer: Sendable {
             let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
 
             var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
             if let promptCache {
-                let (cached, _) = promptCache.fetchNearestCache(
+                let (cached, remainder) = promptCache.fetchNearestCache(
                     model: configuration.name, tokens: inputTokens)
                 cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
             }
 
             return try await scheduler.submitTokens(
@@ -392,6 +397,7 @@ public final class ModelContainer: Sendable {
                 configuration: configuration,
                 includeStopToken: includeStopToken,
                 cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
                 inputTokens: inputTokens,
@@ -487,12 +493,14 @@ public final class ModelContainer: Sendable {
         requests.map { request in
             let inputTokens = request.input.text.tokens.asArray(Int.self)
             var cachedKVState: [KVCache]?
+            var cachedPromptRemainder: [Int]?
             if let promptCache {
-                let (cached, _) = promptCache.fetchNearestCache(
+                let (cached, remainder) = promptCache.fetchNearestCache(
                     model: configuration.name,
                     tokens: inputTokens
                 )
                 cachedKVState = cached
+                cachedPromptRemainder = cached == nil ? nil : remainder
             }
 
             return SchedulerRequest(
@@ -502,6 +510,7 @@ public final class ModelContainer: Sendable {
                 tokenizer: tokenizer,
                 configuration: configuration,
                 cachedKVState: cachedKVState,
+                cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
                 inputTokens: inputTokens,
