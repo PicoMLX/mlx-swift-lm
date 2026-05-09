@@ -205,7 +205,8 @@ public final class ModelContainer: Sendable {
     public func generate(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
-        wiredMemoryTicket: WiredMemoryTicket? = nil
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        promptCacheSalt: UInt64 = 0
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
 
@@ -237,12 +238,28 @@ public final class ModelContainer: Sendable {
             var cachedKVState: [KVCache]?
             var cachedPromptRemainder: [Int]?
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
-            if let promptCache {
-                let (cached, remainder) = promptCache.fetchNearestCache(
-                    model: configuration.name, tokens: inputTokens)
-                cachedKVState = cached
-                cachedPromptRemainder = cached == nil ? nil : remainder
+            var fetchResult: LRUPromptCache.FetchResult?
+            if let promptCache,
+                LRUPromptCache.canUsePromptCache(
+                    input: lmInput,
+                    parameters: parameters,
+                    model: resolvedModel
+                )
+            {
+                let result = promptCache.fetchNearestCacheResult(
+                    model: configuration.name,
+                    tokens: inputTokens,
+                    salt: promptCacheSalt
+                )
+                fetchResult = result
+                cachedKVState = result.cache
+                cachedPromptRemainder = result.cache == nil ? nil : result.remainder
             }
+            Self.logPromptCacheMetrics(
+                logicalPromptTokens: inputTokens.count,
+                fetchResult: fetchResult,
+                salt: promptCacheSalt
+            )
 
             return try await scheduler.submit(
                 input: lmInput,
@@ -255,6 +272,7 @@ public final class ModelContainer: Sendable {
                 cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -295,7 +313,8 @@ public final class ModelContainer: Sendable {
                 let stream = try await generate(
                     input: input.consume(),
                     parameters: request.parameters,
-                    wiredMemoryTicket: request.wiredMemoryTicket
+                    wiredMemoryTicket: request.wiredMemoryTicket,
+                    promptCacheSalt: request.promptCacheSalt
                 )
                 streams.append(stream)
             }
@@ -314,6 +333,7 @@ public final class ModelContainer: Sendable {
         let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
         let schedulerRequests = makeSchedulerRequests(
             from: requests,
+            model: resolvedModel,
             tokenizer: resolvedTokenizer,
             configuration: configuration
         )
@@ -360,7 +380,8 @@ public final class ModelContainer: Sendable {
         input: consuming sending LMInput,
         parameters: GenerateParameters,
         includeStopToken: Bool = false,
-        wiredMemoryTicket: WiredMemoryTicket? = nil
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        promptCacheSalt: UInt64 = 0
     ) async throws -> AsyncStream<TokenGeneration> {
         let input = SendableBox(input)
 
@@ -381,12 +402,28 @@ public final class ModelContainer: Sendable {
             var cachedKVState: [KVCache]?
             var cachedPromptRemainder: [Int]?
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
-            if let promptCache {
-                let (cached, remainder) = promptCache.fetchNearestCache(
-                    model: configuration.name, tokens: inputTokens)
-                cachedKVState = cached
-                cachedPromptRemainder = cached == nil ? nil : remainder
+            var fetchResult: LRUPromptCache.FetchResult?
+            if let promptCache,
+                LRUPromptCache.canUsePromptCache(
+                    input: lmInput,
+                    parameters: parameters,
+                    model: resolvedModel
+                )
+            {
+                let result = promptCache.fetchNearestCacheResult(
+                    model: configuration.name,
+                    tokens: inputTokens,
+                    salt: promptCacheSalt
+                )
+                fetchResult = result
+                cachedKVState = result.cache
+                cachedPromptRemainder = result.cache == nil ? nil : result.remainder
             }
+            Self.logPromptCacheMetrics(
+                logicalPromptTokens: inputTokens.count,
+                fetchResult: fetchResult,
+                salt: promptCacheSalt
+            )
 
             return try await scheduler.submitTokens(
                 input: lmInput,
@@ -400,6 +437,7 @@ public final class ModelContainer: Sendable {
                 cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -436,7 +474,8 @@ public final class ModelContainer: Sendable {
                     input: input.consume(),
                     parameters: request.parameters,
                     includeStopToken: includeStopToken,
-                    wiredMemoryTicket: request.wiredMemoryTicket
+                    wiredMemoryTicket: request.wiredMemoryTicket,
+                    promptCacheSalt: request.promptCacheSalt
                 )
                 streams.append(stream)
             }
@@ -455,6 +494,7 @@ public final class ModelContainer: Sendable {
         let resolvedTokenizer = tokenizerBox.consume() as! Tokenizer
         let schedulerRequests = makeSchedulerRequests(
             from: requests,
+            model: resolvedModel,
             tokenizer: resolvedTokenizer,
             configuration: configuration
         )
@@ -487,6 +527,7 @@ public final class ModelContainer: Sendable {
 
     private func makeSchedulerRequests(
         from requests: [GenerationRequest],
+        model: any LanguageModel,
         tokenizer: Tokenizer,
         configuration: ModelConfiguration
     ) -> [SchedulerRequest] {
@@ -494,14 +535,28 @@ public final class ModelContainer: Sendable {
             let inputTokens = request.input.text.tokens.asArray(Int.self)
             var cachedKVState: [KVCache]?
             var cachedPromptRemainder: [Int]?
-            if let promptCache {
-                let (cached, remainder) = promptCache.fetchNearestCache(
-                    model: configuration.name,
-                    tokens: inputTokens
+            var fetchResult: LRUPromptCache.FetchResult?
+            if let promptCache,
+                LRUPromptCache.canUsePromptCache(
+                    input: request.input,
+                    parameters: request.parameters,
+                    model: model
                 )
-                cachedKVState = cached
-                cachedPromptRemainder = cached == nil ? nil : remainder
+            {
+                let result = promptCache.fetchNearestCacheResult(
+                    model: configuration.name,
+                    tokens: inputTokens,
+                    salt: request.promptCacheSalt
+                )
+                fetchResult = result
+                cachedKVState = result.cache
+                cachedPromptRemainder = result.cache == nil ? nil : result.remainder
             }
+            Self.logPromptCacheMetrics(
+                logicalPromptTokens: inputTokens.count,
+                fetchResult: fetchResult,
+                salt: request.promptCacheSalt
+            )
 
             return SchedulerRequest(
                 input: request.input,
@@ -513,6 +568,7 @@ public final class ModelContainer: Sendable {
                 cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: configuration.name,
+                promptCacheSalt: request.promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: request.wiredMemoryTicket
             )
@@ -540,6 +596,35 @@ public final class ModelContainer: Sendable {
     public func encode(_ text: String) async -> [Int] {
         let tokenizer = await self.tokenizer
         return tokenizer.encode(text: text)
+    }
+
+    private static func logPromptCacheMetrics(
+        logicalPromptTokens: Int,
+        fetchResult: LRUPromptCache.FetchResult?,
+        salt: UInt64
+    ) {
+        #if DEBUG
+            let physicalPrefillTokens: Int
+            let hitKind: LRUPromptCache.HitKind
+            if let fetchResult, fetchResult.cache != nil {
+                hitKind = fetchResult.hitKind
+                physicalPrefillTokens =
+                    fetchResult.remainder.isEmpty
+                    ? min(logicalPromptTokens, 1)
+                    : fetchResult.remainder.count
+            } else {
+                hitKind = .none
+                physicalPrefillTokens = logicalPromptTokens
+            }
+            let reusedTokens = max(0, logicalPromptTokens - physicalPrefillTokens)
+            print(
+                "[PERF] cache.logicalPromptTokens=\(logicalPromptTokens) "
+                    + "physicalPrefillTokens=\(physicalPrefillTokens) "
+                    + "reusedTokens=\(reusedTokens) "
+                    + "cacheHitKind=\(hitKind.rawValue) "
+                    + "cacheSalt=\(salt)"
+            )
+        #endif
     }
 
     /// Apply chat template to messages and return token IDs.

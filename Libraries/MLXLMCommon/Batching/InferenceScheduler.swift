@@ -279,6 +279,9 @@ public actor InferenceScheduler {
         /// Model name for prompt cache operations.
         let promptCacheModelName: String?
 
+        /// Salt for prompt cache operations.
+        let promptCacheSalt: UInt64
+
         /// Optional active ticket for this request.
         let wiredMemoryTicket: WiredMemoryTicket?
 
@@ -326,6 +329,9 @@ public actor InferenceScheduler {
 
         /// Model name for prompt cache operations.
         let promptCacheModelName: String?
+
+        /// Mapping from UID -> salt for prompt cache write-back.
+        var promptCacheSalts: [Int: UInt64]
 
         /// Mapping from UID -> active wired-memory ticket.
         var wiredMemoryTickets: [Int: WiredMemoryTicket]
@@ -391,6 +397,7 @@ public actor InferenceScheduler {
         cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
@@ -414,6 +421,7 @@ public actor InferenceScheduler {
             cachedPromptRemainder: cachedPromptRemainder,
             promptCache: promptCache,
             promptCacheModelName: promptCacheModelName,
+            promptCacheSalt: promptCacheSalt,
             inputTokens: inputTokens,
             wiredMemoryTicket: wiredMemoryTicket
         )
@@ -455,6 +463,7 @@ public actor InferenceScheduler {
         cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<TokenGeneration> {
@@ -476,6 +485,7 @@ public actor InferenceScheduler {
             cachedPromptRemainder: cachedPromptRemainder,
             promptCache: promptCache,
             promptCacheModelName: promptCacheModelName,
+            promptCacheSalt: promptCacheSalt,
             inputTokens: inputTokens,
             wiredMemoryTicket: wiredMemoryTicket
         )
@@ -560,9 +570,28 @@ public actor InferenceScheduler {
         cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws {
+        var cachedKVState = cachedKVState
+        var cachedPromptRemainder = cachedPromptRemainder
+        var promptCache = promptCache
+        var promptCacheModelName = promptCacheModelName
+        var inputTokens = inputTokens
+
+        if !LRUPromptCache.canUsePromptCache(
+            input: input,
+            parameters: parameters,
+            model: model
+        ) {
+            cachedKVState = nil
+            cachedPromptRemainder = nil
+            promptCache = nil
+            promptCacheModelName = nil
+            inputTokens = nil
+        }
+
         // Check if this request is batch-compatible
         let compatible = Self.isBatchCompatible(
             input: input,
@@ -585,6 +614,7 @@ public actor InferenceScheduler {
                 configuration: configuration,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -605,6 +635,7 @@ public actor InferenceScheduler {
                 configuration: configuration,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -645,6 +676,7 @@ public actor InferenceScheduler {
                             configuration: configuration,
                             promptCache: promptCache,
                             promptCacheModelName: promptCacheModelName,
+                            promptCacheSalt: promptCacheSalt,
                             inputTokens: inputTokens,
                             wiredMemoryTicket: wiredMemoryTicket,
                             ticketAlreadyStarted: true
@@ -663,6 +695,7 @@ public actor InferenceScheduler {
                         cachedPromptRemainder: cachedPromptRemainder,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
+                        promptCacheSalt: promptCacheSalt,
                         inputTokens: inputTokens,
                         newRequestWiredMemoryTicket: wiredMemoryTicket,
                         newRequestTicketAlreadyStarted: true
@@ -681,6 +714,7 @@ public actor InferenceScheduler {
                         configuration: configuration,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
+                        promptCacheSalt: promptCacheSalt,
                         inputTokens: inputTokens,
                         wiredMemoryTicket: wiredMemoryTicket,
                         ticketAlreadyStarted: true
@@ -699,6 +733,7 @@ public actor InferenceScheduler {
                         configuration: configuration,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
+                        promptCacheSalt: promptCacheSalt,
                         inputTokens: inputTokens,
                         wiredMemoryTicket: wiredMemoryTicket,
                         ticketAlreadyStarted: true
@@ -723,6 +758,7 @@ public actor InferenceScheduler {
                     configuration: configuration,
                     promptCache: promptCache,
                     promptCacheModelName: promptCacheModelName,
+                    promptCacheSalt: promptCacheSalt,
                     inputTokens: inputTokens,
                     wiredMemoryTicket: wiredMemoryTicket
                 )
@@ -740,6 +776,7 @@ public actor InferenceScheduler {
                 cachedPromptRemainder: cachedPromptRemainder,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens
             )
 
@@ -757,6 +794,7 @@ public actor InferenceScheduler {
                 configuration: configuration,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -775,6 +813,7 @@ public actor InferenceScheduler {
                 configuration: configuration,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: wiredMemoryTicket
             )
@@ -797,6 +836,7 @@ public actor InferenceScheduler {
                         configuration: configuration,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
+                        promptCacheSalt: promptCacheSalt,
                         inputTokens: inputTokens,
                         wiredMemoryTicket: wiredMemoryTicket,
                         ticketAlreadyStarted: ticketAlreadyStarted
@@ -819,6 +859,7 @@ public actor InferenceScheduler {
                         configuration: configuration,
                         promptCache: promptCache,
                         promptCacheModelName: promptCacheModelName,
+                        promptCacheSalt: promptCacheSalt,
                         inputTokens: inputTokens,
                         wiredMemoryTicket: wiredMemoryTicket,
                         ticketAlreadyStarted: ticketAlreadyStarted
@@ -833,6 +874,7 @@ public actor InferenceScheduler {
                     parameters: parameters,
                     tokenizer: tokenizer,
                     cachedKVState: cachedKVState,
+                    promptCacheSalt: promptCacheSalt,
                     wiredMemoryTicket: wiredMemoryTicket
                 )
 
@@ -849,6 +891,7 @@ public actor InferenceScheduler {
                     configuration: configuration,
                     promptCache: promptCache,
                     promptCacheModelName: promptCacheModelName,
+                    promptCacheSalt: promptCacheSalt,
                     inputTokens: inputTokens,
                     wiredMemoryTicket: wiredMemoryTicket,
                     ticketAlreadyStarted: ticketAlreadyStarted
@@ -867,6 +910,7 @@ public actor InferenceScheduler {
                     configuration: configuration,
                     promptCache: promptCache,
                     promptCacheModelName: promptCacheModelName,
+                    promptCacheSalt: promptCacheSalt,
                     inputTokens: inputTokens,
                     wiredMemoryTicket: wiredMemoryTicket,
                     ticketAlreadyStarted: ticketAlreadyStarted
@@ -882,6 +926,22 @@ public actor InferenceScheduler {
     ) async throws {
         guard submissions.count >= 2 else {
             throw BatchedGenerationError.batchTooSmall
+        }
+
+        let submissions = submissions.map { submission -> BatchSubmission in
+            var request = submission.request
+            if !LRUPromptCache.canUsePromptCache(
+                input: request.input,
+                parameters: request.parameters,
+                model: model
+            ) {
+                request.cachedKVState = nil
+                request.cachedPromptRemainder = nil
+                request.promptCache = nil
+                request.promptCacheModelName = nil
+                request.inputTokens = nil
+            }
+            return BatchSubmission(handler: submission.handler, request: request)
         }
 
         let incompatibleIndices = submissions.enumerated().compactMap { index, submission in
@@ -1069,11 +1129,12 @@ public actor InferenceScheduler {
         guard parameters.kvBits == nil,
             input.image == nil,
             input.video == nil,
+            model.defaultPromptCachePolicy == .exact,
             let cachedKVState,
             let cachedPromptRemainder,
             !cachedKVState.isEmpty,
-            MLXLMCommon.isBatchCompatible(cachedKVState),
-            MLXLMCommon.isBatchCompatible(model.newCache(parameters: parameters))
+            LRUPromptCache.isCacheCompatible(cachedKVState),
+            LRUPromptCache.isCacheCompatible(model.newCache(parameters: parameters))
         else {
             return (input, cache, nil)
         }
@@ -1118,11 +1179,16 @@ public actor InferenceScheduler {
     private static func writePromptCache(
         promptCache: LRUPromptCache?,
         modelName: String?,
+        salt: UInt64,
         inputTokens: [Int]?,
         cacheTokenIds: [Int],
         cache: [KVCache]
     ) {
         guard let promptCache, let modelName, let inputTokens, !inputTokens.isEmpty else {
+            return
+        }
+
+        guard LRUPromptCache.isCacheCompatible(cache) else {
             return
         }
 
@@ -1134,7 +1200,8 @@ public actor InferenceScheduler {
         promptCache.insertCache(
             model: modelName,
             tokens: fullTokenSequence,
-            promptCache: cache
+            promptCache: cache,
+            salt: salt
         )
     }
 
@@ -1153,6 +1220,7 @@ public actor InferenceScheduler {
         configuration: ModelConfiguration,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         ticketAlreadyStarted: Bool = false
@@ -1320,6 +1388,7 @@ public actor InferenceScheduler {
             Self.writePromptCache(
                 promptCache: promptCache,
                 modelName: promptCacheModelName,
+                salt: promptCacheSalt,
                 inputTokens: inputTokens,
                 cacheTokenIds: cacheTokenIds,
                 cache: iter.cache
@@ -1357,6 +1426,7 @@ public actor InferenceScheduler {
                 inputTokens: inputTokens,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 wiredMemoryTicket: wiredMemoryTicket,
                 cacheMaxKVSize: parameters.maxKVSize
             ))
@@ -1375,6 +1445,7 @@ public actor InferenceScheduler {
         configuration: ModelConfiguration,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         ticketAlreadyStarted: Bool = false
@@ -1487,6 +1558,7 @@ public actor InferenceScheduler {
             Self.writePromptCache(
                 promptCache: promptCache,
                 modelName: promptCacheModelName,
+                salt: promptCacheSalt,
                 inputTokens: inputTokens,
                 cacheTokenIds: cacheTokenIds,
                 cache: iter.cache
@@ -1570,6 +1642,7 @@ public actor InferenceScheduler {
             stopTokenIDs: stopTokenIDs,
             promptCache: firstRequest.promptCache,
             promptCacheModelName: firstRequest.promptCacheModelName,
+            promptCacheSalts: [:],
             wiredMemoryTickets: [:],
             cacheMaxKVSize: batchCacheMaxKVSize
         )
@@ -1620,6 +1693,7 @@ public actor InferenceScheduler {
             batchedState.promptTokenCounts[uid] = request.input.text.tokens.size
             batchedState.submitTimes[uid] = now
             batchedState.inputTokens[uid] = request.inputTokens ?? promptTokens
+            batchedState.promptCacheSalts[uid] = request.promptCacheSalt
             if let wiredMemoryTicket = request.wiredMemoryTicket {
                 batchedState.wiredMemoryTickets[uid] = wiredMemoryTicket
             }
@@ -1722,11 +1796,12 @@ public actor InferenceScheduler {
                             let inputToks = await self?.getInputTokens(uid: uid),
                             !inputToks.isEmpty
                         {
-                            let (pCache, modelName) =
-                                await self?.getPromptCacheInfo() ?? (nil, nil)
+                            let (pCache, modelName, salt) =
+                                await self?.getPromptCacheInfo(uid: uid) ?? (nil, nil, 0)
                             Self.writePromptCache(
                                 promptCache: pCache,
                                 modelName: modelName,
+                                salt: salt,
                                 inputTokens: inputToks,
                                 cacheTokenIds: cacheTokenIds[uid] ?? [],
                                 cache: finalCache
@@ -1773,6 +1848,7 @@ public actor InferenceScheduler {
         cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         newRequestWiredMemoryTicket: WiredMemoryTicket? = nil,
         newRequestTicketAlreadyStarted: Bool = false
@@ -1808,6 +1884,7 @@ public actor InferenceScheduler {
                 configuration: configuration,
                 promptCache: promptCache,
                 promptCacheModelName: promptCacheModelName,
+                promptCacheSalt: promptCacheSalt,
                 inputTokens: inputTokens,
                 wiredMemoryTicket: newRequestWiredMemoryTicket,
                 ticketAlreadyStarted: newRequestTicketAlreadyStarted
@@ -2063,11 +2140,12 @@ public actor InferenceScheduler {
                             let inputToks = await self?.getInputTokens(uid: uid),
                             !inputToks.isEmpty
                         {
-                            let (pCache, modelName) =
-                                await self?.getPromptCacheInfo() ?? (nil, nil)
+                            let (pCache, modelName, salt) =
+                                await self?.getPromptCacheInfo(uid: uid) ?? (nil, nil, 0)
                             Self.writePromptCache(
                                 promptCache: pCache,
                                 modelName: modelName,
+                                salt: salt,
                                 inputTokens: inputToks,
                                 cacheTokenIds: cacheTokenIds[uid] ?? [],
                                 cache: finalCache
@@ -2105,6 +2183,10 @@ public actor InferenceScheduler {
         if let secondTokens = inputTokens {
             batchInputTokens[secondUID] = secondTokens
         }
+        let promptCacheSalts = [
+            firstUID: existingSingle.promptCacheSalt,
+            secondUID: promptCacheSalt,
+        ]
 
         state = .batched(
             BatchedState(
@@ -2123,6 +2205,7 @@ public actor InferenceScheduler {
                 stopTokenIDs: stopTokenIDs,
                 promptCache: promptCache ?? existingSingle.promptCache,
                 promptCacheModelName: promptCacheModelName ?? existingSingle.promptCacheModelName,
+                promptCacheSalts: promptCacheSalts,
                 wiredMemoryTickets: [
                     firstUID: existingSingle.wiredMemoryTicket,
                     secondUID: newRequestWiredMemoryTicket,
@@ -2141,6 +2224,7 @@ public actor InferenceScheduler {
         parameters: GenerateParameters,
         tokenizer: Tokenizer,
         cachedKVState: [KVCache]? = nil,
+        promptCacheSalt: UInt64 = 0,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) throws {
         let promptTokens = input.text.tokens.asArray(Int.self)
@@ -2151,6 +2235,7 @@ public actor InferenceScheduler {
             tokenizer: tokenizer,
             configuration: batchedState.configuration,
             cachedKVState: cachedKVState,
+            promptCacheSalt: promptCacheSalt,
             inputTokens: promptTokens,
             wiredMemoryTicket: wiredMemoryTicket
         )
@@ -2216,6 +2301,7 @@ public actor InferenceScheduler {
             batchedState.promptTokenCounts.removeValue(forKey: uid)
             batchedState.submitTimes.removeValue(forKey: uid)
             batchedState.inputTokens.removeValue(forKey: uid)
+            batchedState.promptCacheSalts.removeValue(forKey: uid)
             state = .batched(batchedState)
         }
     }
@@ -2244,12 +2330,16 @@ public actor InferenceScheduler {
         return nil
     }
 
-    /// Get the prompt cache and model name from the batched state (for write-back).
-    private func getPromptCacheInfo() -> (LRUPromptCache?, String?) {
+    /// Get prompt cache write-back info from the batched state.
+    private func getPromptCacheInfo(uid: Int) -> (LRUPromptCache?, String?, UInt64) {
         if case .batched(let batchedState) = state {
-            return (batchedState.promptCache, batchedState.promptCacheModelName)
+            return (
+                batchedState.promptCache,
+                batchedState.promptCacheModelName,
+                batchedState.promptCacheSalts[uid] ?? 0
+            )
         }
-        return (nil, nil)
+        return (nil, nil, 0)
     }
 
     /// Finish all remaining handlers (e.g., on batch loop exit).

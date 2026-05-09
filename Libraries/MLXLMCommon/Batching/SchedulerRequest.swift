@@ -12,6 +12,7 @@ struct SchedulerRequest: @unchecked Sendable {
     var cachedPromptRemainder: [Int]?
     var promptCache: LRUPromptCache?
     var promptCacheModelName: String?
+    var promptCacheSalt: UInt64
     var inputTokens: [Int]?
     var wiredMemoryTicket: WiredMemoryTicket?
 
@@ -25,6 +26,7 @@ struct SchedulerRequest: @unchecked Sendable {
         cachedPromptRemainder: [Int]? = nil,
         promptCache: LRUPromptCache? = nil,
         promptCacheModelName: String? = nil,
+        promptCacheSalt: UInt64 = 0,
         inputTokens: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) {
@@ -37,6 +39,7 @@ struct SchedulerRequest: @unchecked Sendable {
         self.cachedPromptRemainder = cachedPromptRemainder
         self.promptCache = promptCache
         self.promptCacheModelName = promptCacheModelName
+        self.promptCacheSalt = promptCacheSalt
         self.inputTokens = inputTokens
         self.wiredMemoryTicket = wiredMemoryTicket
     }

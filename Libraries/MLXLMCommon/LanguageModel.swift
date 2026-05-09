@@ -4,6 +4,15 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Prompt-cache strategy a model supports.
+public enum PromptCachePolicy: Sendable, Equatable {
+    /// Reuse exact or trie-prefix KV snapshots.
+    case exact
+
+    /// Do not fetch or write prompt-cache entries for this model.
+    case disabled
+}
+
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
     /// Optionally preprocess the weights and modify / remove values as needed.
@@ -194,6 +203,9 @@ public protocol LanguageModel: BaseLanguageModel {
     /// create a new array of ``KVCache``: automatic implementation if self
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
+
+    /// Default prompt-cache strategy for this model.
+    var defaultPromptCachePolicy: PromptCachePolicy { get }
 }
 
 extension LanguageModel {
@@ -207,6 +219,8 @@ extension LanguageModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
     }
+
+    public var defaultPromptCachePolicy: PromptCachePolicy { .exact }
 }
 
 /// Optional protocol that can be implemented by ``LanguageModel`` and will
