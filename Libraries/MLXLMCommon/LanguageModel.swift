@@ -11,6 +11,8 @@ public enum PromptCachePolicy: Sendable, Equatable {
 
     /// Do not fetch or write prompt-cache entries for this model.
     case disabled
+
+    // TODO: add .block when BlockPromptCache lands.
 }
 
 /// Abstract form of a model that processes language.

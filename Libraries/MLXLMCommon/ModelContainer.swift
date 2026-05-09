@@ -610,6 +610,8 @@ public final class ModelContainer: Sendable {
                 hitKind = fetchResult.hitKind
                 physicalPrefillTokens =
                     fetchResult.remainder.isEmpty
+                    // Exact hits replay the final cached token to regenerate logits;
+                    // the clamp keeps empty-prompt metrics well-defined.
                     ? min(logicalPromptTokens, 1)
                     : fetchResult.remainder.count
             } else {

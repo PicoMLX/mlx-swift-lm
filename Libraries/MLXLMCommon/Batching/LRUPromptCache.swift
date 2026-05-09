@@ -2,6 +2,7 @@
 
 import Foundation
 import Dispatch
+import CryptoKit
 import MLX
 
 // MARK: - LRUPromptCache
@@ -285,13 +286,26 @@ public final class LRUPromptCache: @unchecked Sendable {
         )
 
         let snapshots = diskSnapshots()
+        #if DEBUG
+            let skipped = snapshots.filter { !Self.isDiskPersistable($0.promptCache) }.count
+            if skipped > 0 {
+                print("[PromptCache] skipping disk persistence for \(skipped) non-KVCacheSimple leaves")
+            }
+        #endif
+
         for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
             let baseURL = directory.appendingPathComponent(snapshot.fileStem)
             let tensorURL = baseURL.appendingPathExtension("safetensors")
             let sidecarURL = baseURL.appendingPathExtension("json")
+            let tempTensorURL = directory.appendingPathComponent("\(snapshot.fileStem).\(UUID().uuidString).tmp.safetensors")
+            let tempSidecarURL = directory.appendingPathComponent("\(snapshot.fileStem).\(UUID().uuidString).tmp.json")
+            defer {
+                try? FileManager.default.removeItem(at: tempTensorURL)
+                try? FileManager.default.removeItem(at: tempSidecarURL)
+            }
 
             try savePromptCache(
-                url: tensorURL,
+                url: tempTensorURL,
                 cache: snapshot.promptCache,
                 metadata: [
                     "formatVersion": String(Self.diskFormatVersion),
@@ -312,7 +326,15 @@ public final class LRUPromptCache: @unchecked Sendable {
                 lastUsed: snapshot.lastUsed
             )
             let data = try JSONEncoder().encode(sidecar)
-            try data.write(to: sidecarURL, options: .atomic)
+            try data.write(to: tempSidecarURL, options: .atomic)
+
+            try? FileManager.default.removeItem(at: tensorURL)
+            try FileManager.default.moveItem(at: tempTensorURL, to: tensorURL)
+
+            // The sidecar is the discoverable commit record. Moving it last makes
+            // interrupted saves load as cache misses instead of half-written entries.
+            try? FileManager.default.removeItem(at: sidecarURL)
+            try FileManager.default.moveItem(at: tempSidecarURL, to: sidecarURL)
         }
 
         if let maxDiskBytes {
@@ -474,25 +496,23 @@ public final class LRUPromptCache: @unchecked Sendable {
     }
 
     private static func tokenHashHex(_ tokens: [Int]) -> String {
-        var hash: UInt64 = 0xcbf29ce484222325
+        var data = Data()
+        data.reserveCapacity(tokens.count * MemoryLayout<Int64>.size)
         for token in tokens {
-            var value = UInt64(bitPattern: Int64(token))
-            for _ in 0 ..< 8 {
-                hash ^= value & 0xff
-                hash &*= 0x100000001b3
-                value >>= 8
+            var value = Int64(token).littleEndian
+            withUnsafeBytes(of: &value) { bytes in
+                data.append(contentsOf: bytes)
             }
         }
-        return String(format: "%016llx", hash)
+        return sha256Hex(data)
     }
 
     private static func stringHashHex(_ string: String) -> String {
-        var hash: UInt64 = 0xcbf29ce484222325
-        for byte in string.utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 0x100000001b3
-        }
-        return String(format: "%016llx", hash)
+        sha256Hex(Data(string.utf8))
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func enforceDiskBudget(directory: URL, maxDiskBytes: Int) throws {
