@@ -7,15 +7,18 @@ public struct GenerationRequest {
     public var input: LMInput
     public var parameters: GenerateParameters
     public var wiredMemoryTicket: WiredMemoryTicket?
+    public var promptCacheSalt: UInt64
 
     public init(
         input: LMInput,
         parameters: GenerateParameters = .init(),
-        wiredMemoryTicket: WiredMemoryTicket? = nil
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        promptCacheSalt: UInt64 = 0
     ) {
         self.input = input
         self.parameters = parameters
         self.wiredMemoryTicket = wiredMemoryTicket
+        self.promptCacheSalt = promptCacheSalt
     }
 }
 

@@ -22,45 +22,68 @@ public final class LRUPromptCache: @unchecked Sendable {
 
     // MARK: - Types
 
+    public enum HitKind: String, Sendable, Equatable {
+        case none
+        case exact
+        case shorter
+        case longer
+    }
+
+    public struct FetchResult {
+        public let cache: [KVCache]?
+        public let remainder: [Int]
+        public let hitKind: HitKind
+        public let matchedTokenCount: Int
+
+        public var reusedTokenCount: Int { matchedTokenCount }
+    }
+
+    private struct RootKey: Hashable {
+        let model: String
+        let salt: UInt64
+    }
+
     /// A single entry stored at a trie leaf.
-    final class CacheEntry {
+    private final class CacheEntry {
         let promptCache: [KVCache]
         let nbytes: Int
+        var lastUsed: TimeInterval
 
-        init(promptCache: [KVCache], nbytes: Int) {
+        init(promptCache: [KVCache], nbytes: Int, lastUsed: TimeInterval = Date().timeIntervalSince1970) {
             self.promptCache = promptCache
             self.nbytes = nbytes
+            self.lastUsed = lastUsed
         }
     }
 
     /// A node in the trie. Children are keyed by token ID.
-    final class TrieNode {
+    private final class TrieNode {
         var children: [Int32: TrieNode] = [:]
         var cache: CacheEntry?
     }
 
     /// LRU order tracking with support for checkpoint vs regular entries.
-    final class CacheOrder {
+    private final class CacheOrder {
         /// Regular LRU entries (most-recently-used at the back).
-        private var lru: [(model: String, tokens: [Int])] = []
+        private var lru: [(key: RootKey, tokens: [Int])] = []
         /// Checkpoint LRU entries (most-recently-used at the back).
-        private var lruCheckpoints: [(model: String, tokens: [Int])] = []
+        private var lruCheckpoints: [(key: RootKey, tokens: [Int])] = []
 
         var count: Int { lru.count + lruCheckpoints.count }
 
-        func push(model: String, tokens: [Int], checkpoint: Bool = false) {
+        func push(key: RootKey, tokens: [Int], checkpoint: Bool = false) {
             if checkpoint {
-                lruCheckpoints.append((model, tokens))
+                lruCheckpoints.append((key, tokens))
             } else {
-                lru.append((model, tokens))
+                lru.append((key, tokens))
             }
         }
 
-        func remove(model: String, tokens: [Int]) {
-            if let idx = lru.firstIndex(where: { $0.model == model && $0.tokens == tokens }) {
+        func remove(key: RootKey, tokens: [Int]) {
+            if let idx = lru.firstIndex(where: { $0.key == key && $0.tokens == tokens }) {
                 lru.remove(at: idx)
             } else if let idx = lruCheckpoints.firstIndex(where: {
-                $0.model == model && $0.tokens == tokens
+                $0.key == key && $0.tokens == tokens
             }) {
                 lruCheckpoints.remove(at: idx)
             }
@@ -68,7 +91,7 @@ public final class LRUPromptCache: @unchecked Sendable {
 
         /// Pop the least-recently-used entry. Pops from the longer list first
         /// (matching the Python behavior which pops from whichever deque is longer).
-        func pop() -> (model: String, tokens: [Int])? {
+        func pop() -> (key: RootKey, tokens: [Int])? {
             if lru.count >= lruCheckpoints.count {
                 return lru.isEmpty ? nil : lru.removeFirst()
             } else {
@@ -79,7 +102,7 @@ public final class LRUPromptCache: @unchecked Sendable {
 
     /// Result of a trie search.
     private struct SearchResult {
-        let model: String
+        let key: RootKey
         /// Non-nil if an exact match was found.
         let exact: [Int]?
         /// Non-nil if a shorter prefix with a cached entry was found.
@@ -99,7 +122,7 @@ public final class LRUPromptCache: @unchecked Sendable {
     public let maxBytes: Int
 
     /// Root trie nodes keyed by model identifier.
-    private var cache: [String: TrieNode] = [:]
+    private var cache: [RootKey: TrieNode] = [:]
 
     /// LRU order tracker.
     private let lru = CacheOrder()
@@ -154,10 +177,23 @@ public final class LRUPromptCache: @unchecked Sendable {
     ///   - tokens: The token sequence to look up.
     /// - Returns: A tuple of (cache, remainderTokens). Cache is nil if no match found;
     ///   remainder is the full token array if no match.
-    public func fetchNearestCache(model: String, tokens: [Int]) -> ([KVCache]?, [Int]) {
+    public func fetchNearestCache(
+        model: String,
+        tokens: [Int],
+        salt: UInt64 = 0
+    ) -> ([KVCache]?, [Int]) {
+        let result = fetchNearestCacheResult(model: model, tokens: tokens, salt: salt)
+        return (result.cache, result.remainder)
+    }
+
+    public func fetchNearestCacheResult(
+        model: String,
+        tokens: [Int],
+        salt: UInt64 = 0
+    ) -> FetchResult {
         lock.lock()
         defer { lock.unlock() }
-        return _fetchNearestCache(model: model, tokens: tokens)
+        return _fetchNearestCache(key: RootKey(model: model, salt: salt), tokens: tokens)
     }
 
     /// Insert a KV cache for the given token sequence.
@@ -172,11 +208,24 @@ public final class LRUPromptCache: @unchecked Sendable {
     ///   - promptCache: The KV cache layers to store.
     ///   - checkpoint: Whether this is a checkpoint entry (affects eviction priority).
     public func insertCache(
-        model: String, tokens: [Int], promptCache: [KVCache], checkpoint: Bool = false
+        model: String,
+        tokens: [Int],
+        promptCache: [KVCache],
+        checkpoint: Bool = false,
+        salt: UInt64 = 0
     ) {
+        guard !tokens.isEmpty, Self.isCacheCompatible(promptCache) else { return }
+        let snapshot = Self.materializedCopy(promptCache, tokenCount: tokens.count)
+        guard !snapshot.isEmpty else { return }
+
         lock.lock()
         defer { lock.unlock() }
-        _insertCache(model: model, tokens: tokens, promptCache: promptCache, checkpoint: checkpoint)
+        _insertCache(
+            key: RootKey(model: model, salt: salt),
+            tokens: tokens,
+            promptCache: snapshot,
+            checkpoint: checkpoint
+        )
     }
 
     /// Evict entries until the cache is within the given limits.
@@ -193,21 +242,249 @@ public final class LRUPromptCache: @unchecked Sendable {
 
         while lru.count > seqLimit {
             guard let evicted = lru.pop() else { break }
-            _delete(model: evicted.model, tokens: evicted.tokens)
+            _delete(key: evicted.key, tokens: evicted.tokens)
         }
         while _nBytes > byteLimit {
             guard let evicted = lru.pop() else { break }
-            _delete(model: evicted.model, tokens: evicted.tokens)
+            _delete(key: evicted.key, tokens: evicted.tokens)
+        }
+    }
+
+    public static func isCacheCompatible(_ cache: [KVCache]) -> Bool {
+        !cache.isEmpty && cache.allSatisfy { $0 is KVCacheSimple || $0 is RotatingKVCache }
+    }
+
+    public func save(to directory: URL, maxDiskBytes: Int? = nil) async throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+
+        let snapshots = diskSnapshots()
+        for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
+            let baseURL = directory.appendingPathComponent(snapshot.fileStem)
+            let tensorURL = baseURL.appendingPathExtension("safetensors")
+            let sidecarURL = baseURL.appendingPathExtension("json")
+
+            try savePromptCache(
+                url: tensorURL,
+                cache: snapshot.promptCache,
+                metadata: [
+                    "formatVersion": String(Self.diskFormatVersion),
+                    "model": snapshot.key.model,
+                    "salt": String(snapshot.key.salt),
+                    "tokenHash": snapshot.tokenHash,
+                ]
+            )
+
+            let sidecar = DiskSidecar(
+                formatVersion: Self.diskFormatVersion,
+                model: snapshot.key.model,
+                salt: snapshot.key.salt,
+                tokens: snapshot.tokens,
+                tokenHash: snapshot.tokenHash,
+                tokenCount: snapshot.tokens.count,
+                byteCount: snapshot.nbytes,
+                lastUsed: snapshot.lastUsed
+            )
+            let data = try JSONEncoder().encode(sidecar)
+            try data.write(to: sidecarURL, options: .atomic)
+        }
+
+        if let maxDiskBytes {
+            try Self.enforceDiskBudget(directory: directory, maxDiskBytes: maxDiskBytes)
+        }
+    }
+
+    public func load(from directory: URL, allowedModels: Set<String>? = nil) async throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: directory.path) else { return }
+
+        let sidecarURLs = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { $0.pathExtension == "json" }
+
+        let decoder = JSONDecoder()
+        var decoded = [(DiskSidecar, URL)]()
+        for sidecarURL in sidecarURLs {
+            guard let data = try? Data(contentsOf: sidecarURL),
+                let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
+                sidecar.formatVersion == Self.diskFormatVersion,
+                sidecar.tokenCount == sidecar.tokens.count,
+                sidecar.tokenHash == Self.tokenHashHex(sidecar.tokens),
+                allowedModels?.contains(sidecar.model) ?? true
+            else {
+                continue
+            }
+            decoded.append((sidecar, sidecarURL))
+        }
+
+        decoded.sort { $0.0.lastUsed < $1.0.lastUsed }
+
+        for (sidecar, sidecarURL) in decoded {
+            let tensorURL = sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
+            guard fileManager.fileExists(atPath: tensorURL.path),
+                let (promptCache, metadata) = try? loadPromptCache(url: tensorURL),
+                metadata["formatVersion"] == String(Self.diskFormatVersion),
+                metadata["model"] == sidecar.model,
+                metadata["salt"] == String(sidecar.salt),
+                metadata["tokenHash"] == sidecar.tokenHash,
+                Self.isDiskPersistable(promptCache)
+            else {
+                continue
+            }
+
+            let entryBytes = Self.cacheByteCount(promptCache)
+            guard entryBytes <= maxBytes else { continue }
+
+            insertCache(
+                model: sidecar.model,
+                tokens: sidecar.tokens,
+                promptCache: promptCache,
+                salt: sidecar.salt
+            )
         }
     }
 
     // MARK: - Private Implementation
 
+    private static let diskFormatVersion = 1
+
+    private struct DiskSidecar: Codable {
+        let formatVersion: Int
+        let model: String
+        let salt: UInt64
+        let tokens: [Int]
+        let tokenHash: String
+        let tokenCount: Int
+        let byteCount: Int
+        let lastUsed: TimeInterval
+    }
+
+    private struct DiskSnapshot {
+        let key: RootKey
+        let tokens: [Int]
+        let promptCache: [KVCache]
+        let nbytes: Int
+        let lastUsed: TimeInterval
+
+        var tokenHash: String { LRUPromptCache.tokenHashHex(tokens) }
+
+        var fileStem: String {
+            "entry_\(LRUPromptCache.stringHashHex(key.model))_\(String(format: "%016llx", key.salt))_\(tokens.count)_\(tokenHash)"
+        }
+    }
+
+    private func diskSnapshots() -> [DiskSnapshot] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var snapshots = [DiskSnapshot]()
+        for (key, root) in cache {
+            collectDiskSnapshots(key: key, node: root, tokens: [], into: &snapshots)
+        }
+        return snapshots
+    }
+
+    private func collectDiskSnapshots(
+        key: RootKey,
+        node: TrieNode,
+        tokens: [Int],
+        into snapshots: inout [DiskSnapshot]
+    ) {
+        if let entry = node.cache {
+            snapshots.append(
+                DiskSnapshot(
+                    key: key,
+                    tokens: tokens,
+                    promptCache: entry.promptCache,
+                    nbytes: entry.nbytes,
+                    lastUsed: entry.lastUsed
+                )
+            )
+        }
+        for (token, child) in node.children {
+            collectDiskSnapshots(
+                key: key,
+                node: child,
+                tokens: tokens + [Int(token)],
+                into: &snapshots
+            )
+        }
+    }
+
+    private static func isDiskPersistable(_ cache: [KVCache]) -> Bool {
+        !cache.isEmpty && cache.allSatisfy { $0 is KVCacheSimple }
+    }
+
+    private static func cacheByteCount(_ cache: [KVCache]) -> Int {
+        cache.reduce(0) { total, layer in
+            total + layer.state.reduce(0) { $0 + $1.nbytes }
+        }
+    }
+
+    private static func tokenHashHex(_ tokens: [Int]) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for token in tokens {
+            var value = UInt64(bitPattern: Int64(token))
+            for _ in 0 ..< 8 {
+                hash ^= value & 0xff
+                hash &*= 0x100000001b3
+                value >>= 8
+            }
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    private static func stringHashHex(_ string: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    private static func enforceDiskBudget(directory: URL, maxDiskBytes: Int) throws {
+        let fileManager = FileManager.default
+        let sidecars = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { $0.pathExtension == "json" }
+
+        var entries = sidecars.map { sidecarURL -> (sidecar: URL, tensor: URL, lastUsed: TimeInterval, bytes: Int) in
+            let tensorURL = sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
+            let data = try? Data(contentsOf: sidecarURL)
+            let sidecar = data.flatMap { try? JSONDecoder().decode(DiskSidecar.self, from: $0) }
+            let bytes = fileSize(sidecarURL) + fileSize(tensorURL)
+            return (sidecarURL, tensorURL, sidecar?.lastUsed ?? 0, bytes)
+        }
+
+        var totalBytes = entries.reduce(0) { $0 + $1.bytes }
+        guard totalBytes > maxDiskBytes else { return }
+
+        entries.sort { $0.lastUsed < $1.lastUsed }
+        for entry in entries where totalBytes > maxDiskBytes {
+            try? fileManager.removeItem(at: entry.sidecar)
+            try? fileManager.removeItem(at: entry.tensor)
+            totalBytes -= entry.bytes
+        }
+    }
+
+    private static func fileSize(_ url: URL) -> Int {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    }
+
     /// Search the trie for the best match.
-    private func _search(model: String, tokens: [Int]) -> SearchResult {
-        guard let root = cache[model] else {
+    private func _search(key: RootKey, tokens: [Int]) -> SearchResult {
+        guard let root = cache[key] else {
             return SearchResult(
-                model: model, exact: nil, shorter: nil, longer: nil, commonPrefix: 0)
+                key: key, exact: nil, shorter: nil, longer: nil, commonPrefix: 0)
         }
 
         var current = root
@@ -225,7 +502,7 @@ public final class LRUPromptCache: @unchecked Sendable {
         // Exact match: the deepest cached node is at the last token
         if lastCacheIndex == tokens.count - 1 {
             return SearchResult(
-                model: model, exact: tokens, shorter: nil, longer: nil, commonPrefix: 0)
+                key: key, exact: tokens, shorter: nil, longer: nil, commonPrefix: 0)
         }
 
         // Shorter prefix
@@ -258,13 +535,13 @@ public final class LRUPromptCache: @unchecked Sendable {
         }
 
         return SearchResult(
-            model: model, exact: nil, shorter: shorter, longer: longer,
+            key: key, exact: nil, shorter: shorter, longer: longer,
             commonPrefix: commonPrefix)
     }
 
     /// Get the cache entry at the given path.
-    private func _get(model: String, tokens: [Int]) -> CacheEntry {
-        var current = cache[model]!
+    private func _get(key: RootKey, tokens: [Int]) -> CacheEntry {
+        var current = cache[key]!
         for tok in tokens {
             current = current.children[Int32(tok)]!
         }
@@ -272,8 +549,8 @@ public final class LRUPromptCache: @unchecked Sendable {
     }
 
     /// Delete a cache entry from the trie.
-    private func _delete(model: String, tokens: [Int]) {
-        guard let root = cache[model] else { return }
+    private func _delete(key: RootKey, tokens: [Int]) {
+        guard let root = cache[key] else { return }
 
         var path = [root]
         for tok in tokens {
@@ -298,7 +575,11 @@ public final class LRUPromptCache: @unchecked Sendable {
 
     /// Deep-copy a KV cache by reading and writing its state.
     private func _deepCopy(_ promptCache: [KVCache]) -> [KVCache] {
-        promptCache.map { original in
+        Self.materializedCopy(promptCache, tokenCount: nil)
+    }
+
+    private static func materializedCopy(_ promptCache: [KVCache], tokenCount: Int?) -> [KVCache] {
+        let copy = promptCache.map { original in
             var copy: KVCache
             if original is KVCacheSimple {
                 copy = KVCacheSimple()
@@ -308,7 +589,7 @@ public final class LRUPromptCache: @unchecked Sendable {
                 // Fallback: KVCacheSimple for unknown types
                 copy = KVCacheSimple()
             }
-            let originalState = original.state
+            let originalState = stateSnapshot(for: original, tokenCount: tokenCount)
             // Only restore state if the cache has data (non-empty state).
             // Empty state means keys/values are nil (e.g., mock model didn't
             // populate the cache), and setting empty state would crash.
@@ -318,62 +599,110 @@ public final class LRUPromptCache: @unchecked Sendable {
             copy.metaState = original.metaState
             return copy
         }
+        let arrays = copy.flatMap { $0.state }
+        if !arrays.isEmpty {
+            eval(arrays)
+        }
+        return copy
+    }
+
+    private static func stateSnapshot(for cache: KVCache, tokenCount: Int?) -> [MLXArray] {
+        cache.state.map { array in
+            var snapshot = array
+            if cache is KVCacheSimple,
+                let tokenCount,
+                array.ndim >= 3,
+                array.dim(2) > tokenCount
+            {
+                snapshot = array[.ellipsis, ..<tokenCount, 0...]
+            }
+            let copied = snapshot + MLXArray.zeros(snapshot.shape, dtype: snapshot.dtype)
+            return copied
+        }
     }
 
     /// Refresh LRU recency for the given entry (move to most-recently-used).
-    private func _touch(model: String, tokens: [Int]) {
-        lru.remove(model: model, tokens: tokens)
-        lru.push(model: model, tokens: tokens)
+    private func _touch(key: RootKey, tokens: [Int]) {
+        let entry = _get(key: key, tokens: tokens)
+        entry.lastUsed = Date().timeIntervalSince1970
+        lru.remove(key: key, tokens: tokens)
+        lru.push(key: key, tokens: tokens)
     }
 
     /// Internal fetch without locking.
-    private func _fetchNearestCache(model: String, tokens: [Int]) -> ([KVCache]?, [Int]) {
-        let result = _search(model: model, tokens: tokens)
+    private func _fetchNearestCache(key: RootKey, tokens: [Int]) -> FetchResult {
+        let result = _search(key: key, tokens: tokens)
 
         // Exact match
         if let exact = result.exact {
-            let entry = _get(model: result.model, tokens: exact)
-            _touch(model: result.model, tokens: exact)
-            return (_deepCopy(entry.promptCache), [])
+            let entry = _get(key: result.key, tokens: exact)
+            _touch(key: result.key, tokens: exact)
+            return FetchResult(
+                cache: _deepCopy(entry.promptCache),
+                remainder: [],
+                hitKind: .exact,
+                matchedTokenCount: tokens.count
+            )
         }
 
         let shortLength = result.shorter?.count ?? 0
 
         // Longer prefix: if the cached entry is longer than the query and trimmable
         if let longer = result.longer, result.commonPrefix > shortLength {
-            let entry = _get(model: result.model, tokens: longer)
+            let entry = _get(key: result.key, tokens: longer)
             if canTrimPromptCache(entry.promptCache) {
-                let copy = _deepCopy(entry.promptCache)
                 let prefix = min(tokens.count, result.commonPrefix)
                 let numToTrim = longer.count - prefix
-                trimPromptCache(copy, numTokens: numToTrim)
-                let remainder = prefix < tokens.count ? Array(tokens[prefix...]) : []
-                _touch(model: result.model, tokens: longer)
-                return (copy, remainder)
+                if Self.canSafelyTrim(entry.promptCache, numTokens: numToTrim) {
+                    let copy = _deepCopy(entry.promptCache)
+                    trimPromptCache(copy, numTokens: numToTrim)
+                    let remainder = prefix < tokens.count ? Array(tokens[prefix...]) : []
+                    _touch(key: result.key, tokens: longer)
+                    return FetchResult(
+                        cache: copy,
+                        remainder: remainder,
+                        hitKind: .longer,
+                        matchedTokenCount: prefix
+                    )
+                }
             }
         }
 
         // Shorter prefix
         if shortLength > 0 {
-            let entry = _get(model: result.model, tokens: result.shorter!)
-            _touch(model: result.model, tokens: result.shorter!)
-            return (_deepCopy(entry.promptCache), Array(tokens[shortLength...]))
+            let entry = _get(key: result.key, tokens: result.shorter!)
+            _touch(key: result.key, tokens: result.shorter!)
+            return FetchResult(
+                cache: _deepCopy(entry.promptCache),
+                remainder: Array(tokens[shortLength...]),
+                hitKind: .shorter,
+                matchedTokenCount: shortLength
+            )
         }
 
         // No match
-        return (nil, tokens)
+        return FetchResult(cache: nil, remainder: tokens, hitKind: .none, matchedTokenCount: 0)
+    }
+
+    private static func canSafelyTrim(_ cache: [KVCache], numTokens: Int) -> Bool {
+        guard numTokens > 0 else { return true }
+        let minCachedSeqLen = cache.map { layer -> Int in
+            guard let first = layer.state.first, first.ndim >= 3 else { return 0 }
+            return first.dim(2)
+        }.min() ?? 0
+        return numTokens < minCachedSeqLen
     }
 
     /// Internal insert without locking.
     private func _insertCache(
-        model: String, tokens: [Int], promptCache: [KVCache], checkpoint: Bool
+        key: RootKey, tokens: [Int], promptCache: [KVCache], checkpoint: Bool
     ) {
         let isTrimmable = canTrimPromptCache(promptCache)
 
-        if cache[model] == nil {
-            cache[model] = TrieNode()
+        if cache[key] == nil {
+            cache[key] = TrieNode()
         }
-        var current = cache[model]!
+        var current = cache[key]!
 
         for i in 0 ..< tokens.count {
             let tok = Int32(tokens[i])
@@ -385,33 +714,36 @@ public final class LRUPromptCache: @unchecked Sendable {
             if isTrimmable, current.cache != nil {
                 _nBytes -= current.cache!.nbytes
                 current.cache = nil
-                lru.remove(model: model, tokens: Array(tokens[..<i]))
+                lru.remove(key: key, tokens: Array(tokens[..<i]))
             }
             current = current.children[tok]!
         }
 
+        let cacheBytes = promptCache.reduce(0) { $0 + $1.state.reduce(0) { $0 + $1.nbytes } }
         if current.cache != nil {
             // Update existing entry: remove from LRU and reinsert
-            lru.remove(model: model, tokens: tokens)
+            _nBytes -= current.cache!.nbytes
+            lru.remove(key: key, tokens: tokens)
+            current.cache = CacheEntry(promptCache: promptCache, nbytes: cacheBytes)
+            _nBytes += cacheBytes
         } else {
-            let cacheBytes = promptCache.reduce(0) { $0 + $1.state.reduce(0) { $0 + $1.nbytes } }
             current.cache = CacheEntry(promptCache: promptCache, nbytes: cacheBytes)
             _nBytes += cacheBytes
         }
 
-        lru.push(model: model, tokens: tokens, checkpoint: checkpoint)
+        lru.push(key: key, tokens: tokens, checkpoint: checkpoint)
 
         // Evict if over maxSize
         if lru.count > maxSize {
             if let evicted = lru.pop() {
-                _delete(model: evicted.model, tokens: evicted.tokens)
+                _delete(key: evicted.key, tokens: evicted.tokens)
             }
         }
 
         // Evict if over maxBytes
         while _nBytes > maxBytes {
             guard let evicted = lru.pop() else { break }
-            _delete(model: evicted.model, tokens: evicted.tokens)
+            _delete(key: evicted.key, tokens: evicted.tokens)
         }
     }
 }

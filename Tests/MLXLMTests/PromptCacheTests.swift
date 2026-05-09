@@ -341,6 +341,107 @@ struct PromptCacheTests {
         #expect(remainder == [1, 2, 3])
     }
 
+    @Test("Fetches are isolated by salt")
+    func fetchesAreIsolatedBySalt() throws {
+        let cache = LRUPromptCache(maxSize: 10)
+        cache.insertCache(
+            model: "model",
+            tokens: [1, 2, 3],
+            promptCache: makeSimplePromptCache(seqLen: 3),
+            salt: 1
+        )
+
+        let saltOne = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3], salt: 1)
+        let saltTwo = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3], salt: 2)
+
+        _ = try #require(saltOne.cache?.first)
+        #expect(saltOne.hitKind == .exact)
+        #expect(saltOne.remainder.isEmpty)
+        #expect(saltTwo.cache == nil)
+        #expect(saltTwo.hitKind == .none)
+        #expect(saltTwo.remainder == [1, 2, 3])
+    }
+
+    @Test("Inserted snapshots are immune to later mutation of the source cache")
+    func insertedSnapshotsAreDetachedFromSourceCache() throws {
+        let cache = LRUPromptCache(maxSize: 10)
+        let source = makeSimplePromptCache(seqLen: 4)
+
+        cache.insertCache(model: "model", tokens: [1, 2, 3, 4], promptCache: source)
+        source.first?.trim(3)
+
+        let restored = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3, 4])
+        let layer = try #require(restored.cache?.first)
+        #expect(restored.hitKind == .exact)
+        #expect(layer.offset == 4)
+    }
+
+    @Test("Longer-prefix rotating-cache trim preflight bails safely")
+    func longerPrefixRotatingTrimPreflightBailsSafely() {
+        let cache = LRUPromptCache(maxSize: 10)
+        cache.insertCache(
+            model: "model",
+            tokens: [1, 2, 3, 4, 5, 6, 7, 8],
+            promptCache: [makeRotatingCache(seqLen: 4, maxSize: 4)]
+        )
+
+        let result = cache.fetchNearestCacheResult(model: "model", tokens: [1])
+        #expect(result.cache == nil)
+        #expect(result.hitKind == .none)
+        #expect(result.remainder == [1])
+    }
+
+    @Test("Disk round trip restores KVCacheSimple leaves with salt")
+    func diskRoundTripRestoresSimpleLeavesWithSalt() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LRUPromptCacheTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let cache = LRUPromptCache(maxSize: 10)
+        cache.insertCache(
+            model: "model",
+            tokens: [1, 2, 3],
+            promptCache: makeSimplePromptCache(seqLen: 3),
+            salt: 42
+        )
+        try await cache.save(to: directory, maxDiskBytes: nil)
+
+        let restored = LRUPromptCache(maxSize: 10)
+        try await restored.load(from: directory, allowedModels: ["model"])
+
+        let hit = restored.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3], salt: 42)
+        let layer = try #require(hit.cache?.first)
+        #expect(hit.hitKind == .exact)
+        #expect(hit.remainder.isEmpty)
+        #expect(layer.offset == 3)
+    }
+
+    @Test("Disk load ignores wrong allowed model")
+    func diskLoadIgnoresWrongAllowedModel() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LRUPromptCacheTests-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let cache = LRUPromptCache(maxSize: 10)
+        cache.insertCache(
+            model: "model-a",
+            tokens: [1, 2, 3],
+            promptCache: makeSimplePromptCache(seqLen: 3)
+        )
+        try await cache.save(to: directory, maxDiskBytes: nil)
+
+        let restored = LRUPromptCache(maxSize: 10)
+        try await restored.load(from: directory, allowedModels: ["model-b"])
+
+        let hit = restored.fetchNearestCacheResult(model: "model-a", tokens: [1, 2, 3])
+        #expect(hit.cache == nil)
+        #expect(hit.hitKind == .none)
+    }
+
     @Test("Cached prefixes reduce prefill token work")
     func cachedPrefixesReducePrefillWork() {
         let model = PromptCacheModel(vocabSize: 32, numLayers: 2)
