@@ -580,7 +580,7 @@ public actor InferenceScheduler {
         var promptCacheModelName = promptCacheModelName
         var inputTokens = inputTokens
 
-        if !Self.canUsePromptCache(
+        if !LRUPromptCache.canUsePromptCache(
             input: input,
             parameters: parameters,
             model: model
@@ -930,7 +930,7 @@ public actor InferenceScheduler {
 
         let submissions = submissions.map { submission -> BatchSubmission in
             var request = submission.request
-            if !Self.canUsePromptCache(
+            if !LRUPromptCache.canUsePromptCache(
                 input: request.input,
                 parameters: request.parameters,
                 model: model
@@ -1081,17 +1081,6 @@ public actor InferenceScheduler {
         parameters: GenerateParameters
     ) -> Bool {
         cacheMaxKVSize == parameters.maxKVSize
-    }
-
-    private static func canUsePromptCache(
-        input: LMInput,
-        parameters: GenerateParameters,
-        model: any LanguageModel
-    ) -> Bool {
-        guard input.image == nil, input.video == nil else { return false }
-        guard parameters.kvBits == nil else { return false }
-        guard model.defaultPromptCachePolicy == .exact else { return false }
-        return LRUPromptCache.isCacheCompatible(model.newCache(parameters: parameters))
     }
 
     private static func makeSinglePathIterator(

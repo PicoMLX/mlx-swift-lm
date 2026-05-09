@@ -240,7 +240,7 @@ public final class ModelContainer: Sendable {
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
             var fetchResult: LRUPromptCache.FetchResult?
             if let promptCache,
-                Self.canUsePromptCache(
+                LRUPromptCache.canUsePromptCache(
                     input: lmInput,
                     parameters: parameters,
                     model: resolvedModel
@@ -404,7 +404,7 @@ public final class ModelContainer: Sendable {
             let inputTokens = lmInput.text.tokens.asArray(Int.self)
             var fetchResult: LRUPromptCache.FetchResult?
             if let promptCache,
-                Self.canUsePromptCache(
+                LRUPromptCache.canUsePromptCache(
                     input: lmInput,
                     parameters: parameters,
                     model: resolvedModel
@@ -537,7 +537,7 @@ public final class ModelContainer: Sendable {
             var cachedPromptRemainder: [Int]?
             var fetchResult: LRUPromptCache.FetchResult?
             if let promptCache,
-                Self.canUsePromptCache(
+                LRUPromptCache.canUsePromptCache(
                     input: request.input,
                     parameters: request.parameters,
                     model: model
@@ -596,17 +596,6 @@ public final class ModelContainer: Sendable {
     public func encode(_ text: String) async -> [Int] {
         let tokenizer = await self.tokenizer
         return tokenizer.encode(text: text)
-    }
-
-    private static func canUsePromptCache(
-        input: LMInput,
-        parameters: GenerateParameters,
-        model: any LanguageModel
-    ) -> Bool {
-        guard input.image == nil, input.video == nil else { return false }
-        guard parameters.kvBits == nil else { return false }
-        guard model.defaultPromptCachePolicy == .exact else { return false }
-        return LRUPromptCache.isCacheCompatible(model.newCache(parameters: parameters))
     }
 
     private static func logPromptCacheMetrics(

@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import Dispatch
 import MLX
 
 // MARK: - LRUPromptCache
@@ -254,7 +255,30 @@ public final class LRUPromptCache: @unchecked Sendable {
         !cache.isEmpty && cache.allSatisfy { $0 is KVCacheSimple || $0 is RotatingKVCache }
     }
 
+    static func canUsePromptCache(
+        input: LMInput,
+        parameters: GenerateParameters,
+        model: any LanguageModel
+    ) -> Bool {
+        guard input.image == nil, input.video == nil else { return false }
+        guard parameters.kvBits == nil else { return false }
+        guard model.defaultPromptCachePolicy == .exact else { return false }
+        return isCacheCompatible(model.newCache(parameters: parameters))
+    }
+
     public func save(to directory: URL, maxDiskBytes: Int? = nil) async throws {
+        try await Self.runPersistenceTask {
+            try self.saveSynchronously(to: directory, maxDiskBytes: maxDiskBytes)
+        }
+    }
+
+    public func load(from directory: URL, allowedModels: Set<String>? = nil) async throws {
+        try await Self.runPersistenceTask {
+            try self.loadSynchronously(from: directory, allowedModels: allowedModels)
+        }
+    }
+
+    private func saveSynchronously(to directory: URL, maxDiskBytes: Int? = nil) throws {
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true
@@ -296,7 +320,7 @@ public final class LRUPromptCache: @unchecked Sendable {
         }
     }
 
-    public func load(from directory: URL, allowedModels: Set<String>? = nil) async throws {
+    private func loadSynchronously(from directory: URL, allowedModels: Set<String>? = nil) throws {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: directory.path) else { return }
 
@@ -352,6 +376,25 @@ public final class LRUPromptCache: @unchecked Sendable {
     // MARK: - Private Implementation
 
     private static let diskFormatVersion = 1
+    private static let persistenceQueue = DispatchQueue(
+        label: "org.ml-explore.mlx-swift-lm.lrucache.persistence",
+        qos: .utility
+    )
+
+    private static func runPersistenceTask(
+        _ work: @escaping @Sendable () throws -> Void
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            persistenceQueue.async {
+                do {
+                    try work()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 
     private struct DiskSidecar: Codable {
         let formatVersion: Int
@@ -383,8 +426,10 @@ public final class LRUPromptCache: @unchecked Sendable {
         defer { lock.unlock() }
 
         var snapshots = [DiskSnapshot]()
+        var tokens = [Int]()
         for (key, root) in cache {
-            collectDiskSnapshots(key: key, node: root, tokens: [], into: &snapshots)
+            tokens.removeAll(keepingCapacity: true)
+            collectDiskSnapshots(key: key, node: root, tokens: &tokens, into: &snapshots)
         }
         return snapshots
     }
@@ -392,7 +437,7 @@ public final class LRUPromptCache: @unchecked Sendable {
     private func collectDiskSnapshots(
         key: RootKey,
         node: TrieNode,
-        tokens: [Int],
+        tokens: inout [Int],
         into snapshots: inout [DiskSnapshot]
     ) {
         if let entry = node.cache {
@@ -407,12 +452,14 @@ public final class LRUPromptCache: @unchecked Sendable {
             )
         }
         for (token, child) in node.children {
+            tokens.append(Int(token))
             collectDiskSnapshots(
                 key: key,
                 node: child,
-                tokens: tokens + [Int(token)],
+                tokens: &tokens,
                 into: &snapshots
             )
+            tokens.removeLast()
         }
     }
 
