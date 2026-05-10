@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// Container for models that guarantees single threaded access.
 ///
@@ -32,6 +33,7 @@ import MLXNN
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
     private let loadedAsVLM: Bool
+    private let schedulerStorage: OSAllocatedUnfairLock<InferenceScheduler?>
 
     /// Optional inference scheduler for transparent batching support.
     ///
@@ -39,17 +41,10 @@ public final class ModelContainer: Sendable {
     /// enabling automatic batching when multiple concurrent requests arrive.
     /// When `nil` (default), the existing direct `TokenIterator` path is used unchanged.
     ///
-    /// - Note: `InferenceScheduler` is a Swift actor and inherently `Sendable`.
-    public nonisolated(unsafe) var scheduler: InferenceScheduler?
-
-    /// Optional prompt cache for reusing KV state across requests with shared prefixes.
-    ///
-    /// When set alongside a scheduler, cached KV state is fetched before submitting
-    /// to the scheduler and stored after generation completes. This reduces prefill
-    /// time for repeated or prefix-sharing prompts.
-    ///
-    /// - Note: `LRUPromptCache` is thread-safe via internal locking.
-    public nonisolated(unsafe) var promptCache: LRUPromptCache?
+    public var scheduler: InferenceScheduler? {
+        get { schedulerStorage.withLock { $0 } }
+        set { schedulerStorage.withLock { $0 = newValue } }
+    }
 
     public var configuration: ModelConfiguration {
         get async {
@@ -72,7 +67,7 @@ public final class ModelContainer: Sendable {
     public init(context: consuming ModelContext, scheduler: InferenceScheduler? = nil) {
         self.loadedAsVLM = context.loadedAsVLM
         self.context = .init(context)
-        self.scheduler = scheduler
+        self.schedulerStorage = OSAllocatedUnfairLock(initialState: scheduler)
     }
 
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
@@ -206,6 +201,7 @@ public final class ModelContainer: Sendable {
         input: consuming sending LMInput,
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil,
+        promptCache: LRUPromptCache? = nil,
         promptCacheSalt: UInt64 = 0
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
@@ -314,6 +310,7 @@ public final class ModelContainer: Sendable {
                     input: input.consume(),
                     parameters: request.parameters,
                     wiredMemoryTicket: request.wiredMemoryTicket,
+                    promptCache: request.promptCache,
                     promptCacheSalt: request.promptCacheSalt
                 )
                 streams.append(stream)
@@ -347,14 +344,21 @@ public final class ModelContainer: Sendable {
     /// Generate text for multiple prepared inputs supplied as parallel arrays.
     public func generateBatched(
         input: consuming sending [LMInput],
-        parameters: [GenerateParameters]
+        parameters: [GenerateParameters],
+        promptCache: LRUPromptCache? = nil,
+        promptCacheSalt: UInt64 = 0
     ) async throws -> [AsyncStream<Generation>] {
         let input = SendableBox(input).consume()
         guard input.count == parameters.count else {
             throw BatchedGenerationError.mismatchedRequestCounts
         }
         let requests = zip(input, parameters).map {
-            GenerationRequest(input: $0.0, parameters: $0.1)
+            GenerationRequest(
+                input: $0.0,
+                parameters: $0.1,
+                promptCache: promptCache,
+                promptCacheSalt: promptCacheSalt
+            )
         }
         return try await generateBatched(requests)
     }
@@ -381,6 +385,7 @@ public final class ModelContainer: Sendable {
         parameters: GenerateParameters,
         includeStopToken: Bool = false,
         wiredMemoryTicket: WiredMemoryTicket? = nil,
+        promptCache: LRUPromptCache? = nil,
         promptCacheSalt: UInt64 = 0
     ) async throws -> AsyncStream<TokenGeneration> {
         let input = SendableBox(input)
@@ -475,6 +480,7 @@ public final class ModelContainer: Sendable {
                     parameters: request.parameters,
                     includeStopToken: includeStopToken,
                     wiredMemoryTicket: request.wiredMemoryTicket,
+                    promptCache: request.promptCache,
                     promptCacheSalt: request.promptCacheSalt
                 )
                 streams.append(stream)
@@ -510,14 +516,21 @@ public final class ModelContainer: Sendable {
     public func generateTokensBatched(
         input: consuming sending [LMInput],
         parameters: [GenerateParameters],
-        includeStopToken: Bool = false
+        includeStopToken: Bool = false,
+        promptCache: LRUPromptCache? = nil,
+        promptCacheSalt: UInt64 = 0
     ) async throws -> [AsyncStream<TokenGeneration>] {
         let input = SendableBox(input).consume()
         guard input.count == parameters.count else {
             throw BatchedGenerationError.mismatchedRequestCounts
         }
         let requests = zip(input, parameters).map {
-            GenerationRequest(input: $0.0, parameters: $0.1)
+            GenerationRequest(
+                input: $0.0,
+                parameters: $0.1,
+                promptCache: promptCache,
+                promptCacheSalt: promptCacheSalt
+            )
         }
         return try await generateTokensBatched(
             requests,
@@ -533,12 +546,13 @@ public final class ModelContainer: Sendable {
     ) -> [SchedulerRequest] {
         requests.map { request in
             let inputTokens = request.input.text.tokens.asArray(Int.self)
+            let promptCache = request.promptCache
             var cachedKVState: [KVCache]?
             var cachedPromptRemainder: [Int]?
             var fetchResult: LRUPromptCache.FetchResult?
             if let promptCache,
-                LRUPromptCache.canUsePromptCache(
-                    input: request.input,
+               LRUPromptCache.canUsePromptCache(
+                   input: request.input,
                     parameters: request.parameters,
                     model: model
                 )
