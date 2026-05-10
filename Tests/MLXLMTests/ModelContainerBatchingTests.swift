@@ -16,7 +16,6 @@ struct ModelContainerBatchingTests {
 
     private func makeContainer(
         scheduler: InferenceScheduler? = nil,
-        promptCache: LRUPromptCache? = nil,
         loadedAsVLM: Bool = false,
         configurationID: String = "test-model",
         callDelay: TimeInterval = 0
@@ -39,7 +38,6 @@ struct ModelContainerBatchingTests {
 
         let container = ModelContainer(context: context)
         container.scheduler = scheduler
-        container.promptCache = promptCache
 
         return (container, model, configuration)
     }
@@ -315,14 +313,14 @@ struct ModelContainerBatchingTests {
         let scheduler = InferenceScheduler()
         let promptCache = LRUPromptCache(maxSize: 10)
         let (container, model, _) = makeContainer(
-            scheduler: scheduler,
-            promptCache: promptCache
+            scheduler: scheduler
         )
         let prompt = [1, 2, 3, 4, 5]
 
         let firstStream = try await container.generate(
             input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
-            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0),
+            promptCache: promptCache
         )
         _ = await collectGenerationOutput(firstStream)
         let firstTotal = model.totalTokensProcessed
@@ -331,7 +329,8 @@ struct ModelContainerBatchingTests {
 
         let secondStream = try await container.generate(
             input: LMInput(tokens: MLXArray(prompt.map(Int32.init))),
-            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0),
+            promptCache: promptCache
         )
         _ = await collectGenerationOutput(secondStream)
         let secondTotal = model.totalTokensProcessed
@@ -345,14 +344,14 @@ struct ModelContainerBatchingTests {
         let scheduler = InferenceScheduler()
         let promptCache = LRUPromptCache(maxSize: 10)
         let (container, model, _) = makeContainer(
-            scheduler: scheduler,
-            promptCache: promptCache
+            scheduler: scheduler
         )
 
         let firstPrompt = [1, 2, 3, 4]
         let firstStream = try await container.generate(
             input: LMInput(tokens: MLXArray(firstPrompt.map(Int32.init))),
-            parameters: GenerateParameters(maxTokens: 1, temperature: 0)
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            promptCache: promptCache
         )
         _ = await collectGenerationOutput(firstStream)
 
@@ -361,7 +360,8 @@ struct ModelContainerBatchingTests {
         let overlappingPrompt = [1, 2, 3, 4, 5, 6]
         let secondStream = try await container.generate(
             input: LMInput(tokens: MLXArray(overlappingPrompt.map(Int32.init))),
-            parameters: GenerateParameters(maxTokens: 1, temperature: 0)
+            parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            promptCache: promptCache
         )
         let secondOutput = await collectGenerationOutput(secondStream)
         let info = try #require(secondOutput.info)
@@ -372,17 +372,25 @@ struct ModelContainerBatchingTests {
         #expect(model.inputShapes.contains([1, overlappingPrompt.count]) == false)
     }
 
-    @Test("Scheduler and prompt cache properties remain assignable on the container")
-    func schedulerAndPromptCachePropertiesRemainAssignable() {
+    @Test("Scheduler property remains assignable on the container")
+    func schedulerPropertyRemainsAssignable() {
         let (container, _, _) = makeContainer()
         let scheduler = InferenceScheduler()
-        let promptCache = LRUPromptCache(maxSize: 4)
 
         container.scheduler = scheduler
-        container.promptCache = promptCache
 
         #expect(container.scheduler != nil)
-        #expect(container.promptCache === promptCache)
+    }
+
+    @Test("GenerationRequest carries prompt cache per request")
+    func generationRequestCarriesPromptCachePerRequest() {
+        let promptCache = LRUPromptCache(maxSize: 4)
+        let request = GenerationRequest(
+            input: LMInput(tokens: MLXArray([Int32(1), Int32(2)])),
+            promptCache: promptCache
+        )
+
+        #expect(request.promptCache === promptCache)
     }
 
     @Test("ChatSession keeps working on the scheduler-backed path")
