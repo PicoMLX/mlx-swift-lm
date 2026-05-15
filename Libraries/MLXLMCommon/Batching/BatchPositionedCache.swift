@@ -24,6 +24,12 @@ public protocol BatchPositionedKVCache: KVCache {
     var batchOffset: MLXArray { get }
 }
 
+extension BatchPositionedKVCache {
+    public var ropeOffset: RoPEOffset {
+        .batch(batchOffset[.ellipsis])
+    }
+}
+
 // MARK: - isBatchCompatible
 
 /// Check whether a list of per-layer caches is compatible with batch KV cache
