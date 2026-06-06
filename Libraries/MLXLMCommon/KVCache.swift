@@ -235,7 +235,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -250,6 +251,13 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Mask out left-padded positions per sequence (continuous batching):
+    // row `b` may attend only to positions `>= leftPadding[b]`.
+    if let leftPadding {
+        let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= lp)
     }
 
     return mask
@@ -1292,6 +1300,20 @@ public class ArraysCache: BaseKVCache {
     public override func finalize() {
         lengths = nil
         leftPadding = nil
+    }
+
+    /// Extract one row as its own single-row cache.
+    ///
+    /// Note: a ``MambaCache`` row is returned as a base ``ArraysCache`` (the
+    /// stored slots are identical); the Mamba auto-upgrade path can refine this
+    /// to preserve the concrete subtype if needed.
+    public func extract(_ idx: Int) -> ArraysCache {
+        let extracted = ArraysCache(size: cache.count)
+        extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        extracted.offset = offset
+        extracted.leftPadding = leftPadding.map { $0[idx ..< (idx + 1)] }
+        extracted.lengths = lengths.map { $0[idx ..< (idx + 1)] }
+        return extracted
     }
 
     public func advance(_ N: Int) {
