@@ -86,14 +86,22 @@ public final class LRUPromptCache: PersistablePromptCache {
             }
         }
 
-        func remove(key: RootKey, tokens: [Int]) {
+        /// Remove an entry, returning whether it was a checkpoint entry
+        /// (`true`), a regular entry (`false`), or absent (`nil`). The return
+        /// value lets `touch` re-insert the entry into its original eviction
+        /// pool instead of silently demoting checkpoints into the regular LRU.
+        @discardableResult
+        func remove(key: RootKey, tokens: [Int]) -> Bool? {
             if let idx = lru.firstIndex(where: { $0.key == key && $0.tokens == tokens }) {
                 lru.remove(at: idx)
+                return false
             } else if let idx = lruCheckpoints.firstIndex(where: {
                 $0.key == key && $0.tokens == tokens
             }) {
                 lruCheckpoints.remove(at: idx)
+                return true
             }
+            return nil
         }
 
         /// Pop the least-recently-used entry. Pops from the longer list first
@@ -233,7 +241,12 @@ public final class LRUPromptCache: PersistablePromptCache {
     ) {
         guard !tokens.isEmpty, Self.isCacheCompatible(promptCache) else { return }
         let snapshot = Self.materializedCopy(promptCache, tokenCount: tokens.count)
-        guard !snapshot.isEmpty else { return }
+        // Reject snapshots that carry no stored KV state. `materializedCopy`
+        // returns a non-empty array of *empty* caches when the source layers
+        // were never populated (offset 0 / nil keys); inserting those would let
+        // a later exact lookup report the tokens as "reused" while handing back
+        // caches with no usable state, causing callers to skip prompt eval.
+        guard !snapshot.isEmpty, snapshot.contains(where: { $0.offset > 0 }) else { return }
 
         state.withLockUnchecked { state in
             state.insertCache(
@@ -275,7 +288,7 @@ public final class LRUPromptCache: PersistablePromptCache {
         parameters: GenerateParameters,
         model: any LanguageModel
     ) -> Bool {
-        guard input.image == nil, input.video == nil else { return false }
+        guard input.image == nil, input.video == nil, input.audio == nil else { return false }
         guard parameters.kvBits == nil else { return false }
         guard model.defaultPromptCachePolicy == .exact else { return false }
         return isCacheCompatible(model.newCache(parameters: parameters))
@@ -306,6 +319,12 @@ public final class LRUPromptCache: PersistablePromptCache {
                 print("[PromptCache] skipping disk persistence for \(skipped) non-KVCacheSimple leaves")
             }
         #endif
+
+        let liveStems = Set(
+            snapshots.lazy
+                .filter { Self.isDiskPersistable($0.promptCache) }
+                .map(\.fileStem)
+        )
 
         for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
             let baseURL = directory.appendingPathComponent(snapshot.fileStem)
@@ -353,8 +372,34 @@ public final class LRUPromptCache: PersistablePromptCache {
             try FileManager.default.moveItem(at: tempSidecarURL, to: sidecarURL)
         }
 
+        try Self.removeStaleSidecars(directory: directory, liveStems: liveStems)
+
         if let maxDiskBytes {
             try Self.enforceDiskBudget(directory: directory, maxDiskBytes: maxDiskBytes)
+        }
+    }
+
+    /// Delete this cache's own committed `entry_` sidecars (and their paired
+    /// tensors) whose stem is no longer in the live snapshot set, so a later
+    /// `load` doesn't resurrect prompts that were evicted or trimmed from
+    /// memory since they were last written. Scoped strictly to `entry_`-prefixed
+    /// final sidecars via ``isFinalSidecar`` — unrelated files are never touched.
+    private static func removeStaleSidecars(directory: URL, liveStems: Set<String>) throws {
+        let fileManager = FileManager.default
+        let sidecars = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        .filter { isFinalSidecar($0) }
+
+        for sidecarURL in sidecars {
+            let stem = sidecarURL.deletingPathExtension().lastPathComponent
+            guard !liveStems.contains(stem) else { continue }
+            let tensorURL = sidecarURL.deletingPathExtension()
+                .appendingPathExtension("safetensors")
+            try? fileManager.removeItem(at: sidecarURL)
+            try? fileManager.removeItem(at: tensorURL)
         }
     }
 
@@ -367,7 +412,13 @@ public final class LRUPromptCache: PersistablePromptCache {
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         )
-        .filter { $0.pathExtension == "json" }
+        // Only committed final sidecars written by this cache. Excluding
+        // `*.tmp.json` honors the "sidecar move is the commit record" ordering
+        // in `saveSynchronously`: a crash after writing the temp pair but before
+        // the final move must load as a miss, not a half-written entry. The
+        // `entry_` prefix also keeps us from touching unrelated `.json` files in
+        // a shared directory.
+        .filter { Self.isFinalSidecar($0) }
 
         let decoder = JSONDecoder()
         var decoded = [(DiskSidecar, URL)]()
@@ -478,11 +529,16 @@ public final class LRUPromptCache: PersistablePromptCache {
         into snapshots: inout [DiskSnapshot]
     ) {
         if let entry = node.cache {
+            // Deep-copy the cache *inside the lock* (this static helper is only
+            // reached from `diskSnapshots()` while `state.withLockUnchecked` is
+            // held). Handing out the trie's live, mutable `[KVCache]` would let
+            // the off-thread `savePromptCache` serialization race against
+            // concurrent mutations on another thread.
             snapshots.append(
                 DiskSnapshot(
                     key: key,
                     tokens: tokens,
-                    promptCache: entry.promptCache,
+                    promptCache: LRUPromptCache.deepCopy(entry.promptCache),
                     nbytes: entry.nbytes,
                     lastUsed: entry.lastUsed
                 )
@@ -537,15 +593,22 @@ public final class LRUPromptCache: PersistablePromptCache {
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         )
-        .filter { $0.pathExtension == "json" }
+        .filter { isFinalSidecar($0) }
 
-        var entries = sidecars.map {
-            sidecarURL -> (sidecar: URL, tensor: URL, lastUsed: TimeInterval, bytes: Int) in
+        // Only enforce the budget against this cache's own entries: a committed
+        // `entry_` sidecar that decodes to valid metadata. Undecodable or
+        // foreign `.json` files in a shared directory are left untouched so the
+        // budget never deletes data this cache doesn't own.
+        var entries = sidecars.compactMap {
+            sidecarURL -> (sidecar: URL, tensor: URL, lastUsed: TimeInterval, bytes: Int)? in
+            guard let data = try? Data(contentsOf: sidecarURL),
+                let sidecar = try? JSONDecoder().decode(DiskSidecar.self, from: data)
+            else {
+                return nil
+            }
             let tensorURL = sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
-            let data = try? Data(contentsOf: sidecarURL)
-            let sidecar = data.flatMap { try? JSONDecoder().decode(DiskSidecar.self, from: $0) }
             let bytes = fileSize(sidecarURL) + fileSize(tensorURL)
-            return (sidecarURL, tensorURL, sidecar?.lastUsed ?? 0, bytes)
+            return (sidecarURL, tensorURL, sidecar.lastUsed, bytes)
         }
 
         var totalBytes = entries.reduce(0) { $0 + $1.bytes }
@@ -557,6 +620,17 @@ public final class LRUPromptCache: PersistablePromptCache {
             try? fileManager.removeItem(at: entry.tensor)
             totalBytes -= entry.bytes
         }
+    }
+
+    /// Whether `url` is a committed final sidecar written by this cache: an
+    /// `entry_`-prefixed `.json` file that is not an in-flight `.tmp.json`
+    /// temporary. Used by both `load` and the disk-budget cleanup to avoid
+    /// touching interrupted saves or unrelated files in a shared directory.
+    private static func isFinalSidecar(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return url.pathExtension == "json"
+            && name.hasPrefix("entry_")
+            && !name.hasSuffix(".tmp.json")
     }
 
     private static func fileSize(_ url: URL) -> Int {
@@ -720,8 +794,11 @@ extension LRUPromptCache.State {
     private func touch(key: RootKey, tokens: [Int]) {
         let entry = get(key: key, tokens: tokens)
         entry.lastUsed = Date().timeIntervalSince1970
-        lru.remove(key: key, tokens: tokens)
-        lru.push(key: key, tokens: tokens)
+        // Preserve the entry's eviction class: re-push as a checkpoint if it was
+        // one, so a recently-used checkpoint isn't demoted into the regular
+        // eviction pool and evicted ahead of its checkpoint peers.
+        let wasCheckpoint = lru.remove(key: key, tokens: tokens) ?? false
+        lru.push(key: key, tokens: tokens, checkpoint: wasCheckpoint)
     }
 
     /// Internal fetch (must be called while holding the lock).
