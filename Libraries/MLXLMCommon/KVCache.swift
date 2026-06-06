@@ -140,6 +140,12 @@ open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
+    /// Declared as an overridable class member (not only via the `KVCache`
+    /// extension default) so batched subclasses can override it and have the
+    /// override dispatched through the `KVCache` witness table — otherwise a
+    /// batched cache used as `KVCache` would fall back to the scalar offset.
+    open var ropeOffset: RoPEOffset { .scalar(offset) }
+
     public func innerState() -> [MLXArray] { [] }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -1215,8 +1221,8 @@ public class ArraysCache: BaseKVCache {
         cache = cache.map { c in
             c?[batchIndices]
         }
-        leftPadding = leftPadding.map { $0.take(batchIndices, axis: 0) }
-        lengths = lengths.map { $0.take(batchIndices, axis: 0) }
+        leftPadding = leftPadding?[batchIndices]
+        lengths = lengths?[batchIndices]
     }
 
     /// In-place extend this cache with the other cache
@@ -1259,8 +1265,8 @@ public class ArraysCache: BaseKVCache {
         let extracted = ArraysCache(size: cache.count)
         extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
         extracted.offset = offset
-        extracted.leftPadding = leftPadding.map { $0[idx ..< (idx + 1)] }
-        extracted.lengths = lengths.map { $0[idx ..< (idx + 1)] }
+        extracted.leftPadding = leftPadding?[idx ..< (idx + 1)]
+        extracted.lengths = lengths?[idx ..< (idx + 1)]
         return extracted
     }
 

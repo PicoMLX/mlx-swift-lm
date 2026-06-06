@@ -75,6 +75,23 @@ struct BatchKVCacheCoverageTests {
             Issue.record("BatchKVCache should produce an explicit array mask for this path")
         }
     }
+
+    @Test("ropeOffset dispatches to .batch through the KVCache type")
+    func ropeOffsetDispatchesThroughKVCache() {
+        // Models read `cache?.ropeOffset` with `cache` typed as `KVCache?`, so the
+        // batched override must win via witness-table dispatch (not the scalar
+        // KVCache extension default).
+        let full: any KVCache = BatchKVCache(leftPadding: [1, 0])
+        guard case .batch = full.ropeOffset else {
+            Issue.record("BatchKVCache.ropeOffset via KVCache should be .batch")
+            return
+        }
+        let rotating: any KVCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [1, 0], keep: 0)
+        guard case .batch = rotating.ropeOffset else {
+            Issue.record("BatchRotatingKVCache.ropeOffset via KVCache should be .batch")
+            return
+        }
+    }
 }
 
 // MARK: - BatchRotatingKVCache (keep > 0)
