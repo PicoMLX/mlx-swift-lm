@@ -759,7 +759,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                     "BatchRotatingKVCache.merge requires RotatingKVCache instances")
             }
             let ms = rotCache.maxSize ?? 0
-            let k = rotCache.keep
+            // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
+            let k = Int(rotCache.metaState.first ?? "0") ?? 0
             if targetMaxSize == 0 {
                 targetMaxSize = ms
                 targetKeep = k
@@ -848,7 +849,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// - Returns: A new `BatchRotatingKVCache` with batch size 1.
     public class func fromSingle(_ cache: RotatingKVCache) -> BatchRotatingKVCache {
         let ms = cache.maxSize ?? 0
-        let k = cache.keep
+        // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
+        let k = Int(cache.metaState.first ?? "0") ?? 0
         let batchCache = BatchRotatingKVCache(maxSize: ms, leftPadding: [0], keep: k)
 
         let temporalData = cache.temporalState
