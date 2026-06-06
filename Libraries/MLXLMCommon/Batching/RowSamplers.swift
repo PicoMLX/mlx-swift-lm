@@ -4,11 +4,13 @@ import Foundation
 import MLX
 import os
 
-// Per-row samplers for the batched inference engine. Mirrors
-// `mlx_lm.sample_utils`: temperature scaling, top-K truncation, top-P
-// (nucleus) truncation, and optional seeded categorical sampling. Each
-// constructed sampler is `@Sendable` so it can be stored alongside an
-// admitted batch row and crossed into the engine's executor.
+// Per-row samplers for the batched inference engine. Mirrors the
+// single-request `TopPSampler` in `Evaluate.swift` (which itself follows
+// `mlx_lm.sample_utils`): top-P (nucleus) truncation, top-K truncation, and
+// optional seeded categorical sampling, with temperature applied at the
+// categorical draw. Each constructed sampler is `@Sendable` so it can be
+// stored alongside an admitted batch row and crossed into the engine's
+// executor.
 //
 // `MLXRandom.categorical`/`key`/`split` resolve transitively through the
 // umbrella `import MLX` (as `Evaluate.swift` does with `categorical` /
@@ -16,10 +18,13 @@ import os
 
 /// Build a `RowSampler` from OpenAI-style request parameters.
 ///
-/// Behavior, mirroring upstream `mlx_lm.sample_utils.make_sampler`:
+/// Behavior, matching the single-request `TopPSampler` in `Evaluate.swift`
+/// (which mirrors `mlx_lm.sample_utils.make_sampler`):
 ///   - `temperature <= 0`: return `greedySampler` (no RNG, deterministic).
-///   - `temperature > 0`: scale logits by `1/temperature`, optionally
-///     mask to top-K and/or top-P, then sample categorically.
+///   - `temperature > 0`: optionally mask the unscaled logprobs to top-P
+///     then top-K, scale by `1/temperature`, and sample categorically. The
+///     order (filter first, temperature at the draw) means one batched row
+///     reproduces single-stream sampling for the same params/seed.
 ///
 /// `seed` makes the resulting stream deterministic. Each call to the
 /// returned sampler advances the per-sampler PRNG key, so successive
@@ -50,11 +55,19 @@ public func makeRowSampler(
     let k = topK
 
     return { @Sendable logprobs in
-        var lp = logprobs * (1.0 / temp)
-        if k > 0 { lp = applyTopK(lp, k: k) }
+        // Match the single-request `TopPSampler` exactly (Evaluate.swift):
+        // filter on the *unscaled* logprobs in top-P -> top-K order, then
+        // apply temperature at the categorical draw. The input is already
+        // `logSoftmax(logits)` (see `DecodeBatch.step`), mirroring
+        // `TopPSampler.sample`'s `logprobs = logSoftmax(logits)`. Applying
+        // temperature before top-P would reshape the softmax mass and change
+        // the nucleus boundary, so one batched row would diverge from
+        // single-stream sampling for the same params/seed.
+        var lp = logprobs
         if p > 0, p < 1 { lp = applyTopP(lp, p: p) }
+        if k > 0 { lp = applyTopK(lp, k: k) }
         let key = keyHolder.next()
-        return MLXRandom.categorical(lp, axis: -1, key: key)
+        return MLXRandom.categorical(lp * (1.0 / temp), axis: -1, key: key)
     }
 }
 
