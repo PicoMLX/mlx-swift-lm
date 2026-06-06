@@ -215,7 +215,15 @@ public final class LRUPromptCache: PersistablePromptCache {
         tokens: [Int],
         salt: UInt64 = 0
     ) -> FetchResult {
-        state.withLockUnchecked { state in
+        // An empty token list is always a miss. Without this guard, `search`
+        // treats it as an exact match (`lastCacheIndex == tokens.count - 1`,
+        // both `-1`) once any entry exists for the model/salt, and the exact
+        // branch then force-unwraps the root node's `cache`, which is always nil
+        // because empty inserts are rejected — crashing after the cache warms.
+        guard !tokens.isEmpty else {
+            return FetchResult(cache: nil, remainder: tokens, hitKind: .none, matchedTokenCount: 0)
+        }
+        return state.withLockUnchecked { state in
             state.fetchNearestCache(key: RootKey(model: model, salt: salt), tokens: tokens)
         }
     }
@@ -241,12 +249,21 @@ public final class LRUPromptCache: PersistablePromptCache {
     ) {
         guard !tokens.isEmpty, Self.isCacheCompatible(promptCache) else { return }
         let snapshot = Self.materializedCopy(promptCache, tokenCount: tokens.count)
-        // Reject snapshots that carry no stored KV state. `materializedCopy`
-        // returns a non-empty array of *empty* caches when the source layers
-        // were never populated (offset 0 / nil keys); inserting those would let
-        // a later exact lookup report the tokens as "reused" while handing back
-        // caches with no usable state, causing callers to skip prompt eval.
-        guard !snapshot.isEmpty, snapshot.contains(where: { $0.offset > 0 }) else { return }
+        // Require the stored state to cover the full token key. A layer's
+        // `offset` is its covered-token-count (`KVCacheSimple.state` sets
+        // `offset = keys.dim(2)`; `RotatingKVCache` restores `offset` from
+        // `metaState`, always copied by `materializedCopy`), mirroring how the
+        // fetch path equates a stored entry's covered length with its token
+        // count. Reject when the snapshot covers fewer tokens than `tokens`:
+        //   - covered length 0 (an array of empty/unpopulated caches) would let
+        //     a later exact lookup report the tokens as "reused" while handing
+        //     back caches with no usable state; and
+        //   - a partial/trimmed cache shorter than `tokens` would be recorded
+        //     for the full sequence, so an exact fetch reports every token as
+        //     reused while returning a smaller offset, letting callers skip
+        //     evaluating the missing suffix.
+        let coveredLength = snapshot.map(\.offset).max() ?? 0
+        guard !snapshot.isEmpty, coveredLength >= tokens.count else { return }
 
         state.withLockUnchecked { state in
             state.insertCache(
@@ -325,6 +342,10 @@ public final class LRUPromptCache: PersistablePromptCache {
                 .filter { Self.isDiskPersistable($0.promptCache) }
                 .map(\.fileStem)
         )
+        // Models this cache currently manages. Stale-sidecar cleanup is scoped
+        // to these so saving a cache that only holds model A never deletes
+        // model B's committed entries from a shared persistence directory.
+        let liveModels = Set(snapshots.map(\.key.model))
 
         for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
             let baseURL = directory.appendingPathComponent(snapshot.fileStem)
@@ -372,7 +393,8 @@ public final class LRUPromptCache: PersistablePromptCache {
             try FileManager.default.moveItem(at: tempSidecarURL, to: sidecarURL)
         }
 
-        try Self.removeStaleSidecars(directory: directory, liveStems: liveStems)
+        try Self.removeStaleSidecars(
+            directory: directory, liveStems: liveStems, liveModels: liveModels)
 
         if let maxDiskBytes {
             try Self.enforceDiskBudget(directory: directory, maxDiskBytes: maxDiskBytes)
@@ -382,9 +404,21 @@ public final class LRUPromptCache: PersistablePromptCache {
     /// Delete this cache's own committed `entry_` sidecars (and their paired
     /// tensors) whose stem is no longer in the live snapshot set, so a later
     /// `load` doesn't resurrect prompts that were evicted or trimmed from
-    /// memory since they were last written. Scoped strictly to `entry_`-prefixed
-    /// final sidecars via ``isFinalSidecar`` — unrelated files are never touched.
-    private static func removeStaleSidecars(directory: URL, liveStems: Set<String>) throws {
+    /// memory since they were last written.
+    ///
+    /// Deletion is scoped two ways so a shared persistence directory is never
+    /// corrupted: only `entry_`-prefixed final sidecars are considered (via
+    /// ``isFinalSidecar``), and a stale sidecar is removed only when it decodes
+    /// to valid metadata whose `model` is one this cache manages (`liveModels`).
+    /// A sidecar that can't be decoded, or whose model this cache doesn't own
+    /// (for example another cache instance or model scope sharing the directory,
+    /// which `load(from:allowedModels:)` supports), is left untouched. When in
+    /// doubt, do not delete.
+    private static func removeStaleSidecars(
+        directory: URL,
+        liveStems: Set<String>,
+        liveModels: Set<String>
+    ) throws {
         let fileManager = FileManager.default
         let sidecars = try fileManager.contentsOfDirectory(
             at: directory,
@@ -393,9 +427,19 @@ public final class LRUPromptCache: PersistablePromptCache {
         )
         .filter { isFinalSidecar($0) }
 
+        let decoder = JSONDecoder()
         for sidecarURL in sidecars {
             let stem = sidecarURL.deletingPathExtension().lastPathComponent
             guard !liveStems.contains(stem) else { continue }
+            // Only delete sidecars this cache owns: decode the metadata and
+            // require its model to be one of this cache's live models. Never
+            // delete an undecodable sidecar or one belonging to another model.
+            guard let data = try? Data(contentsOf: sidecarURL),
+                let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
+                liveModels.contains(sidecar.model)
+            else {
+                continue
+            }
             let tensorURL = sidecarURL.deletingPathExtension()
                 .appendingPathExtension("safetensors")
             try? fileManager.removeItem(at: sidecarURL)
