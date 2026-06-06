@@ -44,9 +44,10 @@ internal func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArra
 
     // Compute rolled indices: (indices - shifts) mod n
     // Use ((x % n) + n) % n to ensure non-negative result (Python-style modulo)
+    // ((x % n) + n) % n keeps the result non-negative (Python-style modulo).
+    // Using `%` avoids any overload ambiguity with Foundation/Darwin `remainder`.
     let nArr = MLXArray(Int32(n))
-    let raw = remainder(reshapedIndices - reshapedShifts, nArr)
-    let idx = remainder(raw + nArr, nArr)
+    let idx = ((reshapedIndices - reshapedShifts) % nArr + nArr) % nArr
 
     return takeAlong(x, idx.asType(.int32), axis: positiveAxis)
 }
@@ -509,7 +510,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             self.batchOffsets = self.batchOffsets - lpArray
         }
 
-        if let rp = rightPadding, rp.max()! > 0, let lengths = lengths {
+        if let rp = rightPadding, rp.contains(where: { $0 > 0 }), let lengths = lengths {
             self._lengths = MLXArray(lengths.map { Int32($0) }) + self.batchOffsets
         }
     }
@@ -549,6 +550,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     public var batchOffset: MLXArray {
         batchOffsets
     }
+
+    /// Override `BaseKVCache`'s scalar `ropeOffset` so per-row offsets are used
+    /// even when this cache flows through attention layers typed as `KVCache`.
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
 
     // MARK: - BatchedCache Conformance
 
@@ -595,6 +600,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             batchOffsets = MLXArray([Int32]())
             _idx = 0
             _scalarOffset = 0
+            // Clear rotation/prefill state so a reused cache starts unrotated.
+            rotated = false
+            _lengths = nil
+            _rightPadding = nil
             return
         }
 
@@ -613,7 +622,13 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// - Parameter other: The other BatchRotatingKVCache to merge into this one.
     public func extend(other: BatchRotatingKVCache) {
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
-            if other.keys != nil {
+            if self.keys == nil && other.keys == nil {
+                // Both empty: concatenate row metadata so admitted rows survive
+                // until their first prefill instead of being dropped.
+                self.leftPadding = concatenated([self.leftPadding, other.leftPadding], axis: 0)
+                self.batchOffsets = concatenated([self.batchOffsets, other.batchOffsets], axis: 0)
+            } else if other.keys != nil {
+                // self empty, other populated: adopt other's state.
                 self.keys = other.keys
                 self.values = other.values
                 self.batchOffsets = other.batchOffsets
@@ -796,7 +811,11 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         let valuesArr = MLXArray.zeros([B, H, maxLength, Dv], dtype: dt)
 
         for (i, (p, c)) in zip(padding, caches).enumerated() {
-            // Get temporally ordered keys/values from the RotatingKVCache
+            // Get temporally ordered keys/values from the RotatingKVCache.
+            // NOTE (deferred to PR4): when a source prompt exceeds `maxSize`, the
+            // tail-vs-head retention of the temporal slice here needs validation
+            // against the single-stream rotating cache. `merge` is not wired until
+            // PR4, so this is exercised and tested there. (PR #8 review, Codex C4.)
             guard let rotCache = c as? RotatingKVCache else { continue }
             let temporalData = rotCache.temporalState
             if temporalData.count >= 2 {

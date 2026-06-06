@@ -202,6 +202,10 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         batchOffsets
     }
 
+    /// Override `BaseKVCache`'s scalar `ropeOffset` so per-row offsets are used
+    /// even when this cache flows through attention layers typed as `KVCache`.
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+
     // MARK: - Batch Operations
 
     /// In-place filter to keep only the sequences at the given batch indices.
@@ -248,8 +252,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// - Parameter other: The other BatchKVCache to merge into this one.
     public func extend(other: BatchKVCache) {
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
-            // If self is empty, take the other's state
-            if other.keys != nil {
+            if self.keys == nil && other.keys == nil {
+                // Both empty: concatenate row metadata so admitted rows survive
+                // until their first prefill instead of being dropped.
+                self.leftPadding = concatenated([self.leftPadding, other.leftPadding], axis: 0)
+                self.batchOffsets = concatenated([self.batchOffsets, other.batchOffsets], axis: 0)
+            } else if other.keys != nil {
+                // self empty, other populated: adopt other's state.
                 self.keys = other.keys
                 self.values = other.values
                 self.batchOffsets = other.batchOffsets
