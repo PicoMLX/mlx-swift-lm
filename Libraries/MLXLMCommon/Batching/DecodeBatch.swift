@@ -106,6 +106,12 @@ public final class DecodeBatch {
         if let numTokens {
             precondition(uids.count == numTokens.count, "uids/numTokens count mismatch")
         }
+        if let samplers {
+            precondition(uids.count == samplers.count, "uids/samplers count mismatch")
+        }
+        if let stateMachines {
+            precondition(uids.count == stateMachines.count, "uids/stateMachines count mismatch")
+        }
         self.model = model
         self.uids = uids
         self.promptCache = promptCache

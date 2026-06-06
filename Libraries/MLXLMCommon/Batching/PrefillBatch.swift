@@ -38,6 +38,14 @@ public final class PrefillBatch {
         fallbackSampler: @escaping RowSampler = greedySampler,
         stateMachines: [StopSequenceMatcher]? = nil
     ) {
+        precondition(uids.count == tokens.count, "uids/tokens count mismatch")
+        precondition(uids.count == maxTokens.count, "uids/max_tokens count mismatch")
+        if let samplers {
+            precondition(uids.count == samplers.count, "uids/samplers count mismatch")
+        }
+        if let stateMachines {
+            precondition(uids.count == stateMachines.count, "uids/stateMachines count mismatch")
+        }
         self.model = model
         self.uids = uids
         self.promptCache = promptCache
@@ -211,8 +219,8 @@ public final class PrefillBatch {
     /// non-empty prefill caches is not yet implemented.
     public func extend(_ other: PrefillBatch) {
         precondition(
-            promptCache.isEmpty && other.promptCache.isEmpty,
-            "PrefillBatch.extend currently only supports merging two empty caches"
+            uids.isEmpty && other.uids.isEmpty,
+            "PrefillBatch.extend currently only supports merging two empty batches"
         )
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
