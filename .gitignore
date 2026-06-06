@@ -95,3 +95,6 @@ iOSInjectionProject/
 .idea
 .vscode
 
+# Claude Code agent worktrees (transient, isolated working copies)
+.claude/worktrees/
+
