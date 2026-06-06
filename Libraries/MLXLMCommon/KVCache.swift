@@ -195,7 +195,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -210,6 +211,13 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Mask out left-padded positions per sequence (continuous batching):
+    // row `b` may attend only to positions `>= leftPadding[b]`.
+    if let leftPadding {
+        let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= lp)
     }
 
     return mask
@@ -1165,6 +1173,7 @@ public class ChunkedKVCache: KVCacheSimple {
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
+    internal var lengths: MLXArray?
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
@@ -1206,23 +1215,86 @@ public class ArraysCache: BaseKVCache {
         cache = cache.map { c in
             c?[batchIndices]
         }
-        leftPadding = nil
+        leftPadding = leftPadding.map { $0.take(batchIndices, axis: 0) }
+        lengths = lengths.map { $0.take(batchIndices, axis: 0) }
     }
 
     /// In-place extend this cache with the other cache
     public func extend(other: ArraysCache) {
-        cache = zip(cache, other.cache).map { (c, o) in
-            if let c = c, let o = o {
-                return MLX.concatenated([c, o])
+        let lhsBatch = batchSize
+        let rhsBatch = other.batchSize
+
+        func concatenateOptional(_ lhs: MLXArray?, _ rhs: MLXArray?) -> MLXArray? {
+            var shape: [Int]?
+            var dtype: DType?
+            if let lhs {
+                shape = lhs.shape
+                dtype = lhs.dtype
             }
-            return c ?? o
+            if let rhs {
+                shape = rhs.shape
+                dtype = rhs.dtype
+            }
+            guard let shape, let dtype else { return nil }
+
+            let itemShape = Array(shape.dropFirst())
+            let lhsValue = lhs ?? MLXArray.zeros([lhsBatch] + itemShape, dtype: dtype)
+            let rhsValue = rhs ?? MLXArray.zeros([rhsBatch] + itemShape, dtype: dtype)
+            return MLX.concatenated([lhsValue, rhsValue])
         }
+
+        cache = zip(cache, other.cache).map { (c, o) in
+            concatenateOptional(c, o)
+        }
+        leftPadding = concatenateOptional(leftPadding, other.leftPadding)
+        lengths = concatenateOptional(lengths, other.lengths)
+    }
+
+    /// Extract one row as its own single-row cache.
+    ///
+    /// Note: a ``MambaCache`` row is returned as a base ``ArraysCache`` (the
+    /// stored slots are identical); PR4's Mamba auto-upgrade path can refine this
+    /// to preserve the concrete subtype if needed.
+    public func extract(_ idx: Int) -> ArraysCache {
+        let extracted = ArraysCache(size: cache.count)
+        extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        extracted.offset = offset
+        extracted.leftPadding = leftPadding.map { $0[idx ..< (idx + 1)] }
+        extracted.lengths = lengths.map { $0[idx ..< (idx + 1)] }
+        return extracted
+    }
+
+    /// Record per-sequence prompt lengths before a ragged prefill chunk.
+    public func prepare(lengths: [Int]? = nil) {
+        self.lengths = lengths.map { MLXArray($0.map { Int32($0) }) }
+    }
+
+    /// Clear transient prefill metadata after the prompt forward pass.
+    public func finalize() {
+        lengths = nil
         leftPadding = nil
     }
 
-    /// Create attention mask based on left padding
+    /// Advance chunk-local metadata after a chunked prefill step.
+    public func advance(_ n: Int) {
+        // During prefill, advance only chunk-local lengths; leftPadding is fixed
+        // admission metadata.
+        if lengths != nil {
+            lengths = lengths.map { $0 - Int32(n) }
+        } else {
+            leftPadding = leftPadding.map { $0 - Int32(n) }
+        }
+    }
+
+    /// Create the chunk-local SSM mask.
     public func makeMask(N: Int) -> MLXArray? {
-        if cache[0] == nil, let leftPadding = leftPadding {
+        // During ragged prefill, `lengths` masks right-padding for the current
+        // chunk and must take precedence; `leftPadding` is merge/admission
+        // metadata. Single-stream callers leave both nil, so this returns nil
+        // (unchanged behavior).
+        if let lengths {
+            return MLXArray(0 ..< N) .< lengths[0..., .newAxis]
+        } else if let leftPadding {
             return MLXArray(0 ..< N) .>= leftPadding[0..., .newAxis]
         } else {
             return nil
@@ -1286,6 +1358,22 @@ public class ArraysCache: BaseKVCache {
     internal var leftPaddingValues: [Int]? {
         guard let lp = leftPadding else { return nil }
         return lp.asArray(Int.self)
+    }
+
+    /// Number of rows in the batch, inferred from stored arrays or metadata.
+    internal var batchSize: Int {
+        for item in cache {
+            if let item {
+                return item.dim(0)
+            }
+        }
+        if let leftPadding {
+            return leftPadding.dim(0)
+        }
+        if let lengths {
+            return lengths.dim(0)
+        }
+        return 0
     }
 }
 
