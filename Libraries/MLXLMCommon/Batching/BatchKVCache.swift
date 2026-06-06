@@ -535,6 +535,17 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// Full-attention caches have no chunk-local prefill metadata to advance.
     public func advanceBatched(_: Int) {}
 
+    public override func copy() -> any KVCache {
+        let c = BatchKVCache(
+            leftPaddingArray: leftPadding[0...], batchOffsetsArray: batchOffsets[0...])
+        c.keys = keys.map { $0[.ellipsis] }
+        c.values = values.map { $0[.ellipsis] }
+        c._idx = _idx
+        c.step = step
+        c._rightPadding = _rightPadding.map { $0[0...] }
+        return c
+    }
+
     public var debugDescription: String {
         "BatchKVCache batchSize: \(batchSize), _idx: \(_idx), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
     }

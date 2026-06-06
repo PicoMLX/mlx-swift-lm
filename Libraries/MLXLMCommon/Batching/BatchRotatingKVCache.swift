@@ -587,6 +587,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Sliding-window caches have no chunk-local prefill metadata to advance.
     public func advanceBatched(_: Int) {}
 
+    public override func copy() -> any KVCache {
+        let c = BatchRotatingKVCache(
+            maxSize: maxCacheSize, keep: keep,
+            leftPaddingArray: leftPadding[0...], batchOffsetsArray: batchOffsets[0...])
+        c.keys = keys.map { $0[.ellipsis] }
+        c.values = values.map { $0[.ellipsis] }
+        c._idx = _idx
+        c._scalarOffset = _scalarOffset
+        c.rotated = rotated
+        c.step = step
+        c._lengths = _lengths.map { $0[0...] }
+        return c
+    }
+
     // MARK: - Batch Operations
 
     /// In-place filter to keep only the sequences at the given batch indices.
@@ -603,7 +617,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             // Clear rotation/prefill state so a reused cache starts unrotated.
             rotated = false
             _lengths = nil
-            _rightPadding = nil
             return
         }
 
