@@ -806,6 +806,18 @@ extension InferenceScheduler {
         }
 
         // The single task has stopped and deposited `live`; we now own it.
+        // Pull out every value-typed (Sendable) field up front so that, after
+        // the cache is migrated below, `live` (and its non-Sendable caches) is
+        // provably dead — the migrated caches can then transfer to the driver
+        // via `sending` with no aliasing back into `live`.
+        let liveCurrentToken = live.currentToken
+        let liveTokenCount = live.tokenCount
+        let liveMaxTokens = live.maxTokens
+        let liveParameters = live.parameters
+        let liveGeneratedTokenIds = live.generatedTokenIds
+
+        let remainingBudget = (liveMaxTokens ?? Int.max) - liveTokenCount
+
         guard let driver = await ensureDriver() else {
             // Cannot batch this model: deliver the joining request on a fresh
             // single path. (The original request's tokens were already
@@ -815,6 +827,16 @@ extension InferenceScheduler {
             return
         }
 
+        guard remainingBudget > 0 else {
+            // Zero remaining budget: the original is effectively done. Finish
+            // it and run the joining request.
+            single.handler.finish()
+            await admitToBatch(joining)
+            return
+        }
+
+        // Migrate the live caches LAST (consumes `live.cache`). After this point
+        // `live` must not be read.
         guard let batchedCaches = Self.migrateCaches(live.cache) else {
             // Migration unsupported for this cache topology. Close the original
             // (its KV cannot be carried) and start the joining request fresh.
@@ -829,27 +851,7 @@ extension InferenceScheduler {
         let firstUID = nextRequestID
         nextRequestID += 1
 
-        let remainingBudget = (live.maxTokens ?? Int.max) - live.tokenCount
-        guard remainingBudget > 0 else {
-            // Zero remaining budget: the original is effectively done. Finish
-            // it and run the joining request.
-            single.handler.finish()
-            await admitToBatch(joining)
-            return
-        }
-
-        let sampler = Self.rowSampler(for: live.parameters)
-        let adopted = await driver.makeAdoptedBatch(
-            uid: firstUID,
-            seedToken: live.currentToken,
-            caches: batchedCaches,
-            sampler: sampler,
-            stateMachine: nil,
-            maxTokens: remainingBudget,
-            numTokens: 0,
-            tokens: live.generatedTokenIds
-        )
-
+        let sampler = Self.rowSampler(for: liveParameters)
         let firstRecord = EngineDriver.AdoptedRecord(
             handler: single.handler,
             promptTokenCount: single.inputTokens.count,
@@ -859,7 +861,19 @@ extension InferenceScheduler {
             submitTime: single.submitTime,
             writeBackToPromptCache: single.writeBackToPromptCache
         )
-        await driver.adopt(adopted, records: [firstUID: firstRecord])
+        // Build + splice the migrated batch entirely on the driver (the
+        // DecodeBatch never crosses an isolation boundary).
+        await driver.adoptMigrated(
+            uid: firstUID,
+            seedToken: liveCurrentToken,
+            caches: batchedCaches,
+            sampler: sampler,
+            stateMachine: nil,
+            maxTokens: remainingBudget,
+            numTokens: 0,
+            tokens: liveGeneratedTokenIds,
+            record: firstRecord
+        )
 
         // Phase 3: admit the joining request and start the batch loop.
         state = .batched

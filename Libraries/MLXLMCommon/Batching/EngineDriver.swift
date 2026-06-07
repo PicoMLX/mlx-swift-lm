@@ -200,32 +200,6 @@ actor EngineDriver {
 
     // MARK: - Adopt (single → batch upgrade bridge)
 
-    /// Splice an already-decoding ``DecodeBatch`` (built from a migrated single
-    /// request's live caches) into the engine as the running set, and register
-    /// its per-uid routing records so its tokens fan out to the original
-    /// request's handler.
-    ///
-    /// `batch` is transferred with `sending`: it carries non-`Sendable` decode
-    /// state handed off from the upgrade path, which provably stops touching it
-    /// after the deposit.
-    func adopt(
-        _ batch: sending DecodeBatch,
-        records newRecords: [Int: AdoptedRecord]
-    ) {
-        for (uid, rec) in newRecords {
-            records[uid] = RequestRecord(
-                handler: rec.handler,
-                promptTokenCount: rec.promptTokenCount,
-                inputTokens: rec.inputTokens,
-                modelName: rec.modelName,
-                promptCacheSalt: rec.promptCacheSalt,
-                submitTime: rec.submitTime,
-                writeBackToPromptCache: rec.writeBackToPromptCache
-            )
-        }
-        engine.adoptActiveBatch(batch)
-    }
-
     /// Routing/finalization info for a migrated (adopted) request, supplied by
     /// the scheduler's upgrade path. Mirrors ``RequestRecord`` but is the
     /// public hand-off shape.
@@ -239,13 +213,18 @@ actor EngineDriver {
         let writeBackToPromptCache: Bool
     }
 
-    /// Build a ``DecodeBatch`` from migrated single-request decode state. Runs
-    /// on the driver so the priming decode step the constructor performs touches
-    /// the engine's model from the engine's executor.
+    /// Adopt a migrated single request: build a ``DecodeBatch`` from its
+    /// already-converted per-layer caches and splice it in as the running set,
+    /// registering its routing record so its tokens fan out to the original
+    /// request's handler. This happens entirely on the driver — the
+    /// non-`Sendable` ``DecodeBatch`` never leaves the actor (it references the
+    /// engine's model), so nothing is round-tripped across an isolation
+    /// boundary.
     ///
-    /// Caches are transferred with `sending` (region isolation): they are the
-    /// migrated single request's per-layer batched caches, handed off once.
-    func makeAdoptedBatch(
+    /// `caches` is transferred with `sending` (region isolation): the migrated
+    /// single request's per-layer batched caches, handed off once. The
+    /// constructor runs one priming decode step on the engine's executor.
+    func adoptMigrated(
         uid: Int,
         seedToken: Int,
         caches: sending [any BatchedCache],
@@ -253,9 +232,10 @@ actor EngineDriver {
         stateMachine: StopSequenceMatcher?,
         maxTokens: Int,
         numTokens: Int,
-        tokens: [Int]
-    ) -> sending DecodeBatch {
-        engine.makeAdoptedBatch(
+        tokens: [Int],
+        record: AdoptedRecord
+    ) {
+        let batch = engine.makeAdoptedBatch(
             uids: [uid],
             seedTokens: MLXArray([UInt32(seedToken)]),
             caches: caches,
@@ -265,6 +245,16 @@ actor EngineDriver {
             numTokens: [numTokens],
             tokens: [tokens]
         )
+        records[uid] = RequestRecord(
+            handler: record.handler,
+            promptTokenCount: record.promptTokenCount,
+            inputTokens: record.inputTokens,
+            modelName: record.modelName,
+            promptCacheSalt: record.promptCacheSalt,
+            submitTime: record.submitTime,
+            writeBackToPromptCache: record.writeBackToPromptCache
+        )
+        engine.adoptActiveBatch(batch)
     }
 
     // MARK: - Cancel
