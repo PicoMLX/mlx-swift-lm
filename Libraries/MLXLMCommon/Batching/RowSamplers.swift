@@ -16,15 +16,42 @@ import os
 // umbrella `import MLX` (as `Evaluate.swift` does with `categorical` /
 // `withRandomState`), so no explicit `import MLXRandom` is required.
 
+/// Builds a fresh per-row ``LogitProcessor`` (repetition / presence /
+/// frequency penalties) for the batched inference engine.
+///
+/// `LogitProcessor` is **not** `Sendable` and carries mutable per-row state
+/// (the penalty ring buffers), so a *built* processor must never cross an
+/// actor boundary. Instead the engine's public APIs accept this `@Sendable`
+/// factory: the scheduler/caller (potentially on another actor) constructs it
+/// from the `Sendable` ``GenerateParameters``, and the engine invokes it on
+/// its own executor to materialize the per-row processor just before building
+/// the batch -- exactly how `makeRowSampler` captures `Sendable` config and
+/// returns a `@Sendable` closure.
+///
+/// Returns `nil` when a row has no penalties configured.
+public typealias RowProcessorSource = @Sendable () -> LogitProcessor?
+
+/// Build a ``RowProcessorSource`` from ``GenerateParameters``.
+///
+/// The returned factory captures only the `Sendable` parameters and defers
+/// `parameters.processor()` (which allocates the penalty ring buffers) until
+/// the engine calls it on its executor. Returns a source that yields `nil`
+/// when no repetition/presence/frequency penalty is configured, mirroring
+/// `GenerateParameters.processor()`.
+public func makeRowProcessorSource(_ parameters: GenerateParameters) -> RowProcessorSource {
+    { parameters.processor() }
+}
+
 /// Build a `RowSampler` from OpenAI-style request parameters.
 ///
 /// Behavior, matching the single-request `TopPSampler` in `Evaluate.swift`
 /// (which mirrors `mlx_lm.sample_utils.make_sampler`):
 ///   - `temperature <= 0`: return `greedySampler` (no RNG, deterministic).
 ///   - `temperature > 0`: optionally mask the unscaled logprobs to top-P
-///     then top-K, scale by `1/temperature`, and sample categorically. The
-///     order (filter first, temperature at the draw) means one batched row
-///     reproduces single-stream sampling for the same params/seed.
+///     then min-P then top-K, scale by `1/temperature`, and sample
+///     categorically. The order (filter first, temperature at the draw)
+///     means one batched row reproduces single-stream sampling for the
+///     same params/seed.
 ///
 /// `seed` makes the resulting stream deterministic. Each call to the
 /// returned sampler advances the per-sampler PRNG key, so successive
@@ -38,11 +65,13 @@ import os
 ///   - temperature: 0 = greedy, otherwise the logits divisor.
 ///   - topP: nucleus probability mass (1.0 = disabled).
 ///   - topK: number of top tokens to keep (0 = disabled).
+///   - minP: min-P threshold relative to the most likely token (0 = disabled).
 ///   - seed: optional RNG seed; nil uses MLX's global PRNG.
 public func makeRowSampler(
     temperature: Float = 0.0,
     topP: Float = 1.0,
     topK: Int = 0,
+    minP: Float = 0.0,
     seed: UInt64? = nil
 ) -> RowSampler {
     if temperature <= 0 {
@@ -53,18 +82,20 @@ public func makeRowSampler(
     let temp = temperature
     let p = topP
     let k = topK
+    let mp = minP
 
     return { @Sendable logprobs in
         // Match the single-request `TopPSampler` exactly (Evaluate.swift):
-        // filter on the *unscaled* logprobs in top-P -> top-K order, then
-        // apply temperature at the categorical draw. The input is already
+        // filter on the *unscaled* logprobs in top-P -> min-P -> top-K order,
+        // then apply temperature at the categorical draw. The input is already
         // `logSoftmax(logits)` (see `DecodeBatch.step`), mirroring
         // `TopPSampler.sample`'s `logprobs = logSoftmax(logits)`. Applying
-        // temperature before top-P would reshape the softmax mass and change
-        // the nucleus boundary, so one batched row would diverge from
-        // single-stream sampling for the same params/seed.
+        // temperature before these filters would reshape the softmax mass and
+        // change the nucleus / min-P boundary, so one batched row would
+        // diverge from single-stream sampling for the same params/seed.
         var lp = logprobs
         if p > 0, p < 1 { lp = applyTopP(lp, p: p) }
+        if mp > 0 { lp = applyMinP(lp, minP: mp) }
         if k > 0 { lp = applyTopK(lp, k: k) }
         let key = keyHolder.next()
         return MLXRandom.categorical(lp * (1.0 / temp), axis: -1, key: key)
@@ -93,6 +124,28 @@ func applyTopK(_ logprobs: MLXArray, k: Int) -> MLXArray {
     // Indices at [k, V) after partitioning are the tokens to mask out.
     let maskIndices = MLX.argPartition(-logprobs, kth: k - 1, axis: -1)[.ellipsis, k...]
     return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
+}
+
+// MARK: - Min-P
+
+/// Keep tokens whose probability is at least `minP * maxProb`, masking the
+/// rest to `-inf`. Operates on log-probabilities, so the threshold in
+/// log-space is `maxLogprob + log(minP)`.
+///
+/// Mirrors the single-request `TopPSampler.applyMinP` in `Evaluate.swift`
+/// (`apply_min_p` from `mlx_lm.sample_utils`): the input is already
+/// `logSoftmax(logits)`, so comparing `logprobs >= maxLogprob + log(minP)`
+/// is equivalent to `prob >= minP * maxProb`. Applied between top-P and
+/// top-K to match the single path's `top_p -> min_p -> top_k` filter chain.
+@usableFromInline
+func applyMinP(_ logprobs: MLXArray, minP: Float) -> MLXArray {
+    // threshold in log-space: log(maxProb * minP) = maxLogprob + log(minP).
+    // Compute log(minP) via MLX (as `Evaluate.swift` does) to avoid scalar
+    // Float/Double ambiguity and to match the single path bit-for-bit.
+    let maxLogprob = logprobs.max(axis: -1, keepDims: true)
+    let threshold = maxLogprob + log(MLXArray(minP))
+    let negInf = MLXArray(-Float.infinity)
+    return which(logprobs .>= threshold, logprobs, negInf)
 }
 
 // MARK: - Top-P (nucleus)

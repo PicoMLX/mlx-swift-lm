@@ -25,6 +25,17 @@ public final class PrefillBatch {
 
     public private(set) var samplers: [RowSampler?]
     public let fallbackSampler: RowSampler
+
+    /// Whether `fallbackSampler` is the deterministic ``greedySampler``.
+    /// Forwarded to the ``DecodeBatch`` built in `generate(lastTokensOf:)` so
+    /// it can gate its greedy `argMax` fast path correctly.
+    public let fallbackIsGreedy: Bool
+
+    /// Per-row ``LogitProcessor`` (penalties), forwarded to the
+    /// ``DecodeBatch`` on `generate(lastTokensOf:)`. `nil` for a row with no
+    /// penalties. Built (non-`Sendable`) processors held directly because
+    /// `PrefillBatch` is actor-confined and never crosses an actor boundary.
+    public private(set) var processors: [LogitProcessor?]
     public private(set) var stateMachines: [StopSequenceMatcher]
 
     public init(
@@ -36,12 +47,17 @@ public final class PrefillBatch {
         prefillStepSize: Int = 2048,
         samplers: [RowSampler?]? = nil,
         fallbackSampler: @escaping RowSampler = greedySampler,
+        fallbackIsGreedy: Bool = true,
+        processors: [LogitProcessor?]? = nil,
         stateMachines: [StopSequenceMatcher]? = nil
     ) {
         precondition(uids.count == tokens.count, "uids/tokens count mismatch")
         precondition(uids.count == maxTokens.count, "uids/max_tokens count mismatch")
         if let samplers {
             precondition(uids.count == samplers.count, "uids/samplers count mismatch")
+        }
+        if let processors {
+            precondition(uids.count == processors.count, "uids/processors count mismatch")
         }
         if let stateMachines {
             precondition(uids.count == stateMachines.count, "uids/stateMachines count mismatch")
@@ -54,6 +70,8 @@ public final class PrefillBatch {
         self.prefillStepSize = prefillStepSize
         self.samplers = samplers ?? Array(repeating: nil, count: uids.count)
         self.fallbackSampler = fallbackSampler
+        self.fallbackIsGreedy = fallbackIsGreedy
+        self.processors = processors ?? Array(repeating: nil, count: uids.count)
         self.stateMachines =
             stateMachines
             ?? Array(
@@ -65,7 +83,8 @@ public final class PrefillBatch {
     public static func empty(
         model: any LanguageModel,
         prefillStepSize: Int = 2048,
-        fallbackSampler: @escaping RowSampler = greedySampler
+        fallbackSampler: @escaping RowSampler = greedySampler,
+        fallbackIsGreedy: Bool = true
     ) -> PrefillBatch {
         PrefillBatch(
             model: model,
@@ -76,6 +95,8 @@ public final class PrefillBatch {
             prefillStepSize: prefillStepSize,
             samplers: [],
             fallbackSampler: fallbackSampler,
+            fallbackIsGreedy: fallbackIsGreedy,
+            processors: [],
             stateMachines: []
         )
     }
@@ -183,6 +204,8 @@ public final class PrefillBatch {
             maxTokens: maxTokens,
             samplers: samplers,
             fallbackSampler: fallbackSampler,
+            fallbackIsGreedy: fallbackIsGreedy,
+            processors: processors,
             stateMachines: stateMachines
         )
 
@@ -190,6 +213,7 @@ public final class PrefillBatch {
         promptCache = []
         tokens = []
         samplers = []
+        processors = []
         maxTokens = []
         stateMachines = []
 
@@ -210,6 +234,7 @@ public final class PrefillBatch {
         uids = keep.map { uids[$0] }
         tokens = keep.map { tokens[$0] }
         samplers = keep.map { samplers[$0] }
+        processors = keep.map { processors[$0] }
         maxTokens = keep.map { maxTokens[$0] }
         stateMachines = keep.map { stateMachines[$0] }
     }
@@ -225,6 +250,7 @@ public final class PrefillBatch {
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
         samplers.append(contentsOf: other.samplers)
+        processors.append(contentsOf: other.processors)
         maxTokens.append(contentsOf: other.maxTokens)
         stateMachines.append(contentsOf: other.stateMachines)
     }
