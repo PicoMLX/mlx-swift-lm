@@ -95,15 +95,26 @@ public actor InferenceScheduler {
 
     /// Bind the model context the scheduler drives. Idempotent; the context is
     /// captured on first attach. Called by ``ModelContainer`` when the
-    /// scheduler is installed.
-    func attach(context: ModelContext, promptCache: (any PromptCaching)?) {
+    /// scheduler is first used.
+    ///
+    /// The context is transferred inside a `SendableBox` (the repo's existing
+    /// non-`Sendable` hand-off box, also used by `generateTask`): ``ModelContext``
+    /// carries non-`Sendable` model/processor references. The scheduler shares
+    /// the (already-evaluated) model weights with the container, the same way
+    /// ``ModelContainer/generate(input:parameters:wiredMemoryTicket:)`` permits
+    /// concurrent access to evaluated weights. No NEW `@unchecked Sendable` is
+    /// introduced — `SendableBox` is pre-existing infrastructure.
+    func attach(context box: SendableBox<ModelContext>, promptCache: (any PromptCaching)?) {
         if self.context == nil {
-            self.context = context
+            self.context = box.consume()
         }
         if self.promptCache == nil {
             self.promptCache = promptCache
         }
     }
+
+    /// Whether the scheduler already has a bound context.
+    var isAttached: Bool { context != nil }
 
     // MARK: - Stats
 
@@ -332,6 +343,32 @@ extension InferenceScheduler {
     public func submit(_ request: sending GenerationRequest) async throws
         -> AsyncStream<Generation>
     {
+        try await submitOne(request)
+    }
+
+    /// Submit several requests at once (the manual ``ModelContainer/generateBatched(_:)``
+    /// path), returning one stream per request in order. The array is
+    /// transferred with `sending` and owned by the actor; each request is
+    /// routed internally with no further boundary crossing.
+    public func submitBatch(_ requests: sending [GenerationRequest]) async throws
+        -> [AsyncStream<Generation>]
+    {
+        var remaining = requests
+        var streams: [AsyncStream<Generation>] = []
+        streams.reserveCapacity(remaining.count)
+        while !remaining.isEmpty {
+            // Within the actor the element is actor-isolated; moving it out and
+            // routing it does not cross an isolation boundary.
+            let request = remaining.removeFirst()
+            streams.append(try await submitOne(request))
+        }
+        return streams
+    }
+
+    /// Build the per-request stream + handler and route it.
+    private func submitOne(_ request: sending GenerationRequest) async throws
+        -> AsyncStream<Generation>
+    {
         guard let context else {
             throw BatchedGenerationError.schedulerBusy
         }
@@ -347,8 +384,7 @@ extension InferenceScheduler {
             request: request,
             handler: handler,
             inputTokens: request.input.text.tokens.asArray(Int.self),
-            modelName: context.configuration.name,
-            context: context
+            modelName: context.configuration.name
         )
 
         try await route(scheduled)
@@ -356,13 +392,14 @@ extension InferenceScheduler {
     }
 
     /// Internal carrier bundling a request with its derived routing data.
-    /// Not `Sendable`: holds the non-`Sendable` `GenerationRequest`/context.
+    /// Not `Sendable`: holds the non-`Sendable` `GenerationRequest`. The model
+    /// context is read from the actor's stored ``context`` rather than carried
+    /// here, so this value can be passed to `sending` routing methods.
     struct ScheduledRequest {
         var request: GenerationRequest
         let handler: SchedulerTokenHandler
         let inputTokens: [Int]
         let modelName: String
-        let context: ModelContext
     }
 
     private func route(_ scheduled: sending ScheduledRequest) async throws {
@@ -388,10 +425,25 @@ extension InferenceScheduler {
 
 extension InferenceScheduler {
 
+    /// Non-`Sendable` bundle of everything the single task needs that cannot
+    /// cross into the detached `Task` directly. Transferred via ``SendableBox``
+    /// (the repo's existing hand-off box; no new `@unchecked`).
+    private struct SingleTaskInputs {
+        let request: GenerationRequest
+        let model: any LanguageModel
+        let configuration: ModelConfiguration
+        let tokenizer: Tokenizer
+    }
+
     /// Start a request on the zero-overhead single-stream path. The task drives
     /// a ``TokenIterator``, streams decoded text to the handler, and checks the
     /// upgrade flag after each token so it can hand off its live state.
     private func startSingle(_ scheduled: sending ScheduledRequest) {
+        guard let context else {
+            scheduled.handler.finish()
+            return
+        }
+
         let requestID = nextRequestID
         nextRequestID += 1
 
@@ -403,22 +455,26 @@ extension InferenceScheduler {
         let salt = scheduled.request.promptCacheSalt
         let writeBack = scheduled.request.promptCache != nil
         let submitTime = Date.timeIntervalSinceReferenceDate
-
-        // Build the iterator inside the task to keep the non-Sendable
-        // TokenIterator confined to the task that drives it. The request is
-        // transferred in with `sending`.
-        let boxed = SendableBox(scheduled.request)
-        let model = scheduled.context.model
-        let configuration = scheduled.context.configuration
         let promptTokenCount = inputTokens.count
 
-        let tokenizer = scheduled.context.tokenizer
+        // Box the non-`Sendable` inputs (model/tokenizer/request) so the
+        // detached `@Sendable` task can consume them; the iterator is built and
+        // owned inside the task.
+        let boxed = SendableBox(
+            SingleTaskInputs(
+                request: scheduled.request,
+                model: context.model,
+                configuration: context.configuration,
+                tokenizer: context.tokenizer
+            ))
+
         let task = Task<Void, Never> { [weak self] in
+            let inputs = boxed.consume()
             await Self.runSingle(
-                request: boxed.consume(),
-                model: model,
-                configuration: configuration,
-                tokenizer: tokenizer,
+                request: inputs.request,
+                model: inputs.model,
+                configuration: inputs.configuration,
+                tokenizer: inputs.tokenizer,
                 handler: handler,
                 upgradeFlag: upgradeFlag,
                 promptTokenCount: promptTokenCount,
