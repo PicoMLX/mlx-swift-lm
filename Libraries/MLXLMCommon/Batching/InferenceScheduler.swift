@@ -410,7 +410,22 @@ extension InferenceScheduler {
             toolCallFormat: context.configuration.toolCallFormat ?? .json
         )
 
+        let requestID = nextRequestID
+        nextRequestID += 1
+
+        // Wire stream cancellation once, generically, before routing: a consumer
+        // that drops the stream — while held in the scheduler's queue, while
+        // waiting for batch capacity, during prefill, or mid-decode — cancels the
+        // request wherever it currently lives (single task, scheduler queue, or
+        // driver). Mirrors the historical `generateTask` `onTermination`
+        // cancellation, which the scheduler's own stream previously lacked except
+        // on the single path.
+        handler.onCancellation { [weak self] in
+            Task { await self?.cancel(requestID: requestID) }
+        }
+
         let scheduled = ScheduledRequest(
+            requestID: requestID,
             request: request,
             handler: handler,
             inputTokens: request.input.text.tokens.asArray(Int.self),
@@ -421,11 +436,50 @@ extension InferenceScheduler {
         return stream
     }
 
+    /// Cancel a request by its scheduler-owned id, wherever it currently lives.
+    /// Invoked when a consumer drops its stream (the `onCancellation` wiring in
+    /// ``submitOne(_:)``):
+    ///
+    /// - On the single path (`.single`/`.pendingUpgrade`) for this request:
+    ///   cancel its task; the task closes the stream and reports back through
+    ///   ``singleTaskFinished(requestID:generatedTokenIds:)``, which returns the
+    ///   scheduler to `.idle` and drains any queued requests.
+    /// - Held in the scheduler's queue (waiting behind a non-upgradeable single
+    ///   request): drop it and close its stream.
+    /// - Otherwise: forward to the driver, which removes it whether it is still
+    ///   waiting for batch capacity or already decoding in the engine.
+    private func cancel(requestID: Int) async {
+        let runningSingle: SingleRequest?
+        switch state {
+        case .single(let s), .pendingUpgrade(let s):
+            runningSingle = s.requestID == requestID ? s : nil
+        default:
+            runningSingle = nil
+        }
+        if let runningSingle {
+            runningSingle.task.cancel()
+            return
+        }
+
+        if let index = queuedRequests.firstIndex(where: { $0.requestID == requestID }) {
+            let dropped = queuedRequests.remove(at: index)
+            dropped.handler.finish()
+            return
+        }
+
+        await driver?.cancel(token: requestID)
+    }
+
     /// Internal carrier bundling a request with its derived routing data.
     /// Not `Sendable`: holds the non-`Sendable` `GenerationRequest`. The model
     /// context is read from the actor's stored ``context`` rather than carried
     /// here, so this value can be passed to `sending` routing methods.
     struct ScheduledRequest {
+        /// Scheduler-owned stable id, allocated when the stream is created. Used
+        /// as the single-task id, the queue identity, and the driver's cancel
+        /// token, so a single ``cancel(requestID:)`` can stop the request
+        /// wherever it currently lives.
+        let requestID: Int
         var request: GenerationRequest
         let handler: SchedulerTokenHandler
         let inputTokens: [Int]
@@ -493,8 +547,9 @@ extension InferenceScheduler {
             return
         }
 
-        let requestID = nextRequestID
-        nextRequestID += 1
+        // Reuse the stream's stable id (allocated in `submitOne`) so the generic
+        // `cancel(requestID:)` resolves to this task.
+        let requestID = scheduled.requestID
 
         let upgradeFlag = UpgradeFlag()
         let handler = scheduled.handler
@@ -537,10 +592,9 @@ extension InferenceScheduler {
             )
         }
 
-        // Wire stream cancellation to the single task so a consumer that drops
-        // the stream during prefill (before the first token) stops the work
-        // promptly, matching the historical `generateTask` semantics.
-        handler.onCancellation { task.cancel() }
+        // Stream cancellation is wired generically in `submitOne` (routing to
+        // `cancel(requestID:)`, which cancels this task when this request is the
+        // running single one).
 
         let single = SingleRequest(
             requestID: requestID,
@@ -795,6 +849,7 @@ extension InferenceScheduler {
         // Pull the Sendable routing fields out first, then build the request as
         // the sole non-Sendable value handed to the driver via `sending`.
         let handler = scheduled.handler
+        let cancelToken = scheduled.requestID
         let sampler = Self.rowSampler(for: scheduled.request.parameters)
         let maxTokens = scheduled.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
@@ -810,6 +865,7 @@ extension InferenceScheduler {
         await driver.submit(
             req,
             handler: handler,
+            cancelToken: cancelToken,
             maxTokens: maxTokens,
             sampler: sampler,
             stateMachine: nil
@@ -1016,6 +1072,9 @@ extension InferenceScheduler {
         let stopMatcher = defaultStopMatcher()
         let firstRecord = EngineDriver.AdoptedRecord(
             handler: single.handler,
+            // The adopted row keeps the original request's stable id, so a later
+            // stream cancellation routes through `cancel(requestID:)` to it.
+            cancelToken: single.requestID,
             promptTokenCount: single.inputTokens.count,
             inputTokens: single.inputTokens,
             modelName: single.modelName,
@@ -1048,6 +1107,7 @@ extension InferenceScheduler {
         state = .batched
 
         let joinHandler = joining.handler
+        let joinCancelToken = joining.requestID
         let joinSampler = Self.rowSampler(for: joining.request.parameters)
         let joinMax = joining.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
@@ -1062,6 +1122,7 @@ extension InferenceScheduler {
         await driver.submit(
             req,
             handler: joinHandler,
+            cancelToken: joinCancelToken,
             maxTokens: joinMax,
             sampler: joinSampler,
             stateMachine: nil

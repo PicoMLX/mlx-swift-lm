@@ -35,6 +35,9 @@ actor EngineDriver {
     /// finished row. The handler is `Sendable`; the rest are value types.
     private struct RequestRecord {
         let handler: SchedulerTokenHandler
+        /// Scheduler-owned stable id, used to cancel this row by token (e.g. on
+        /// stream cancellation) without the caller knowing the engine UID.
+        let cancelToken: Int
         let promptTokenCount: Int
         let inputTokens: [Int]
         let modelName: String
@@ -96,6 +99,7 @@ actor EngineDriver {
     private struct PendingSubmission {
         let request: SchedulerRequest
         let handler: SchedulerTokenHandler
+        let cancelToken: Int
         let maxTokens: Int
         let sampler: RowSampler?
         let stateMachine: StopSequenceMatcher?
@@ -171,6 +175,7 @@ actor EngineDriver {
     func submit(
         _ request: sending SchedulerRequest,
         handler: SchedulerTokenHandler,
+        cancelToken: Int,
         maxTokens: Int,
         sampler: RowSampler?,
         stateMachine: StopSequenceMatcher?
@@ -180,6 +185,7 @@ actor EngineDriver {
                 PendingSubmission(
                     request: request,
                     handler: handler,
+                    cancelToken: cancelToken,
                     maxTokens: maxTokens,
                     sampler: sampler,
                     stateMachine: stateMachine
@@ -189,6 +195,7 @@ actor EngineDriver {
         return admit(
             request,
             handler: handler,
+            cancelToken: cancelToken,
             maxTokens: maxTokens,
             sampler: sampler,
             stateMachine: stateMachine
@@ -199,6 +206,7 @@ actor EngineDriver {
     private func admit(
         _ request: SchedulerRequest,
         handler: SchedulerTokenHandler,
+        cancelToken: Int,
         maxTokens: Int,
         sampler: RowSampler?,
         stateMachine: StopSequenceMatcher?
@@ -225,6 +233,7 @@ actor EngineDriver {
         }
         records[uid] = RequestRecord(
             handler: handler,
+            cancelToken: cancelToken,
             promptTokenCount: request.inputTokens.count,
             inputTokens: request.inputTokens,
             modelName: request.modelName,
@@ -243,6 +252,9 @@ actor EngineDriver {
     /// public hand-off shape.
     struct AdoptedRecord {
         let handler: SchedulerTokenHandler
+        /// Scheduler-owned stable id, so an adopted (upgraded) row can be
+        /// cancelled by token if its consumer drops the stream.
+        let cancelToken: Int
         let promptTokenCount: Int
         let inputTokens: [Int]
         let modelName: String
@@ -285,6 +297,7 @@ actor EngineDriver {
         )
         records[uid] = RequestRecord(
             handler: record.handler,
+            cancelToken: record.cancelToken,
             promptTokenCount: record.promptTokenCount,
             inputTokens: record.inputTokens,
             modelName: record.modelName,
@@ -313,6 +326,26 @@ actor EngineDriver {
         // A finished/cancelled row freed a slot; pull in any waiters.
         admitWaitingIfPossible()
         return removed
+    }
+
+    /// Cancel a request by its scheduler-owned token, wherever it currently
+    /// lives: waiting for batch capacity (drop from the queue and close its
+    /// stream) or admitted to the engine (route through ``cancel(uid:)``). Used
+    /// when a consumer drops the stream before, or after, the request reaches
+    /// the engine. Returns whether anything was removed.
+    @discardableResult
+    func cancel(token: Int) -> Bool {
+        if let index = waiting.firstIndex(where: { $0.cancelToken == token }) {
+            let pending = waiting.remove(at: index)
+            pending.handler.finish()
+            // A waiter never occupied an engine slot, so there is nothing to
+            // re-admit here.
+            return true
+        }
+        if let uid = records.first(where: { $0.value.cancelToken == token })?.key {
+            return cancel(uid: uid)
+        }
+        return false
     }
 
     // MARK: - Decode loop
@@ -452,6 +485,7 @@ actor EngineDriver {
             _ = admit(
                 pending.request,
                 handler: pending.handler,
+                cancelToken: pending.cancelToken,
                 maxTokens: pending.maxTokens,
                 sampler: pending.sampler,
                 stateMachine: pending.stateMachine
