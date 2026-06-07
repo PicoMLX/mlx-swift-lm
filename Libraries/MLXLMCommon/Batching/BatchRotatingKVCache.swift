@@ -768,8 +768,17 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
             cache.state = [extractedK, extractedV]
             cache.offset = seqOffset
-            // Set metaState to configure idx properly
-            let cacheIdx = extractedK.dim(2)
+            // Restore `idx` as the row's logical cache write position, not the
+            // padded tensor length. In the rotated path the slice keeps trailing
+            // padded slots beyond this row's `seqOffset` (a shorter/left-padded
+            // row in a globally-rotated batch), so `extractedK.dim(2)` would push
+            // the next write past those pad slots while `offset == seqOffset`,
+            // landing the next token outside the returned `..<(offset+1)` slice and
+            // losing the first post-extraction token. Clamp to the logical length
+            // (`min(seqOffset, maxCacheSize)`) and the physical tensor length so a
+            // full row still restores `idx == maxCacheSize` (wraps to `keep`) while
+            // a shorter row writes at its true logical position.
+            let cacheIdx = min(min(seqOffset, maxCacheSize), extractedK.dim(2))
             cache.metaState = [
                 String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
             ]
