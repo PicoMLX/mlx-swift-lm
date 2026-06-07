@@ -112,9 +112,16 @@ extension SchedulerTokenHandler {
                             return false
                         }
                     }
-                    if let toolCall = state.toolCallProcessor.toolCalls.popLast() {
-                        if case .terminated = box.continuation.yield(.toolCall(toolCall)) {
-                            return false
+                    // Drain ALL accumulated tool calls in FIFO order (popLast
+                    // would emit only the last one, in LIFO order, and delay the
+                    // rest to end-of-sequence).
+                    if !state.toolCallProcessor.toolCalls.isEmpty {
+                        let pending = state.toolCallProcessor.toolCalls
+                        state.toolCallProcessor.toolCalls.removeAll()
+                        for toolCall in pending {
+                            if case .terminated = box.continuation.yield(.toolCall(toolCall)) {
+                                return false
+                            }
                         }
                     }
                     return true

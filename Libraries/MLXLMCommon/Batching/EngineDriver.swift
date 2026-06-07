@@ -43,6 +43,22 @@ actor EngineDriver {
         /// Whether to write this request's final KV state back to the prompt
         /// cache when it finishes.
         let writeBackToPromptCache: Bool
+        /// Whether the engine's `allTokens` for this row includes the prompt
+        /// (true for freshly-prefilled rows, where `PrefillBatch` appends the
+        /// prompt; false for adopted/upgraded rows, whose history is seeded with
+        /// generated-only tokens). Controls how `generationTokenCount` is
+        /// derived in the completion info.
+        let tokensIncludePrompt: Bool
+    }
+
+    /// The number of generated tokens for a finished row, excluding prompt
+    /// tokens when the engine's history includes them.
+    private func generationCount(_ record: RequestRecord, allTokens: [Int]?) -> Int {
+        let total = allTokens?.count ?? 0
+        if record.tokensIncludePrompt {
+            return max(0, total - record.promptTokenCount)
+        }
+        return total
     }
 
     /// The sole owner of the engine. Never escapes the actor.
@@ -66,6 +82,14 @@ actor EngineDriver {
     /// Whether a decode loop is currently running, so `submit`/`adopt` does not
     /// start a second one (the loop already drains all work).
     private var draining = false
+
+    /// The most recently supplied wired-memory ticket from an admitted request.
+    /// The decode loop runs each step under this limit when set, so callers that
+    /// rely on `wiredMemoryTicket` to bound generation still get a memory policy
+    /// on the batched path. (A batch may serve several requests; the latest
+    /// non-nil ticket governs — tickets are a coordination mechanism, not
+    /// per-row state.)
+    private var activeWiredMemoryTicket: WiredMemoryTicket?
 
     /// A request waiting for batch capacity. Carries everything `submit` needs
     /// to admit it later.
@@ -186,6 +210,9 @@ actor EngineDriver {
             handler.finish()
             return nil
         }
+        if let ticket = request.wiredMemoryTicket {
+            activeWiredMemoryTicket = ticket
+        }
         records[uid] = RequestRecord(
             handler: handler,
             promptTokenCount: request.inputTokens.count,
@@ -193,7 +220,8 @@ actor EngineDriver {
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
             submitTime: Date.timeIntervalSinceReferenceDate,
-            writeBackToPromptCache: request.promptCache != nil
+            writeBackToPromptCache: request.promptCache != nil,
+            tokensIncludePrompt: true
         )
         return uid
     }
@@ -252,7 +280,11 @@ actor EngineDriver {
             modelName: record.modelName,
             promptCacheSalt: record.promptCacheSalt,
             submitTime: record.submitTime,
-            writeBackToPromptCache: record.writeBackToPromptCache
+            writeBackToPromptCache: record.writeBackToPromptCache,
+            // Adopted rows are seeded with generated-only history (the prompt
+            // was consumed by the single iterator's prefill), so `allTokens`
+            // already excludes the prompt.
+            tokensIncludePrompt: false
         )
         engine.adoptActiveBatch(batch)
     }
@@ -301,11 +333,15 @@ actor EngineDriver {
         draining = true
         defer { draining = false }
 
+        // An explicit override wins; otherwise use the ticket captured from
+        // admitted requests so scheduler-driven drains keep the memory policy.
+        let ticketForLoop = wiredMemoryTicket ?? activeWiredMemoryTicket
+
         while true {
             admitWaitingIfPossible()
             if !engine.hasWork { break }
 
-            if let ticket = wiredMemoryTicket {
+            if let ticket = ticketForLoop {
                 await WiredMemoryTicket.withWiredLimit(ticket) {
                     self.stepOnce(onResult: onResult)
                 }
@@ -353,10 +389,9 @@ actor EngineDriver {
             handler.processEndOfSequence()
 
             let now = Date.timeIntervalSinceReferenceDate
-            let generatedCount = response.allTokens?.count ?? 0
             let info = GenerateCompletionInfo(
                 promptTokenCount: record.promptTokenCount,
-                generationTokenCount: generatedCount,
+                generationTokenCount: generationCount(record, allTokens: response.allTokens),
                 promptTime: 0,
                 generationTime: max(0, now - record.submitTime),
                 stopReason: reason
@@ -366,10 +401,10 @@ actor EngineDriver {
             records.removeValue(forKey: response.uid)
         } else {
             if handler.processToken(response.token) == false {
-                // Consumer cancelled mid-stream: drop the row from the engine.
-                engine.cancel(uid: response.uid)
-                handler.finish()
-                records.removeValue(forKey: response.uid)
+                // Consumer cancelled mid-stream. Route through `cancel(uid:)` so
+                // the engine drop, stream finish, record removal, and waiting-
+                // queue admission all happen in one place.
+                cancel(uid: response.uid)
             }
         }
     }

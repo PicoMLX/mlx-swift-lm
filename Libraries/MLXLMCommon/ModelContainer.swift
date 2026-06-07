@@ -298,6 +298,12 @@ public final class ModelContainer: Sendable {
         guard !requests.isEmpty else {
             throw BatchedGenerationError.batchTooSmall
         }
+        // VLM inputs carry image/video tensors the text-only batch prefill does
+        // not handle; reject them rather than silently dropping the media.
+        let loadedAsVLM = await context.read { $0.loadedAsVLM }
+        guard !loadedAsVLM else {
+            throw BatchedGenerationError.incompatibleRequests(Array(requests.indices))
+        }
         try await attachSchedulerIfNeeded(scheduler)
         // The whole array is transferred to the scheduler actor, which owns it
         // and routes each request internally (no per-element boundary crossing).

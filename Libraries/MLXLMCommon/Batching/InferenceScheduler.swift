@@ -482,6 +482,11 @@ extension InferenceScheduler {
             )
         }
 
+        // Wire stream cancellation to the single task so a consumer that drops
+        // the stream during prefill (before the first token) stops the work
+        // promptly, matching the historical `generateTask` semantics.
+        handler.onCancellation { task.cancel() }
+
         let single = SingleRequest(
             requestID: requestID,
             task: task,
@@ -670,6 +675,22 @@ extension InferenceScheduler {
         stopTokenIds(configuration: configuration, tokenizer: tokenizer).map { [$0] }
     }
 
+    /// The default per-row stop matcher (model EOS), matching what
+    /// `BatchInferenceEngine.insert` installs for freshly-admitted rows. Used
+    /// for the adopted (upgraded) row so it keeps stopping on EOS instead of
+    /// running to `maxTokens` (`DecodeBatch.init` does not fall back to the
+    /// engine default the way `insert` does).
+    private func defaultStopMatcher() -> StopSequenceMatcher? {
+        guard let context else { return nil }
+        let sequences = Self.eosSequences(
+            configuration: context.configuration, tokenizer: context.tokenizer)
+        guard !sequences.isEmpty else { return nil }
+        return StopSequenceMatcher(
+            states: ["normal": sequences.map { (sequence: $0, next: nil) }],
+            initial: "normal"
+        )
+    }
+
     /// Admit a request directly to the batch engine and ensure the driver's
     /// decode loop is running. Used for 3rd+ concurrent requests and for the
     /// manual ``generateBatched(_:)`` path.
@@ -695,7 +716,8 @@ extension InferenceScheduler {
             inputTokens: scheduled.inputTokens,
             modelName: scheduled.modelName,
             promptCache: scheduled.request.promptCache,
-            promptCacheSalt: scheduled.request.promptCacheSalt
+            promptCacheSalt: scheduled.request.promptCacheSalt,
+            wiredMemoryTicket: scheduled.request.wiredMemoryTicket
         )
 
         await driver.submit(
@@ -725,10 +747,16 @@ extension InferenceScheduler {
         }
     }
 
-    /// Build a `RowSampler` from generation parameters. Note: penalties
-    /// (`LogitProcessor`: repetition/presence/frequency) are NOT represented by
-    /// `RowSampler` and are dropped on the batched path; only
-    /// temperature/top-p/top-k carry over. See the upgrade TODO.
+    /// Build a `RowSampler` from generation parameters.
+    ///
+    /// - Note: The batched engine samples per row via the `RowSampler` closure,
+    ///   which currently models temperature/top-p/top-k only. These are NOT yet
+    ///   carried over to the batched/upgraded path and behave as the single
+    ///   stream's `GenerateParameters.sampler()`/`.processor()` would otherwise:
+    ///   - `minP` (min-p truncation),
+    ///   - `LogitProcessor` penalties (repetition / presence / frequency).
+    ///   TODO(PR4 sampling-parity): extend `makeRowSampler` with min-p and a
+    ///   per-row penalty processor so the batched path matches the single path.
     static func rowSampler(for parameters: GenerateParameters) -> RowSampler {
         makeRowSampler(
             temperature: parameters.temperature,
@@ -820,21 +848,51 @@ extension InferenceScheduler {
         let liveParameters = live.parameters
         let liveGeneratedTokenIds = live.generatedTokenIds
 
-        let remainingBudget = (liveMaxTokens ?? Int.max) - liveTokenCount
+        // `liveCurrentToken` is the token the single `TokenIterator` already
+        // sampled but has not yet returned/delivered. It must be EOS-checked and
+        // delivered here; the adopted batch then seeds from it (the batch's
+        // priming step consumes the seed without re-emitting it, so delivering
+        // it manually avoids dropping exactly one token at the hand-off).
+        let stopIds: Set<Int>
+        if let context {
+            stopIds = Self.stopTokenIds(
+                configuration: context.configuration, tokenizer: context.tokenizer)
+        } else {
+            stopIds = []
+        }
+        let liveTokenIsStop = stopIds.contains(liveCurrentToken)
+
+        // Use the engine's own default budget when unset, matching admitToBatch.
+        let budgetLimit = liveMaxTokens ?? defaultMaxTokens
+        let remainingBudget = budgetLimit - liveTokenCount
 
         guard let driver = await ensureDriver() else {
-            // Cannot batch this model: deliver the joining request on a fresh
-            // single path. (The original request's tokens were already
-            // streamed; it cannot continue without batching — close it.)
-            single.handler.finish()
+            // Cannot batch this model: deliver the last token, finalize the
+            // original stream cleanly, then run the joining request fresh.
+            finishUpgradedSingle(
+                handler: single.handler,
+                lastToken: liveTokenIsStop ? nil : liveCurrentToken,
+                promptTokenCount: single.inputTokens.count,
+                generatedCount: liveGeneratedTokenIds.count,
+                submitTime: single.submitTime,
+                reason: liveTokenIsStop ? .stop : .length
+            )
             startSingleAfterUpgradeFallback(joining)
             return
         }
 
-        guard remainingBudget > 0 else {
-            // Zero remaining budget: the original is effectively done. Finish
-            // it and run the joining request.
-            single.handler.finish()
+        if liveTokenIsStop || remainingBudget <= 0 {
+            // The original is already done (EOS reached, or no budget left).
+            // Finalize it cleanly (delivering the final non-stop token) and run
+            // the joining request through the batch.
+            finishUpgradedSingle(
+                handler: single.handler,
+                lastToken: liveTokenIsStop ? nil : liveCurrentToken,
+                promptTokenCount: single.inputTokens.count,
+                generatedCount: liveGeneratedTokenIds.count,
+                submitTime: single.submitTime,
+                reason: liveTokenIsStop ? .stop : .length
+            )
             await admitToBatch(joining)
             return
         }
@@ -842,20 +900,34 @@ extension InferenceScheduler {
         // Migrate the live caches LAST (consumes `live.cache`). After this point
         // `live` must not be read.
         guard let batchedCaches = Self.migrateCaches(live.cache) else {
-            // Migration unsupported for this cache topology. Close the original
-            // (its KV cannot be carried) and start the joining request fresh.
+            // Migration unsupported for this cache topology. The original's KV
+            // cannot be carried into the batch, so finalize it cleanly
+            // (delivering its last token + completion info — never truncate
+            // silently) and run the joining request fresh.
             // TODO(PR4 auto-upgrade): extend fromSingle to SSM/composite so this
             // fallback is unreachable for those models.
-            single.handler.finish()
+            finishUpgradedSingle(
+                handler: single.handler,
+                lastToken: liveCurrentToken,
+                promptTokenCount: single.inputTokens.count,
+                generatedCount: liveGeneratedTokenIds.count,
+                submitTime: single.submitTime,
+                reason: .length
+            )
             await admitToBatch(joining)
             return
         }
+
+        // Deliver the live token to the original handler before adoption (the
+        // batch will seed from it but not re-emit it).
+        _ = single.handler.processToken(liveCurrentToken)
 
         // Phase 2: build the adopted decode batch from migrated state.
         let firstUID = nextRequestID
         nextRequestID += 1
 
         let sampler = Self.rowSampler(for: liveParameters)
+        let stopMatcher = defaultStopMatcher()
         let firstRecord = EngineDriver.AdoptedRecord(
             handler: single.handler,
             promptTokenCount: single.inputTokens.count,
@@ -866,15 +938,17 @@ extension InferenceScheduler {
             writeBackToPromptCache: single.writeBackToPromptCache
         )
         // Build + splice the migrated batch entirely on the driver (the
-        // DecodeBatch never crosses an isolation boundary).
+        // DecodeBatch never crosses an isolation boundary). The live token was
+        // already produced, so the adopted row's budget excludes it (numTokens:
+        // 1) and it keeps the model's EOS stop matcher.
         await driver.adoptMigrated(
             uid: firstUID,
             seedToken: liveCurrentToken,
             caches: batchedCaches,
             sampler: sampler,
-            stateMachine: nil,
-            maxTokens: remainingBudget,
-            numTokens: 0,
+            stateMachine: stopMatcher,
+            maxTokens: budgetLimit,
+            numTokens: liveTokenCount + 1,
             tokens: liveGeneratedTokenIds,
             record: firstRecord
         )
@@ -893,7 +967,8 @@ extension InferenceScheduler {
             inputTokens: joining.inputTokens,
             modelName: joining.modelName,
             promptCache: joining.request.promptCache,
-            promptCacheSalt: joining.request.promptCacheSalt
+            promptCacheSalt: joining.request.promptCacheSalt,
+            wiredMemoryTicket: joining.request.wiredMemoryTicket
         )
         await driver.submit(
             req,
@@ -904,6 +979,35 @@ extension InferenceScheduler {
         )
 
         startBatchLoop(driver)
+    }
+
+    /// Finalize an upgraded single request's stream when it will not actually
+    /// join the batch (EOS reached at the hand-off, no budget, or unsupported
+    /// cache migration). Delivers a final non-stop token (if any), flushes
+    /// pending tool calls, emits completion info, and closes the stream — so the
+    /// original request is never silently truncated.
+    private func finishUpgradedSingle(
+        handler: SchedulerTokenHandler,
+        lastToken: Int?,
+        promptTokenCount: Int,
+        generatedCount: Int,
+        submitTime: TimeInterval,
+        reason: GenerateStopReason
+    ) {
+        if let lastToken {
+            _ = handler.processToken(lastToken)
+        }
+        handler.processEndOfSequence()
+        let now = Date.timeIntervalSinceReferenceDate
+        let info = GenerateCompletionInfo(
+            promptTokenCount: promptTokenCount,
+            generationTokenCount: generatedCount + (lastToken == nil ? 0 : 1),
+            promptTime: 0,
+            generationTime: max(0, now - submitTime),
+            stopReason: reason
+        )
+        handler.yieldInfo(info)
+        handler.finish()
     }
 
     /// Fallback when an upgrade cannot batch the model: run the joining request
