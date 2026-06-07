@@ -171,10 +171,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// The maximum size of this cache (sliding window size).
     public override var maxSize: Int? { maxCacheSize }
 
-    /// The scalar offset (returns `_idx` for compatibility with KVCache protocol).
+    /// The logical cache length, capped at `maxCacheSize`.
+    ///
+    /// `_idx` is the circular write pointer (reset to `keep` on wrap), so it is
+    /// not a valid position to expose to generic callers: after the first
+    /// rotation it jumps backward. Paths that derive masks from `cache.offset`
+    /// rather than `makeMask` — e.g. the array-based `createAttentionMask(h:cache:)`
+    /// used by `Gemma2ModelInner` during multi-token cached prefill — would then
+    /// build masks with too small an offset. Report the monotonic logical length
+    /// (`_scalarOffset`) capped at the window, mirroring how single-stream
+    /// `RotatingKVCache.offset` reports a monotonic position rather than the ring
+    /// index. The setter drives `_scalarOffset` for symmetry.
     public override var offset: Int {
-        get { _idx }
-        set { _idx = newValue }
+        get { min(_scalarOffset, maxCacheSize) }
+        set { _scalarOffset = newValue }
     }
 
     /// Initialize a BatchRotatingKVCache with a maximum size and left-padding per sequence.
@@ -633,7 +643,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// If the rotation states differ, both caches are put into temporal order first.
     ///
     /// - Parameter other: The other BatchRotatingKVCache to merge into this one.
+    ///
+    /// Admission contract: the engine prefills every admitted sub-batch before
+    /// extending the active batch, so a non-empty `other` always arrives with a
+    /// populated KV buffer. This precondition makes that contract explicit and
+    /// closes the "append empty admitted rows" hole: an `other` that carries row
+    /// metadata (`batchSize > 0`) but no prefilled keys is rejected here instead
+    /// of silently dropping those rows from the enlarged batch.
     public func extend(other: BatchRotatingKVCache) {
+        precondition(
+            other.keys != nil || other.batchSize == 0,
+            "BatchRotatingKVCache.extend requires a non-empty `other` to be "
+                + "prefilled (keys != nil) before extending; the engine prefills "
+                + "each admitted sub-batch before calling extend."
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
