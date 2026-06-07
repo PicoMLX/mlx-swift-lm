@@ -233,9 +233,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
 
-        // Shift left to reduce padding
+        // Shift left to reduce padding. Only meaningful once a KV buffer exists:
+        // for a fresh/cancelled-before-prefill cache the tensor slices are no-ops,
+        // but decrementing `_idx` would drive it negative and leave `batchOffsets`
+        // inconsistent with the adjusted padding, corrupting the `prev` range used
+        // by the next prefill. Skip the shift entirely while `keys == nil`.
         let minLeftPad = leftPadding.min().item(Int32.self)
-        if minLeftPad > 0 {
+        if minLeftPad > 0, keys != nil {
             let padInt = Int(minLeftPad)
             keys = keys?[.ellipsis, padInt..., 0...]
             values = values?[.ellipsis, padInt..., 0...]

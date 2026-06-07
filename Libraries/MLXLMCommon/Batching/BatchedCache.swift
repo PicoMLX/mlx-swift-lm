@@ -95,6 +95,26 @@ public final class BatchedCacheList: CacheList, BatchedCache {
             cache.advanceBatched(n)
         }
     }
+
+    /// Deep-copy as a `BatchedCacheList`, preserving the `BatchedCache` wrapper.
+    ///
+    /// `CacheList.copy()` rebuilds a plain `CacheList` from copied children, which
+    /// would strip the continuous-batching protocol from a snapshot taken after the
+    /// factory builds a composite batched cache. Each batched child's `copy()`
+    /// returns the same concrete batched type, so it re-conforms to `BatchedCache`.
+    public override func copy() -> any KVCache {
+        BatchedCacheList(
+            caches: batchedCaches.map { child in
+                guard let copied = child.copy() as? any BatchedCache else {
+                    preconditionFailure(
+                        "BatchedCache.copy() must return a BatchedCache for "
+                            + "BatchedCacheList snapshots"
+                    )
+                }
+                return copied
+            }
+        )
+    }
 }
 
 // MARK: - SSM cache conformance
