@@ -249,20 +249,19 @@ public final class LRUPromptCache: PersistablePromptCache {
     ) {
         guard !tokens.isEmpty, Self.isCacheCompatible(promptCache) else { return }
         let snapshot = Self.materializedCopy(promptCache, tokenCount: tokens.count)
-        // Require the stored state to cover the full token key. A layer's
-        // `offset` is its covered-token-count (`KVCacheSimple.state` sets
+        // Require *every* layer to cover the full token key. A layer's `offset`
+        // is its covered-token-count (`KVCacheSimple.state` sets
         // `offset = keys.dim(2)`; `RotatingKVCache` restores `offset` from
         // `metaState`, always copied by `materializedCopy`), mirroring how the
         // fetch path equates a stored entry's covered length with its token
-        // count. Reject when the snapshot covers fewer tokens than `tokens`:
-        //   - covered length 0 (an array of empty/unpopulated caches) would let
-        //     a later exact lookup report the tokens as "reused" while handing
-        //     back caches with no usable state; and
-        //   - a partial/trimmed cache shorter than `tokens` would be recorded
-        //     for the full sequence, so an exact fetch reports every token as
-        //     reused while returning a smaller offset, letting callers skip
-        //     evaluating the missing suffix.
-        let coveredLength = snapshot.map(\.offset).max() ?? 0
+        // count. Use the *minimum* covered length across layers so a mixed-depth
+        // snapshot (one populated layer plus a short/empty layer) is rejected
+        // rather than recorded for the full sequence — otherwise a later exact
+        // fetch reports every token as reused while returning the shorter,
+        // unusable layer. This also subsumes the empty-state case: covered
+        // length 0 (an array of empty/unpopulated caches) is < non-empty
+        // `tokens.count`, so it is skipped.
+        let coveredLength = snapshot.map(\.offset).min() ?? 0
         guard !snapshot.isEmpty, coveredLength >= tokens.count else { return }
 
         state.withLockUnchecked { state in
@@ -342,10 +341,12 @@ public final class LRUPromptCache: PersistablePromptCache {
                 .filter { Self.isDiskPersistable($0.promptCache) }
                 .map(\.fileStem)
         )
-        // Models this cache currently manages. Stale-sidecar cleanup is scoped
-        // to these so saving a cache that only holds model A never deletes
-        // model B's committed entries from a shared persistence directory.
-        let liveModels = Set(snapshots.map(\.key.model))
+        // The `(model, salt)` pairs this cache currently manages. Stale-sidecar
+        // cleanup is scoped to these so a shared persistence directory is never
+        // corrupted: saving a cache that only holds model A never deletes model
+        // B's committed entries, and — because salt is part of the cache key —
+        // saving one salt never deletes another salt's same-model entries.
+        let liveKeys = Set(snapshots.map(\.key))
 
         for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
             let baseURL = directory.appendingPathComponent(snapshot.fileStem)
@@ -394,7 +395,7 @@ public final class LRUPromptCache: PersistablePromptCache {
         }
 
         try Self.removeStaleSidecars(
-            directory: directory, liveStems: liveStems, liveModels: liveModels)
+            directory: directory, liveStems: liveStems, liveKeys: liveKeys)
 
         if let maxDiskBytes {
             try Self.enforceDiskBudget(directory: directory, maxDiskBytes: maxDiskBytes)
@@ -409,15 +410,17 @@ public final class LRUPromptCache: PersistablePromptCache {
     /// Deletion is scoped two ways so a shared persistence directory is never
     /// corrupted: only `entry_`-prefixed final sidecars are considered (via
     /// ``isFinalSidecar``), and a stale sidecar is removed only when it decodes
-    /// to valid metadata whose `model` is one this cache manages (`liveModels`).
-    /// A sidecar that can't be decoded, or whose model this cache doesn't own
-    /// (for example another cache instance or model scope sharing the directory,
-    /// which `load(from:allowedModels:)` supports), is left untouched. When in
-    /// doubt, do not delete.
+    /// to valid metadata whose `(model, salt)` is one this cache manages
+    /// (`liveKeys`). Salt is part of the cache key, so scoping on model alone
+    /// would let one salt delete another salt's same-model entries. A sidecar
+    /// that can't be decoded, or whose `(model, salt)` this cache doesn't own
+    /// (for example another cache instance or model/salt scope sharing the
+    /// directory, which `load(from:allowedModels:)` supports), is left
+    /// untouched. When in doubt, do not delete.
     private static func removeStaleSidecars(
         directory: URL,
         liveStems: Set<String>,
-        liveModels: Set<String>
+        liveKeys: Set<RootKey>
     ) throws {
         let fileManager = FileManager.default
         let sidecars = try fileManager.contentsOfDirectory(
@@ -432,11 +435,12 @@ public final class LRUPromptCache: PersistablePromptCache {
             let stem = sidecarURL.deletingPathExtension().lastPathComponent
             guard !liveStems.contains(stem) else { continue }
             // Only delete sidecars this cache owns: decode the metadata and
-            // require its model to be one of this cache's live models. Never
-            // delete an undecodable sidecar or one belonging to another model.
+            // require its `(model, salt)` to be one of this cache's live keys.
+            // Never delete an undecodable sidecar or one belonging to another
+            // model or salt.
             guard let data = try? Data(contentsOf: sidecarURL),
                 let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
-                liveModels.contains(sidecar.model)
+                liveKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
             else {
                 continue
             }
