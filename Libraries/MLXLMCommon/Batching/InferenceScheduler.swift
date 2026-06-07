@@ -675,6 +675,8 @@ extension InferenceScheduler {
     /// decode loop is running. Used for 3rd+ concurrent requests and for the
     /// manual ``generateBatched(_:)`` path.
     private func admitToBatch(_ scheduled: sending ScheduledRequest) async {
+        // `ensureDriver` suspends; resolve it before consuming `scheduled` so
+        // the non-Sendable request is not held across the await unnecessarily.
         guard let driver = await ensureDriver() else {
             // Cannot batch this model — run the request on the single path
             // instead (correctness over batching).
@@ -683,6 +685,11 @@ extension InferenceScheduler {
         }
         state = .batched
 
+        // Pull the Sendable routing fields out first, then build the request as
+        // the sole non-Sendable value handed to the driver via `sending`.
+        let handler = scheduled.handler
+        let sampler = Self.rowSampler(for: scheduled.request.parameters)
+        let maxTokens = scheduled.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
             input: scheduled.request.input,
             parameters: scheduled.request.parameters,
@@ -691,12 +698,10 @@ extension InferenceScheduler {
             promptCache: scheduled.request.promptCache,
             promptCacheSalt: scheduled.request.promptCacheSalt
         )
-        let sampler = Self.rowSampler(for: scheduled.request.parameters)
-        let maxTokens = scheduled.request.parameters.maxTokens ?? defaultMaxTokens
 
         await driver.submit(
             req,
-            handler: scheduled.handler,
+            handler: handler,
             maxTokens: maxTokens,
             sampler: sampler,
             stateMachine: nil
@@ -875,9 +880,14 @@ extension InferenceScheduler {
             record: firstRecord
         )
 
-        // Phase 3: admit the joining request and start the batch loop.
+        // Phase 3: admit the joining request and start the batch loop. Pull the
+        // Sendable fields out first so the request is the sole non-Sendable
+        // value handed to the driver via `sending`.
         state = .batched
 
+        let joinHandler = joining.handler
+        let joinSampler = Self.rowSampler(for: joining.request.parameters)
+        let joinMax = joining.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
             input: joining.request.input,
             parameters: joining.request.parameters,
@@ -886,11 +896,9 @@ extension InferenceScheduler {
             promptCache: joining.request.promptCache,
             promptCacheSalt: joining.request.promptCacheSalt
         )
-        let joinSampler = Self.rowSampler(for: joining.request.parameters)
-        let joinMax = joining.request.parameters.maxTokens ?? defaultMaxTokens
         await driver.submit(
             req,
-            handler: joining.handler,
+            handler: joinHandler,
             maxTokens: joinMax,
             sampler: joinSampler,
             stateMachine: nil
