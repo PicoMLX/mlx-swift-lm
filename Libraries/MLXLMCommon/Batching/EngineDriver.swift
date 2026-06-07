@@ -125,6 +125,16 @@ actor EngineDriver {
 
     // MARK: - Admission control
 
+    /// Note a wired-memory ticket to govern the decode loop. Used by the
+    /// scheduler's upgrade path to carry the migrated single request's ticket
+    /// onto the batched loop (the row bypasses `admit`, which is where freshly
+    /// admitted requests' tickets are captured).
+    func noteWiredMemoryTicket(_ ticket: WiredMemoryTicket?) {
+        if let ticket {
+            activeWiredMemoryTicket = ticket
+        }
+    }
+
     /// Set the runtime admission cap. Modeled on Layr's `setMaxNumSeqs(_:)`:
     /// values `< 1` are clamped to `1` so a zero/negative cap cannot deadlock
     /// admission. Lowering the cap below the live row count does not evict

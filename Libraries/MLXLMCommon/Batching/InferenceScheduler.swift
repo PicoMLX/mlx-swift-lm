@@ -175,6 +175,7 @@ extension InferenceScheduler {
         let promptCacheSalt: UInt64
         let writeBackToPromptCache: Bool
         let submitTime: TimeInterval
+        let wiredMemoryTicket: WiredMemoryTicket?
     }
 }
 
@@ -452,6 +453,7 @@ extension InferenceScheduler {
         let writeBack = scheduled.request.promptCache != nil
         let submitTime = Date.timeIntervalSinceReferenceDate
         let promptTokenCount = inputTokens.count
+        let ticket = scheduled.request.wiredMemoryTicket
 
         // Box the non-`Sendable` inputs (model/tokenizer/request) so the
         // detached `@Sendable` task can consume them; the iterator is built and
@@ -475,6 +477,7 @@ extension InferenceScheduler {
                 upgradeFlag: upgradeFlag,
                 promptTokenCount: promptTokenCount,
                 submitTime: submitTime,
+                wiredMemoryTicket: ticket,
                 onFinished: { tokenIds in
                     await self?.singleTaskFinished(
                         requestID: requestID, generatedTokenIds: tokenIds)
@@ -497,7 +500,8 @@ extension InferenceScheduler {
             modelName: modelName,
             promptCacheSalt: salt,
             writeBackToPromptCache: writeBack,
-            submitTime: submitTime
+            submitTime: submitTime,
+            wiredMemoryTicket: ticket
         )
         state = .single(single)
     }
@@ -507,6 +511,15 @@ extension InferenceScheduler {
     /// isolation boundary. On an upgrade request it deposits a `sending`
     /// ``LiveIteratorState`` and exits without finishing the stream (the batch
     /// loop takes over). Otherwise it finishes the stream itself.
+    /// How the synchronous single decode loop exited.
+    private enum SingleLoopOutcome {
+        /// An upgrade was requested: live state was captured (to deposit after
+        /// the wired-memory scope closes).
+        case deposit(LiveIteratorState)
+        /// The loop completed normally with the given stop reason.
+        case finished(GenerateStopReason)
+    }
+
     private static func runSingle(
         request: sending GenerationRequest,
         model: any LanguageModel,
@@ -516,6 +529,7 @@ extension InferenceScheduler {
         upgradeFlag: UpgradeFlag,
         promptTokenCount: Int,
         submitTime: TimeInterval,
+        wiredMemoryTicket: WiredMemoryTicket?,
         onFinished: @Sendable @escaping ([Int]) async -> Void
     ) async {
         let parameters = request.parameters
@@ -537,62 +551,83 @@ extension InferenceScheduler {
 
         var it = iterator
         var generated: [Int] = []
-        var stopReason: GenerateStopReason? = nil
-        var cancelled = false
 
-        while true {
-            if Task.isCancelled {
-                cancelled = true
-                break
+        // The synchronous decode loop, run under the wired-memory limit when a
+        // ticket is supplied (parity with `generateTask`). It captures live
+        // state on upgrade instead of returning, so the deposit happens after
+        // the limit scope closes.
+        func decodeLoop() -> SingleLoopOutcome {
+            var stopReason: GenerateStopReason? = nil
+            var cancelled = false
+            while true {
+                if Task.isCancelled {
+                    cancelled = true
+                    break
+                }
+                // Upgrade hand-off point: capture live state and stop. After
+                // this the task never touches `it`/its caches again
+                // (region-isolation invariant).
+                if upgradeFlag.upgradeRequested {
+                    return .deposit(
+                        LiveIteratorState(
+                            cache: it.cache,
+                            currentToken: it.y.tokens.item(Int.self),
+                            tokenCount: it.tokenCount,
+                            maxTokens: it.maxTokens,
+                            parameters: parameters,
+                            generatedTokenIds: generated
+                        ))
+                }
+
+                guard let token = it.next() else {
+                    break
+                }
+
+                // Stop-token detection mirrors `runSynchronousGenerationLoop`:
+                // the stop token is NOT emitted to the consumer.
+                if token == unknownTokenId || stopTokenIds.contains(token) {
+                    stopReason = .stop
+                    break
+                }
+
+                generated.append(token)
+
+                if handler.processToken(token) == false {
+                    cancelled = true
+                    break
+                }
             }
-            // Upgrade hand-off point: deposit live state and exit, leaving the
-            // stream open for the batch loop to continue. After this the task
-            // never touches `it`/its caches again (region-isolation invariant).
-            if upgradeFlag.upgradeRequested {
-                let live = LiveIteratorState(
-                    cache: it.cache,
-                    currentToken: it.y.tokens.item(Int.self),
-                    tokenCount: it.tokenCount,
-                    maxTokens: it.maxTokens,
-                    parameters: parameters,
-                    generatedTokenIds: generated
-                )
-                upgradeFlag.depositLiveState(live)
-                return
-            }
 
-            guard let token = it.next() else {
-                break
-            }
-
-            // Stop-token detection mirrors `runSynchronousGenerationLoop`: the
-            // stop token is NOT emitted to the consumer, generation just ends.
-            if token == unknownTokenId || stopTokenIds.contains(token) {
-                stopReason = .stop
-                break
-            }
-
-            generated.append(token)
-
-            if handler.processToken(token) == false {
-                cancelled = true
-                break
+            // Resolve the final stop reason, matching the synchronous loop.
+            if cancelled {
+                return .finished(.cancelled)
+            } else if let stopReason {
+                return .finished(stopReason)
+            } else if let maxTokens = it.maxTokens, it.tokenCount >= maxTokens {
+                return .finished(.length)
+            } else {
+                return .finished(.cancelled)
             }
         }
 
-        // Resolve the final stop reason, matching `runSynchronousGenerationLoop`:
-        // an explicit stop token wins; otherwise reaching the limit is `.length`;
-        // anything else (consumer cancel / iterator exhausted) is `.cancelled`.
-        let resolvedReason: GenerateStopReason
-        if cancelled {
-            resolvedReason = .cancelled
-        } else if let stopReason {
-            resolvedReason = stopReason
-        } else if let maxTokens = it.maxTokens, it.tokenCount >= maxTokens {
-            resolvedReason = .length
+        let outcome: SingleLoopOutcome
+        if let ticket = wiredMemoryTicket {
+            var captured: SingleLoopOutcome = .finished(.cancelled)
+            await WiredMemoryTicket.withWiredLimit(ticket) {
+                captured = decodeLoop()
+            }
+            outcome = captured
         } else {
-            resolvedReason = .cancelled
+            outcome = decodeLoop()
         }
+
+        if case .deposit(let live) = outcome {
+            // Hand the live state to the scheduler and exit, leaving the stream
+            // open for the batch loop to continue.
+            upgradeFlag.depositLiveState(live)
+            return
+        }
+        guard case .finished(let resolvedReason) = outcome else { return }
 
         // If an upgrade was requested in the same instant we exited, hand off
         // nil so the scheduler does not hang waiting on the continuation.
@@ -773,13 +808,12 @@ extension InferenceScheduler {
     /// Start (or no-op if already running) the driver's decode loop as a
     /// detached task. The loop ends when the engine empties; on completion the
     /// scheduler is returned to `.idle` if no work remains.
+    ///
+    /// No explicit wired-memory ticket is passed: the driver applies the ticket
+    /// it captured from admitted requests (see `EngineDriver.drain`).
     private func startBatchLoop(_ driver: EngineDriver) {
-        let ticket: WiredMemoryTicket? = nil
         Task { [weak self] in
-            await driver.drain(
-                wiredMemoryTicket: ticket,
-                onResult: nil
-            )
+            await driver.drain(onResult: nil)
             await self?.batchLoopFinished()
         }
     }
@@ -952,6 +986,9 @@ extension InferenceScheduler {
             tokens: liveGeneratedTokenIds,
             record: firstRecord
         )
+        // Carry the migrated request's wired-memory ticket onto the batch loop
+        // (the adopted row bypasses `admit`, which captures fresh tickets).
+        await driver.noteWiredMemoryTicket(single.wiredMemoryTicket)
 
         // Phase 3: admit the joining request and start the batch loop. Pull the
         // Sendable fields out first so the request is the sole non-Sendable
