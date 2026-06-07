@@ -489,7 +489,13 @@ extension InferenceScheduler {
     private func route(_ scheduled: sending ScheduledRequest) async throws {
         switch state {
         case .idle:
-            startSingle(scheduled)
+            // The iterator is built synchronously inside `startSingle`; a failing
+            // prefill throws out here → `submitOne`/`submit` →
+            // `ModelContainer.generate`, mirroring the historical single path's
+            // synchronous init-error semantics. (Drain re-routes — where the
+            // stream is already live — close the stream instead; see
+            // `drainQueuedRequests`.)
+            try startSingle(scheduled)
 
         case .single(let single):
             if canUpgrade(parameters: single.parameters) {
@@ -530,18 +536,31 @@ extension InferenceScheduler {
 
     /// Non-`Sendable` bundle of everything the single task needs that cannot
     /// cross into the detached `Task` directly. Transferred via ``SendableBox``
-    /// (the repo's existing hand-off box; no new `@unchecked`).
+    /// (the repo's existing hand-off box; no new `@unchecked`). The
+    /// ``TokenIterator`` is built on the actor (so its prefill error surfaces to
+    /// the caller) and carried here so the task owns it after the single
+    /// transfer. (Sendable inputs like `parameters` are passed to `runSingle`
+    /// directly, not boxed.)
     private struct SingleTaskInputs {
-        let request: GenerationRequest
-        let model: any LanguageModel
         let configuration: ModelConfiguration
         let tokenizer: Tokenizer
+        let iterator: TokenIterator
     }
 
     /// Start a request on the zero-overhead single-stream path. The task drives
     /// a ``TokenIterator``, streams decoded text to the handler, and checks the
     /// upgrade flag after each token so it can hand off its live state.
-    private func startSingle(_ scheduled: sending ScheduledRequest) {
+    ///
+    /// The ``TokenIterator`` is constructed **here, on the actor**, before this
+    /// returns — its prefill runs the model's `prepare`, which can throw (bad
+    /// input / model configuration). Building it synchronously (rather than
+    /// inside the detached task) lets that error propagate to the original
+    /// `submit`/``ModelContainer/generate`` caller, mirroring the historical
+    /// non-scheduler ``generate(input:cache:parameters:context:wiredMemoryTicket:tools:)``
+    /// which also constructs the iterator before handing back its stream. The
+    /// non-`Sendable` iterator is then transferred into the detached task via
+    /// the repo's existing ``SendableBox`` (no new `@unchecked`).
+    private func startSingle(_ scheduled: sending ScheduledRequest) throws {
         guard let context else {
             scheduled.handler.finish()
             return
@@ -562,24 +581,35 @@ extension InferenceScheduler {
         let promptTokenCount = inputTokens.count
         let ticket = scheduled.request.wiredMemoryTicket
 
-        // Box the non-`Sendable` inputs (model/tokenizer/request) so the
-        // detached `@Sendable` task can consume them; the iterator is built and
-        // owned inside the task.
+        // Construct the iterator on the actor so a failing prefill/`prepare`
+        // throws to the caller (the stream has not been handed back yet on the
+        // primary `idle` route). A thrown error leaves `state`/the handler
+        // untouched — no task is launched and the request is simply not started.
+        let iterator = try TokenIterator(
+            input: scheduled.request.input,
+            model: context.model,
+            parameters: parameters
+        )
+
+        // Box the non-`Sendable` config/tokenizer and the already-built iterator
+        // so the detached `@Sendable` task can consume them; the iterator never
+        // crosses the boundary except inside the box (transferred once, then
+        // owned solely by the task). `parameters` is `Sendable` and captured
+        // directly.
         let boxed = SendableBox(
             SingleTaskInputs(
-                request: scheduled.request,
-                model: context.model,
                 configuration: context.configuration,
-                tokenizer: context.tokenizer
+                tokenizer: context.tokenizer,
+                iterator: iterator
             ))
 
         let task = Task<Void, Never> { [weak self] in
             let inputs = boxed.consume()
             await Self.runSingle(
-                request: inputs.request,
-                model: inputs.model,
+                parameters: parameters,
                 configuration: inputs.configuration,
                 tokenizer: inputs.tokenizer,
+                iterator: inputs.iterator,
                 handler: handler,
                 upgradeFlag: upgradeFlag,
                 promptTokenCount: promptTokenCount,
@@ -612,9 +642,10 @@ extension InferenceScheduler {
         state = .single(single)
     }
 
-    /// The single-request decode loop. Runs detached from the actor; builds and
-    /// owns the `TokenIterator` so the non-`Sendable` iterator never crosses an
-    /// isolation boundary. On an upgrade request it deposits a `sending`
+    /// The single-request decode loop. Runs detached from the actor and owns the
+    /// non-`Sendable` `TokenIterator` (built on the actor by ``startSingle(_:)``
+    /// and transferred in once) so the iterator never crosses an isolation
+    /// boundary afterward. On an upgrade request it deposits a `sending`
     /// ``LiveIteratorState`` and exits without finishing the stream (the batch
     /// loop takes over). Otherwise it finishes the stream itself.
     /// How the synchronous single decode loop exited.
@@ -627,10 +658,10 @@ extension InferenceScheduler {
     }
 
     private static func runSingle(
-        request: sending GenerationRequest,
-        model: any LanguageModel,
+        parameters: GenerateParameters,
         configuration: ModelConfiguration,
         tokenizer: Tokenizer,
+        iterator: consuming TokenIterator,
         handler: SchedulerTokenHandler,
         upgradeFlag: UpgradeFlag,
         promptTokenCount: Int,
@@ -638,17 +669,9 @@ extension InferenceScheduler {
         wiredMemoryTicket: WiredMemoryTicket?,
         onFinished: @Sendable @escaping ([Int]) async -> Void
     ) async {
-        let parameters = request.parameters
-        let iterator: TokenIterator
-        do {
-            iterator = try TokenIterator(
-                input: request.input, model: model, parameters: parameters)
-        } catch {
-            upgradeFlag.markTaskFinished()
-            handler.finish()
-            await onFinished([])
-            return
-        }
+        // The iterator was constructed on the actor (its prefill `prepare` ran
+        // there, surfacing any init error to the caller before the stream was
+        // returned); the task only drives it.
 
         // Same stop set the synchronous single-stream loop uses.
         let stopTokenIds = Self.stopTokenIds(
@@ -873,20 +896,19 @@ extension InferenceScheduler {
         startBatchLoop(driver)
     }
 
-    /// If the model cannot be batched and we are idle, run on the single path;
-    /// otherwise just finish the stream (a non-batchable model cannot join an
-    /// existing batch).
+    /// Run a non-batchable request on its own single iterator. Two concurrent
+    /// single tasks are safe (the single path shares no engine state; each owns
+    /// its caches and the model weights are already evaluated), so this runs the
+    /// request single regardless of state. The stream was already handed back to
+    /// the caller, so a failing iterator prefill cannot be thrown out here — it
+    /// is surfaced by closing the stream (the request simply yields nothing),
+    /// matching the pre-existing best-effort handling on this path.
     private func startSingleIfIdle(_ scheduled: sending ScheduledRequest) {
-        if case .idle = state {
-            startSingle(scheduled)
-        } else {
-            // Best effort: a non-batchable model with concurrent requests is
-            // unusual; stream this one on its own single iterator after the
-            // current one frees. For now, run it single regardless — the
-            // single path does not share engine state, so two concurrent
-            // single tasks are safe (each owns its own caches/model calls are
-            // already-evaluated weights).
-            startSingle(scheduled)
+        let handler = scheduled.handler
+        do {
+            try startSingle(scheduled)
+        } catch {
+            handler.finish()
         }
     }
 
@@ -1005,22 +1027,35 @@ extension InferenceScheduler {
         let liveTokenIsStop = stopIds.contains(liveCurrentToken)
 
         // Use the engine's own default budget when unset, matching admitToBatch.
-        // `liveCurrentToken` is the (liveTokenCount + 1)-th token: it has been
-        // sampled but not yet delivered. Delivering it consumes one budget unit,
-        // so the request still needs the batch only if at least one more token
-        // fits afterwards, i.e. `remainingBudget >= 2`. When `remainingBudget
-        // <= 1`, delivering the live token already reaches `budgetLimit`; adopt-
-        // ing anyway would let `DecodeBatch.next()` (which increments before its
-        // length check) emit one token past the caller's maximum.
+        // `liveCurrentToken` is the (liveTokenCount + 1)-th token: it was sampled
+        // by the iterator's pump but only DELIVERED if the iterator would have
+        // returned it on its next `next()`. `TokenIterator.next()` returns nil
+        // once `tokenCount >= maxTokens`, so the live token is real and
+        // deliverable iff `liveTokenCount < budgetLimit`, i.e.
+        // `remainingBudget >= 1`. When `remainingBudget == 0` the request has
+        // already emitted its full `maxTokens`; `liveCurrentToken` is a purely
+        // speculative precompute and must NOT be delivered or counted (doing so
+        // would emit/count one token past the caller's maximum).
+        //
+        // The request still needs the batch only if at least one more token
+        // fits after delivering the live one, i.e. `remainingBudget >= 2`. When
+        // `remainingBudget <= 1` it is finalized here (delivering the live token
+        // only if `remainingBudget == 1`), never adopted — adopting would let
+        // `DecodeBatch.next()` (which increments before its length check) emit a
+        // token past the maximum.
         let budgetLimit = liveMaxTokens ?? defaultMaxTokens
         let remainingBudget = budgetLimit - liveTokenCount
+        // The final token to flush when finalizing without adoption: nil for a
+        // stop token (never emitted) or when the budget is already exhausted
+        // (the live token is speculative); otherwise the real undelivered token.
+        let liveFinalToken = (liveTokenIsStop || remainingBudget <= 0) ? nil : liveCurrentToken
 
         guard let driver = await ensureDriver() else {
             // Cannot batch this model: deliver the last token, finalize the
             // original stream cleanly, then run the joining request fresh.
             finishUpgradedSingle(
                 handler: single.handler,
-                lastToken: liveTokenIsStop ? nil : liveCurrentToken,
+                lastToken: liveFinalToken,
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count,
                 submitTime: single.submitTime,
@@ -1034,10 +1069,11 @@ extension InferenceScheduler {
             // The original is already done: EOS reached, or delivering the live
             // token reaches `budgetLimit` (no room for the batch to add another
             // without overshooting). Finalize it cleanly (delivering the final
-            // non-stop token) and run the joining request through the batch.
+            // non-stop token only when one is actually undelivered) and run the
+            // joining request through the batch.
             finishUpgradedSingle(
                 handler: single.handler,
-                lastToken: liveTokenIsStop ? nil : liveCurrentToken,
+                lastToken: liveFinalToken,
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count,
                 submitTime: single.submitTime,
@@ -1094,8 +1130,15 @@ extension InferenceScheduler {
         )
         // Build + splice the migrated batch entirely on the driver (the
         // DecodeBatch never crosses an isolation boundary). The live token was
-        // already produced, so the adopted row's budget excludes it (numTokens:
-        // 1) and it keeps the model's EOS stop matcher.
+        // already produced, so the adopted row's budget counts it (numTokens =
+        // liveTokenCount + 1) and it keeps the model's EOS stop matcher.
+        //
+        // `tokens` is the FULL generated history *including* the seed
+        // (`liveCurrentToken`): `makeAdoptedBatch` drops the trailing seed and
+        // the batch's priming `step()` re-appends exactly that token, so the
+        // post-priming history equals the true sequence with no duplicate
+        // (parity with `PrefillBatch.generate`). Passing the generated-only
+        // list would make priming append the seed a second time.
         await driver.adoptMigrated(
             seedToken: liveCurrentToken,
             caches: batchedCaches,
@@ -1103,7 +1146,7 @@ extension InferenceScheduler {
             stateMachine: stopMatcher,
             maxTokens: budgetLimit,
             numTokens: liveTokenCount + 1,
-            tokens: liveGeneratedTokenIds,
+            tokens: liveGeneratedTokenIds + [liveCurrentToken],
             record: firstRecord
         )
         // Carry the migrated request's wired-memory ticket onto the batch loop
@@ -1171,11 +1214,18 @@ extension InferenceScheduler {
 
     /// Fallback when an upgrade cannot batch the model: run the joining request
     /// on a fresh single iterator after the upgrade window. Two concurrent
-    /// single tasks are safe (no shared engine state).
+    /// single tasks are safe (no shared engine state). The joining stream is
+    /// already live, so a failing iterator prefill is surfaced by closing the
+    /// stream rather than thrown.
     private func startSingleAfterUpgradeFallback(_ scheduled: sending ScheduledRequest) {
         // Reset to idle so `startSingle` installs cleanly.
         state = .idle
-        startSingle(scheduled)
+        let handler = scheduled.handler
+        do {
+            try startSingle(scheduled)
+        } catch {
+            handler.finish()
+        }
     }
 
     /// Called from the single task when it finishes naturally (not via
@@ -1215,7 +1265,16 @@ extension InferenceScheduler {
         queuedRequests.removeAll()
         while !pending.isEmpty {
             let next = pending.removeFirst()
-            try? await route(next)
+            // These streams are already live (returned to their callers when
+            // queued), so an iterator-prefill failure during re-route cannot be
+            // thrown out — close the stream so the request ends instead of
+            // hanging open. Other routing errors are likewise terminal here.
+            let handler = next.handler
+            do {
+                try await route(next)
+            } catch {
+                handler.finish()
+            }
         }
     }
 }

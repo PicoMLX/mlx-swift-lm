@@ -334,9 +334,11 @@ actor EngineDriver {
             promptCacheSalt: record.promptCacheSalt,
             submitTime: record.submitTime,
             writeBackToPromptCache: record.writeBackToPromptCache,
-            // Adopted rows are seeded with generated-only history (the prompt
-            // was consumed by the single iterator's prefill), so `allTokens`
-            // already excludes the prompt.
+            // Adopted rows carry generated-only history (the prompt was
+            // consumed by the single iterator's prefill); `makeAdoptedBatch`
+            // drops the trailing seed and priming re-appends it, so the row's
+            // `allTokens` is the full generated sequence but still excludes the
+            // prompt.
             tokensIncludePrompt: false
         )
         engine.adoptActiveBatch(batch)
