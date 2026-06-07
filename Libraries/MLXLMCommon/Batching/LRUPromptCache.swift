@@ -138,6 +138,17 @@ public final class LRUPromptCache: PersistablePromptCache {
         var cache: [RootKey: TrieNode] = [:]
         let lru = CacheOrder()
         var nBytes: Int = 0
+        /// Every `(model, salt)` namespace this instance has ever held a live
+        /// entry for, accumulated on insert and never cleared by eviction/trim.
+        ///
+        /// This is the cache's *ownership* identity on disk, distinct from the
+        /// set of currently-live keys. Disk cleanup (`removeStaleSidecars`,
+        /// `enforceDiskBudget`) is scoped to this set so a shared persistence
+        /// directory is never corrupted across `(model, salt)` namespaces, while
+        /// still letting the cache clean up — or budget-evict — its OWN prior
+        /// sidecars even when it has been trimmed back to zero live entries (at
+        /// which point the live-key set is empty).
+        var managedKeys: Set<RootKey> = []
     }
 
     // MARK: - Properties
@@ -328,7 +339,7 @@ public final class LRUPromptCache: PersistablePromptCache {
             withIntermediateDirectories: true
         )
 
-        let snapshots = diskSnapshots()
+        let (snapshots, ownedKeys) = diskSnapshotsAndOwnedKeys()
         #if DEBUG
             let skipped = snapshots.filter { !Self.isDiskPersistable($0.promptCache) }.count
             if skipped > 0 {
@@ -341,12 +352,16 @@ public final class LRUPromptCache: PersistablePromptCache {
                 .filter { Self.isDiskPersistable($0.promptCache) }
                 .map(\.fileStem)
         )
-        // The `(model, salt)` pairs this cache currently manages. Stale-sidecar
-        // cleanup is scoped to these so a shared persistence directory is never
-        // corrupted: saving a cache that only holds model A never deletes model
-        // B's committed entries, and — because salt is part of the cache key —
-        // saving one salt never deletes another salt's same-model entries.
-        let liveKeys = Set(snapshots.map(\.key))
+        // The `(model, salt)` namespaces this cache OWNS — every key it has held
+        // a live entry for, not just those live right now. Both disk-cleanup
+        // passes are scoped to this set so a shared persistence directory is
+        // never corrupted across namespaces: saving a cache that only ever held
+        // model A never deletes model B's committed entries, and — because salt
+        // is part of the cache key — one salt never deletes another salt's
+        // same-model entries. Using the owned set (rather than the live-key set)
+        // also lets the cache reclaim its OWN sidecars after it has been trimmed
+        // back to zero live entries, when the live-key set would be empty.
+        let ownedKeySet = ownedKeys.union(snapshots.map(\.key))
 
         for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
             let baseURL = directory.appendingPathComponent(snapshot.fileStem)
@@ -395,10 +410,11 @@ public final class LRUPromptCache: PersistablePromptCache {
         }
 
         try Self.removeStaleSidecars(
-            directory: directory, liveStems: liveStems, liveKeys: liveKeys)
+            directory: directory, liveStems: liveStems, ownedKeys: ownedKeySet)
 
         if let maxDiskBytes {
-            try Self.enforceDiskBudget(directory: directory, maxDiskBytes: maxDiskBytes)
+            try Self.enforceDiskBudget(
+                directory: directory, maxDiskBytes: maxDiskBytes, ownedKeys: ownedKeySet)
         }
     }
 
@@ -410,17 +426,21 @@ public final class LRUPromptCache: PersistablePromptCache {
     /// Deletion is scoped two ways so a shared persistence directory is never
     /// corrupted: only `entry_`-prefixed final sidecars are considered (via
     /// ``isFinalSidecar``), and a stale sidecar is removed only when it decodes
-    /// to valid metadata whose `(model, salt)` is one this cache manages
-    /// (`liveKeys`). Salt is part of the cache key, so scoping on model alone
-    /// would let one salt delete another salt's same-model entries. A sidecar
-    /// that can't be decoded, or whose `(model, salt)` this cache doesn't own
-    /// (for example another cache instance or model/salt scope sharing the
-    /// directory, which `load(from:allowedModels:)` supports), is left
-    /// untouched. When in doubt, do not delete.
+    /// to valid metadata whose `(model, salt)` is a namespace this cache owns
+    /// (`ownedKeys`). Scoping on the *owned* set rather than the live-key set is
+    /// what lets a cache trimmed back to zero live entries still reclaim its own
+    /// prior sidecars (an empty live set would otherwise disable cleanup exactly
+    /// when every entry has been evicted, resurrecting old files on the next
+    /// `load`). Salt is part of the cache key, so scoping on model alone would
+    /// let one salt delete another salt's same-model entries. A sidecar that
+    /// can't be decoded, or whose `(model, salt)` this cache doesn't own (for
+    /// example another cache instance or model/salt scope sharing the directory,
+    /// which `load(from:allowedModels:)` supports), is left untouched. When in
+    /// doubt, do not delete.
     private static func removeStaleSidecars(
         directory: URL,
         liveStems: Set<String>,
-        liveKeys: Set<RootKey>
+        ownedKeys: Set<RootKey>
     ) throws {
         let fileManager = FileManager.default
         let sidecars = try fileManager.contentsOfDirectory(
@@ -435,12 +455,12 @@ public final class LRUPromptCache: PersistablePromptCache {
             let stem = sidecarURL.deletingPathExtension().lastPathComponent
             guard !liveStems.contains(stem) else { continue }
             // Only delete sidecars this cache owns: decode the metadata and
-            // require its `(model, salt)` to be one of this cache's live keys.
-            // Never delete an undecodable sidecar or one belonging to another
-            // model or salt.
+            // require its `(model, salt)` to be one of this cache's owned
+            // namespaces. Never delete an undecodable sidecar or one belonging
+            // to another model or salt.
             guard let data = try? Data(contentsOf: sidecarURL),
                 let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
-                liveKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
+                ownedKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
             else {
                 continue
             }
@@ -558,7 +578,13 @@ public final class LRUPromptCache: PersistablePromptCache {
         }
     }
 
-    private func diskSnapshots() -> [DiskSnapshot] {
+    /// Collect deep-copied disk snapshots of every live entry together with the
+    /// set of `(model, salt)` namespaces this instance owns, in a single locked
+    /// read so the two stay consistent. The owned-key set is a superset of the
+    /// live snapshot keys (it also retains namespaces whose entries have all been
+    /// evicted/trimmed) and bounds which sidecars disk cleanup may delete.
+    private func diskSnapshotsAndOwnedKeys() -> (snapshots: [DiskSnapshot], ownedKeys: Set<RootKey>)
+    {
         state.withLockUnchecked { state in
             var snapshots = [DiskSnapshot]()
             var tokens = [Int]()
@@ -566,7 +592,7 @@ public final class LRUPromptCache: PersistablePromptCache {
                 tokens.removeAll(keepingCapacity: true)
                 Self.collectDiskSnapshots(key: key, node: root, tokens: &tokens, into: &snapshots)
             }
-            return snapshots
+            return (snapshots, state.managedKeys)
         }
     }
 
@@ -578,8 +604,9 @@ public final class LRUPromptCache: PersistablePromptCache {
     ) {
         if let entry = node.cache {
             // Deep-copy the cache *inside the lock* (this static helper is only
-            // reached from `diskSnapshots()` while `state.withLockUnchecked` is
-            // held). Handing out the trie's live, mutable `[KVCache]` would let
+            // reached from `diskSnapshotsAndOwnedKeys()` while
+            // `state.withLockUnchecked` is held). Handing out the trie's live,
+            // mutable `[KVCache]` would let
             // the off-thread `savePromptCache` serialization race against
             // concurrent mutations on another thread.
             snapshots.append(
@@ -634,7 +661,11 @@ public final class LRUPromptCache: PersistablePromptCache {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func enforceDiskBudget(directory: URL, maxDiskBytes: Int) throws {
+    private static func enforceDiskBudget(
+        directory: URL,
+        maxDiskBytes: Int,
+        ownedKeys: Set<RootKey>
+    ) throws {
         let fileManager = FileManager.default
         let sidecars = try fileManager.contentsOfDirectory(
             at: directory,
@@ -644,13 +675,18 @@ public final class LRUPromptCache: PersistablePromptCache {
         .filter { isFinalSidecar($0) }
 
         // Only enforce the budget against this cache's own entries: a committed
-        // `entry_` sidecar that decodes to valid metadata. Undecodable or
-        // foreign `.json` files in a shared directory are left untouched so the
-        // budget never deletes data this cache doesn't own.
+        // `entry_` sidecar that decodes to valid metadata AND whose `(model,
+        // salt)` is a namespace this cache owns. Scoping by owned `(model, salt)`
+        // — the same ownership model `removeStaleSidecars` uses — means saving
+        // model A under a tight budget can never evict model B's or another
+        // salt's committed entries from a shared directory. Undecodable, foreign,
+        // or unowned files are left untouched so the budget never deletes data
+        // this cache doesn't own.
         var entries = sidecars.compactMap {
             sidecarURL -> (sidecar: URL, tensor: URL, lastUsed: TimeInterval, bytes: Int)? in
             guard let data = try? Data(contentsOf: sidecarURL),
-                let sidecar = try? JSONDecoder().decode(DiskSidecar.self, from: data)
+                let sidecar = try? JSONDecoder().decode(DiskSidecar.self, from: data),
+                ownedKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
             else {
                 return nil
             }
@@ -688,8 +724,15 @@ public final class LRUPromptCache: PersistablePromptCache {
     // MARK: - Cache materialization (immutable / static)
 
     /// Deep-copy a KV cache by reading and writing its state.
+    ///
+    /// When `tokenCount` is supplied (the insert path), each layer is normalized
+    /// down to that key length: `KVCacheSimple` is sliced by `stateSnapshot`, and
+    /// a `RotatingKVCache` whose restored `offset` exceeds `tokenCount` is
+    /// normalized by ``normalizeRotating`` so a stored entry's covered length can
+    /// never overshoot its token key. When `tokenCount` is `nil` (the fetch /
+    /// disk-snapshot path) the copy is faithful — offsets are preserved exactly.
     private static func materializedCopy(_ promptCache: [KVCache], tokenCount: Int?) -> [KVCache] {
-        let copy = promptCache.map { original in
+        let copy = promptCache.map { original -> KVCache in
             var copy: KVCache
             if original is KVCacheSimple {
                 copy = KVCacheSimple()
@@ -707,6 +750,9 @@ public final class LRUPromptCache: PersistablePromptCache {
                 copy.state = originalState
             }
             copy.metaState = original.metaState
+            if copy is RotatingKVCache, let tokenCount {
+                copy = normalizeRotating(copy, tokenCount: tokenCount)
+            }
             return copy
         }
         let arrays = copy.flatMap { $0.state }
@@ -714,6 +760,45 @@ public final class LRUPromptCache: PersistablePromptCache {
             eval(arrays)
         }
         return copy
+    }
+
+    /// Normalize a freshly materialized `RotatingKVCache` copy down to
+    /// `tokenCount` so its covered length (and therefore its rope offset) never
+    /// exceeds the token key it will be stored under.
+    ///
+    /// `KVCacheSimple` is already truncated to the key by ``stateSnapshot`` (and
+    /// its `state` setter resets `offset = keys.dim(2)`), but the rotating path
+    /// restores `offset` from `metaState`, so an over-covered snapshot would
+    /// otherwise be recorded as covering the full key while returning KV state +
+    /// a rope offset that include extra tokens — letting an exact lookup skip
+    /// evaluation from the wrong position.
+    ///
+    /// - If `offset <= tokenCount`, the copy already fits: return it unchanged.
+    /// - If the cache is still linear (never rotated: `idx == offset`, so the
+    ///   physical buffer holds tokens `0..<offset` in temporal order), `trim` the
+    ///   excess. After trimming, `offset == idx == tokenCount` and the `state`
+    ///   getter yields exactly the `..<tokenCount` temporal prefix.
+    /// - If it has already wrapped (`idx != offset`), a position-sliced prefix is
+    ///   not the temporal prefix, so a clean truncation to the key is impossible.
+    ///   Return a fresh empty `RotatingKVCache` (offset 0) so the insert coverage
+    ///   guard (`min` offset `>= tokens.count`) rejects the whole snapshot rather
+    ///   than storing an unusable over-covered entry.
+    private static func normalizeRotating(_ copy: KVCache, tokenCount: Int) -> KVCache {
+        guard let rotating = copy as? RotatingKVCache, rotating.offset > tokenCount else {
+            return copy
+        }
+        // metaState == [keep, maxCacheSize, step, offset, idx]; `idx == offset`
+        // iff the cache has never rotated and the buffer is in temporal order.
+        // Compare `idx` against the authoritative `offset` (not `meta[3]`) so a
+        // missing/garbled value fails closed (treated as wrapped → rejected)
+        // rather than matching `nil == nil`.
+        let meta = rotating.metaState
+        let isLinear = meta.count == 5 && Int(meta[4]) == rotating.offset
+        if isLinear {
+            rotating.trim(rotating.offset - tokenCount)
+            return rotating
+        }
+        return RotatingKVCache(maxSize: rotating.maxSize ?? 0)
     }
 
     private static func stateSnapshot(for cache: KVCache, tokenCount: Int?) -> [MLXArray] {
@@ -915,6 +1000,11 @@ extension LRUPromptCache.State {
         maxBytes: Int
     ) {
         let isTrimmable = canTrimPromptCache(promptCache)
+
+        // Record namespace ownership. This survives later eviction/trim of every
+        // entry under `key`, so disk cleanup can still reclaim this instance's
+        // own sidecars once it has been trimmed back to zero live entries.
+        managedKeys.insert(key)
 
         if cache[key] == nil {
             cache[key] = LRUPromptCache.TrieNode()
