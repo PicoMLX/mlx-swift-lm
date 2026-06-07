@@ -1005,6 +1005,13 @@ extension InferenceScheduler {
         let liveTokenIsStop = stopIds.contains(liveCurrentToken)
 
         // Use the engine's own default budget when unset, matching admitToBatch.
+        // `liveCurrentToken` is the (liveTokenCount + 1)-th token: it has been
+        // sampled but not yet delivered. Delivering it consumes one budget unit,
+        // so the request still needs the batch only if at least one more token
+        // fits afterwards, i.e. `remainingBudget >= 2`. When `remainingBudget
+        // <= 1`, delivering the live token already reaches `budgetLimit`; adopt-
+        // ing anyway would let `DecodeBatch.next()` (which increments before its
+        // length check) emit one token past the caller's maximum.
         let budgetLimit = liveMaxTokens ?? defaultMaxTokens
         let remainingBudget = budgetLimit - liveTokenCount
 
@@ -1023,10 +1030,11 @@ extension InferenceScheduler {
             return
         }
 
-        if liveTokenIsStop || remainingBudget <= 0 {
-            // The original is already done (EOS reached, or no budget left).
-            // Finalize it cleanly (delivering the final non-stop token) and run
-            // the joining request through the batch.
+        if liveTokenIsStop || remainingBudget <= 1 {
+            // The original is already done: EOS reached, or delivering the live
+            // token reaches `budgetLimit` (no room for the batch to add another
+            // without overshooting). Finalize it cleanly (delivering the final
+            // non-stop token) and run the joining request through the batch.
             finishUpgradedSingle(
                 handler: single.handler,
                 lastToken: liveTokenIsStop ? nil : liveCurrentToken,

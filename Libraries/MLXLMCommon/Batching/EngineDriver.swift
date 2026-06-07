@@ -55,13 +55,38 @@ actor EngineDriver {
     }
 
     /// The number of generated tokens for a finished row, excluding prompt
-    /// tokens when the engine's history includes them.
-    private func generationCount(_ record: RequestRecord, allTokens: [Int]?) -> Int {
-        let total = allTokens?.count ?? 0
+    /// tokens when the engine's history includes them and excluding a final
+    /// stop token that was appended to the history but suppressed from the
+    /// stream (the single-stream loop checks EOS before counting, so it never
+    /// counts the stop token — this keeps the batched path consistent).
+    private func generationCount(
+        _ record: RequestRecord, allTokens: [Int]?, suppressedStopToken: Bool
+    ) -> Int {
+        var total = allTokens?.count ?? 0
         if record.tokensIncludePrompt {
-            return max(0, total - record.promptTokenCount)
+            total -= record.promptTokenCount
         }
-        return total
+        if suppressedStopToken {
+            total -= 1
+        }
+        return max(0, total)
+    }
+
+    /// Whether a finishing response's stop token is appended to the row history
+    /// but never delivered to the consumer, so it must not be counted as a
+    /// generated token. Only stop-reason finishes suppress a token, and only
+    /// when the handler does not surface it (decoded text mode, or raw-token
+    /// mode with `includeStopToken: false`).
+    private func suppressesStopToken(
+        _ record: RequestRecord, reason: GenerateStopReason
+    ) -> Bool {
+        guard reason == .stop else { return false }
+        switch record.handler.mode {
+        case .decoded:
+            return true
+        case .rawTokens(let includeStopToken):
+            return !includeStopToken
+        }
     }
 
     /// The sole owner of the engine. Never escapes the actor.
@@ -439,7 +464,11 @@ actor EngineDriver {
             let now = Date.timeIntervalSinceReferenceDate
             let info = GenerateCompletionInfo(
                 promptTokenCount: record.promptTokenCount,
-                generationTokenCount: generationCount(record, allTokens: response.allTokens),
+                generationTokenCount: generationCount(
+                    record,
+                    allTokens: response.allTokens,
+                    suppressedStopToken: suppressesStopToken(record, reason: reason)
+                ),
                 promptTime: 0,
                 generationTime: max(0, now - record.submitTime),
                 stopReason: reason
