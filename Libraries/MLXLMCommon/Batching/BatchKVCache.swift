@@ -250,7 +250,20 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// to align with the longer one along the sequence dimension.
     ///
     /// - Parameter other: The other BatchKVCache to merge into this one.
+    ///
+    /// Admission contract: the engine prefills every admitted sub-batch before
+    /// extending the active batch, so a non-empty `other` always arrives with a
+    /// populated KV buffer. This precondition makes that contract explicit and
+    /// closes the "append empty admitted rows" hole: an `other` that carries row
+    /// metadata (`batchSize > 0`) but no prefilled keys is rejected here instead
+    /// of silently dropping those rows from the enlarged batch.
     public func extend(other: BatchKVCache) {
+        precondition(
+            other.keys != nil || other.batchSize == 0,
+            "BatchKVCache.extend requires a non-empty `other` to be prefilled "
+                + "(keys != nil) before extending; the engine prefills each "
+                + "admitted sub-batch before calling extend."
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
