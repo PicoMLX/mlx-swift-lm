@@ -232,10 +232,12 @@ extension InferenceScheduler {
     /// `CheckedContinuation` over a non-`Sendable` payload); the conformance
     /// itself is checked.
     final class UpgradeFlag: Sendable {
+        typealias Cont = CheckedContinuation<LiveIteratorState?, Never>
+
         private struct State {
             var upgradeRequested = false
             var taskFinished = false
-            var continuation: CheckedContinuation<LiveIteratorState?, Never>?
+            var continuation: Cont?
         }
 
         private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
@@ -247,9 +249,7 @@ extension InferenceScheduler {
 
         /// Scheduler side: deposit the continuation and request the upgrade. If
         /// the task already finished, resume immediately with `nil`.
-        func requestUpgrade(
-            continuation: CheckedContinuation<LiveIteratorState?, Never>
-        ) {
+        func requestUpgrade(continuation: Cont) {
             let resumeNil = state.withLockUnchecked { s -> Bool in
                 if s.taskFinished {
                     return true
@@ -268,9 +268,7 @@ extension InferenceScheduler {
         /// `state` is transferred with `sending`; the caller stops touching it
         /// after this returns.
         func depositLiveState(_ liveState: sending LiveIteratorState) {
-            let cont = state.withLockUnchecked { s -> CheckedContinuation<
-                LiveIteratorState?, Never
-            >? in
+            let cont = state.withLockUnchecked { s -> Cont? in
                 let c = s.continuation
                 s.continuation = nil
                 return c
@@ -281,9 +279,7 @@ extension InferenceScheduler {
         /// Single-task side: mark the task finished. Resumes any pending
         /// continuation with `nil` so the scheduler does not hang.
         func markTaskFinished() {
-            let cont = state.withLockUnchecked { s -> CheckedContinuation<
-                LiveIteratorState?, Never
-            >? in
+            let cont = state.withLockUnchecked { s -> Cont? in
                 s.taskFinished = true
                 let c = s.continuation
                 s.continuation = nil
@@ -579,15 +575,18 @@ extension InferenceScheduler {
             }
         }
 
-        // Resolve the stop reason the same way the synchronous loop does.
-        if stopReason == nil {
-            if let maxTokens = it.maxTokens, it.tokenCount >= maxTokens {
-                stopReason = .length
-            } else if cancelled {
-                stopReason = .cancelled
-            } else {
-                stopReason = .cancelled
-            }
+        // Resolve the final stop reason, matching `runSynchronousGenerationLoop`:
+        // an explicit stop token wins; otherwise reaching the limit is `.length`;
+        // anything else (consumer cancel / iterator exhausted) is `.cancelled`.
+        let resolvedReason: GenerateStopReason
+        if cancelled {
+            resolvedReason = .cancelled
+        } else if let stopReason {
+            resolvedReason = stopReason
+        } else if let maxTokens = it.maxTokens, it.tokenCount >= maxTokens {
+            resolvedReason = .length
+        } else {
+            resolvedReason = .cancelled
         }
 
         // If an upgrade was requested in the same instant we exited, hand off
@@ -601,7 +600,7 @@ extension InferenceScheduler {
             generationTokenCount: generated.count,
             promptTime: it.promptPrefillTime,
             generationTime: max(0, now - submitTime),
-            stopReason: cancelled ? .cancelled : (stopReason ?? .stop)
+            stopReason: resolvedReason
         )
         handler.yieldInfo(info)
         handler.finish()
