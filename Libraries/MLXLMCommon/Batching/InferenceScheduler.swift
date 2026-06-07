@@ -1064,10 +1064,12 @@ extension InferenceScheduler {
         // batch will seed from it but not re-emit it).
         _ = single.handler.processToken(liveCurrentToken)
 
-        // Phase 2: build the adopted decode batch from migrated state.
-        let firstUID = nextRequestID
-        nextRequestID += 1
-
+        // Phase 2: build the adopted decode batch from migrated state. The
+        // adopted row's engine UID is allocated by the engine (the single
+        // source of truth for row identity) inside `adoptMigrated`, never from
+        // the scheduler's `nextRequestID`, so a later `insert` cannot reuse it
+        // and overwrite the row's record. The scheduler-owned request id rides
+        // along as `cancelToken` for stream-cancellation routing.
         let sampler = Self.rowSampler(for: liveParameters)
         let stopMatcher = defaultStopMatcher()
         let firstRecord = EngineDriver.AdoptedRecord(
@@ -1087,7 +1089,6 @@ extension InferenceScheduler {
         // already produced, so the adopted row's budget excludes it (numTokens:
         // 1) and it keeps the model's EOS stop matcher.
         await driver.adoptMigrated(
-            uid: firstUID,
             seedToken: liveCurrentToken,
             caches: batchedCaches,
             sampler: sampler,

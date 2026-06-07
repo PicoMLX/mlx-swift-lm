@@ -274,8 +274,14 @@ actor EngineDriver {
     /// `caches` is transferred with `sending` (region isolation): the migrated
     /// single request's per-layer batched caches, handed off once. The
     /// constructor runs one priming decode step on the engine's executor.
+    ///
+    /// The adopted row's engine UID is allocated by the engine itself (from its
+    /// own `uidCounter`, the single source of truth for row identity) and
+    /// returned by ``BatchInferenceEngine/makeAdoptedBatch(seedTokens:caches:samplers:stateMachines:maxTokens:numTokens:tokens:)``,
+    /// so a later ``BatchInferenceEngine/insert(prompts:)`` can never reuse it
+    /// and overwrite this record. The scheduler-owned id used to cancel the row
+    /// by token still travels on ``AdoptedRecord/cancelToken``.
     func adoptMigrated(
-        uid: Int,
         seedToken: Int,
         caches: sending [any BatchedCache],
         sampler: RowSampler?,
@@ -285,8 +291,7 @@ actor EngineDriver {
         tokens: [Int],
         record: AdoptedRecord
     ) {
-        let batch = engine.makeAdoptedBatch(
-            uids: [uid],
+        let (batch, uids) = engine.makeAdoptedBatch(
             seedTokens: MLXArray([UInt32(seedToken)]),
             caches: caches,
             samplers: sampler.map { [$0] },
@@ -295,6 +300,7 @@ actor EngineDriver {
             numTokens: [numTokens],
             tokens: [tokens]
         )
+        guard let uid = uids.first else { return }
         records[uid] = RequestRecord(
             handler: record.handler,
             cancelToken: record.cancelToken,

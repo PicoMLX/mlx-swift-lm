@@ -289,6 +289,12 @@ public final class BatchInferenceEngine {
     /// the current seed token(s), and per-row bookkeeping) so it can be handed
     /// to ``adoptActiveBatch(_:)``.
     ///
+    /// The adopted rows' UIDs are allocated here from the engine's own
+    /// `uidCounter` — the **single source of truth** for row identity — and
+    /// returned alongside the batch, exactly as ``insert(prompts:)`` does. This
+    /// prevents a later `insert` from reusing an adopted row's UID and
+    /// overwriting its live record. One UID is allocated per `seedToken`.
+    ///
     /// `maxTokens`/`numTokens` carry the migrated request's original limit and
     /// the count it already produced while running single, so its remaining
     /// budget is honored. `tokens` is the full per-row token history so the
@@ -297,7 +303,6 @@ public final class BatchInferenceEngine {
     /// Constructing the batch runs one priming decode step (the double-buffer)
     /// just like a freshly-prefilled batch.
     public func makeAdoptedBatch(
-        uids: [Int],
         seedTokens: MLXArray,
         caches: [any BatchedCache],
         samplers: [RowSampler?]? = nil,
@@ -305,8 +310,14 @@ public final class BatchInferenceEngine {
         maxTokens: [Int],
         numTokens: [Int]? = nil,
         tokens: [[Int]]
-    ) -> DecodeBatch {
-        DecodeBatch(
+    ) -> (batch: DecodeBatch, uids: [Int]) {
+        var uids: [Int] = []
+        uids.reserveCapacity(tokens.count)
+        for _ in 0 ..< tokens.count {
+            uids.append(uidCounter)
+            uidCounter += 1
+        }
+        let batch = DecodeBatch(
             model: model,
             uids: uids,
             seedTokens: seedTokens,
@@ -318,6 +329,7 @@ public final class BatchInferenceEngine {
             stateMachines: stateMachines,
             numTokens: numTokens
         )
+        return (batch, uids)
     }
 
     // MARK: - Admission
