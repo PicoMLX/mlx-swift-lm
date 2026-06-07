@@ -277,10 +277,9 @@ actor EngineDriver {
     ///
     /// The adopted row's engine UID is allocated by the engine itself (from its
     /// own `uidCounter`, the single source of truth for row identity) and
-    /// returned by ``BatchInferenceEngine/makeAdoptedBatch(seedTokens:caches:samplers:stateMachines:maxTokens:numTokens:tokens:)``,
-    /// so a later ``BatchInferenceEngine/insert(prompts:)`` can never reuse it
-    /// and overwrite this record. The scheduler-owned id used to cancel the row
-    /// by token still travels on ``AdoptedRecord/cancelToken``.
+    /// returned by `makeAdoptedBatch`, so a later `engine.insert` can never
+    /// reuse it and overwrite this record. The scheduler-owned id used to cancel
+    /// the row by token still travels on ``AdoptedRecord/cancelToken``.
     func adoptMigrated(
         seedToken: Int,
         caches: sending [any BatchedCache],
