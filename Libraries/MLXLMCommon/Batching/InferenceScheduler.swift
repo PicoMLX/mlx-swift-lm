@@ -89,6 +89,15 @@ public actor InferenceScheduler {
     /// Monotonic request id for diagnostics.
     private var nextRequestID: Int = 0
 
+    /// Requests that arrived while a non-upgradeable single request was running
+    /// (its cache topology cannot be migrated single→batch). They are held —
+    /// not started — until the running single request completes, then drained
+    /// in FIFO order so the first request is never interrupted/truncated. The
+    /// elements are non-`Sendable` (`ScheduledRequest`), but they are stored and
+    /// later re-routed entirely within this actor's isolation, so no isolation
+    /// boundary is crossed.
+    private var queuedRequests: [ScheduledRequest] = []
+
     public init(configuration: Configuration = .init()) {
         self.configuration = configuration
     }
@@ -319,6 +328,30 @@ extension InferenceScheduler {
         }
         return batched
     }
+
+    /// Whether a single request running with `parameters` could be migrated
+    /// into a batch, decided from the model's cache **topology** alone — before
+    /// any upgrade handshake. This lets the scheduler avoid initiating an
+    /// upgrade it cannot complete (which would otherwise force the first,
+    /// already-running request to stop mid-generation).
+    ///
+    /// `model.newCache(parameters:)` is a pure, side-effect-free factory that
+    /// returns the exact per-layer cache types the running ``TokenIterator``
+    /// built for this request (the iterator uses the same call with the same
+    /// `parameters`), so probing fresh caches faithfully predicts whether the
+    /// live caches will migrate — without touching the running task's state.
+    ///
+    /// KV quantization (`kvBits != nil`) is treated as non-upgradeable even
+    /// though the *fresh* caches start as `KVCacheSimple`: the iterator's decode
+    /// loop dynamically rewrites them to `QuantizedKVCache` after
+    /// `quantizedKVStart` tokens (`maybeQuantizeKVCache`), which `migrateCaches`
+    /// rejects. Gating on `kvBits` here keeps the first request on its single
+    /// iterator instead of discovering the rejection only after the handshake.
+    private func canUpgrade(parameters: GenerateParameters) -> Bool {
+        guard let context else { return false }
+        guard parameters.kvBits == nil else { return false }
+        return Self.migrateCaches(context.model.newCache(parameters: parameters)) != nil
+    }
 }
 
 // MARK: - Public submit API
@@ -405,11 +438,30 @@ extension InferenceScheduler {
             startSingle(scheduled)
 
         case .single(let single):
-            await upgrade(from: single, joining: scheduled)
+            if canUpgrade(parameters: single.parameters) {
+                // The running request's caches can migrate single→batch; perform
+                // the handshake and join both into the batch.
+                await upgrade(from: single, joining: scheduled)
+            } else {
+                // The running request's cache topology (SSM/composite/chunked, or
+                // KV-quantized) cannot migrate. Never interrupt/truncate the
+                // first request: keep it on its single iterator and hold this
+                // request until it finishes (then it is drained — see
+                // `singleTaskFinished`). Enter `.pendingUpgrade` to mark "single
+                // still running, requests queued".
+                queuedRequests.append(scheduled)
+                state = .pendingUpgrade(single)
+            }
 
-        case .pendingUpgrade, .upgrading:
-            // An upgrade is mid-flight; admit this request to the (about-to-be
-            // or already) batched engine. It joins the batch on the next step.
+        case .pendingUpgrade:
+            // A non-upgradeable single request is still running with requests
+            // already queued behind it; keep queuing so it stays uninterrupted.
+            // (State stays `.pendingUpgrade`.)
+            queuedRequests.append(scheduled)
+
+        case .upgrading:
+            // An upgrade handshake is mid-flight; admit this request to the
+            // (about-to-be) batched engine. It joins the batch on the next step.
             await admitToBatch(scheduled)
 
         case .batched:
@@ -1058,7 +1110,8 @@ extension InferenceScheduler {
 
     /// Called from the single task when it finishes naturally (not via
     /// upgrade). If the scheduler is still in `.single`/`.pendingUpgrade` for
-    /// this request, return to `.idle`.
+    /// this request, return to `.idle` and drain any requests that were queued
+    /// behind a non-upgradeable single request.
     private func singleTaskFinished(requestID: Int, generatedTokenIds: [Int]) async {
         let activeID: Int?
         switch state {
@@ -1066,13 +1119,33 @@ extension InferenceScheduler {
         case .pendingUpgrade(let s): activeID = s.requestID
         default: activeID = nil
         }
-        if activeID == requestID {
-            // Write the finished single request's KV state back to the prompt
-            // cache, if enabled. (Single-path write-back is a future hookup;
-            // the single task does not currently surface its final caches here.
-            // TODO(PR4): wire single-path prompt-cache write-back.)
-            state = .idle
+        guard activeID == requestID else {
+            // The request was upgraded or superseded; nothing to do.
+            return
         }
-        // Otherwise the request was upgraded or superseded; nothing to do.
+        // Write the finished single request's KV state back to the prompt
+        // cache, if enabled. (Single-path write-back is a future hookup; the
+        // single task does not currently surface its final caches here.
+        // TODO(PR4): wire single-path prompt-cache write-back.)
+        state = .idle
+        await drainQueuedRequests()
+    }
+
+    /// Re-route requests that were held while a non-upgradeable single request
+    /// ran. Drained in FIFO order: the first starts on the now-idle single path;
+    /// subsequent ones land on `.single` and (for the same non-upgradeable
+    /// model) re-queue behind it, naturally serializing them one-at-a-time so no
+    /// running request is ever interrupted.
+    private func drainQueuedRequests() async {
+        guard !queuedRequests.isEmpty else { return }
+        // Move the held requests out of the actor's storage, then re-route them.
+        // The elements stay actor-isolated throughout (storage → local → route),
+        // so moving and routing crosses no isolation boundary.
+        var pending = queuedRequests
+        queuedRequests.removeAll()
+        while !pending.isEmpty {
+            let next = pending.removeFirst()
+            try? await route(next)
+        }
     }
 }
