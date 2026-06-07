@@ -71,14 +71,26 @@ public struct ModelContext {
     public var processor: any UserInputProcessor
     public var tokenizer: Tokenizer
 
+    /// Whether this context was loaded as a vision-language model.
+    ///
+    /// The batched inference scheduler reads this to decide whether a
+    /// transparent `generate()` call may be routed through batching: VLM
+    /// inputs carry image/video tensors that the text-only batch prefill
+    /// path does not yet handle, so VLM contexts always fall back to the
+    /// single-stream path (``ModelContainer`` routing checks `!loadedAsVLM`).
+    /// Loaders that build a VLM context should set this to `true`.
+    public var loadedAsVLM: Bool
+
     public init(
         configuration: ModelConfiguration, model: any LanguageModel,
-        processor: any UserInputProcessor, tokenizer: any Tokenizer
+        processor: any UserInputProcessor, tokenizer: any Tokenizer,
+        loadedAsVLM: Bool = false
     ) {
         self.configuration = configuration
         self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
+        self.loadedAsVLM = loadedAsVLM
     }
 }
 
