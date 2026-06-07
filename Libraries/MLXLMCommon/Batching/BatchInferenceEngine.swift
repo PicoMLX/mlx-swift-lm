@@ -291,11 +291,19 @@ public final class BatchInferenceEngine {
     ///
     /// `maxTokens`/`numTokens` carry the migrated request's original limit and
     /// the count it already produced while running single, so its remaining
-    /// budget is honored. `tokens` is the full per-row token history so the
-    /// final response reports the complete sequence.
+    /// budget is honored. `tokens` is the full per-row token history (including
+    /// the current/seed token) so the final response reports the complete
+    /// sequence.
     ///
     /// Constructing the batch runs one priming decode step (the double-buffer)
-    /// just like a freshly-prefilled batch.
+    /// just like a freshly-prefilled batch. That priming `step()` treats
+    /// `seedTokens` as the current token and appends it to the batch's
+    /// `tokens`. To avoid double-counting the seed, we hand `DecodeBatch` the
+    /// history with the already-counted current token dropped from each row;
+    /// after priming, the batch's `tokens` (and thus `allTokens` / any
+    /// prompt-cache write-back keyed by it) equals the true history with no
+    /// duplicate. This mirrors `PrefillBatch.generate`, which seeds the last
+    /// prompt token and passes only the preceding prefix to `DecodeBatch`.
     public func makeAdoptedBatch(
         uids: [Int],
         seedTokens: MLXArray,
@@ -306,12 +314,18 @@ public final class BatchInferenceEngine {
         numTokens: [Int]? = nil,
         tokens: [[Int]]
     ) -> DecodeBatch {
-        DecodeBatch(
+        precondition(
+            !tokens.contains(where: { $0.isEmpty }),
+            "makeAdoptedBatch requires non-empty token histories; each row's "
+                + "last element is the current/seed token re-appended by priming"
+        )
+        let priorTokens = tokens.map { Array($0.dropLast()) }
+        return DecodeBatch(
             model: model,
             uids: uids,
             seedTokens: seedTokens,
             promptCache: caches,
-            tokens: tokens,
+            tokens: priorTokens,
             maxTokens: maxTokens,
             samplers: samplers,
             fallbackSampler: defaultSampler,
