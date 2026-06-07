@@ -279,7 +279,16 @@ public final class DecodeBatch {
 
         let sampledTokens: MLXArray
         if samplers.contains(where: { $0 != nil }) {
-            let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
+            // Promote bfloat16 logits to float32 before building logprobs, so
+            // the batched sampler path matches the single-request `TopPSampler`
+            // (Evaluate.swift), which casts bfloat16 -> float32 before
+            // `logSoftmax`. Computing logprobs directly from bfloat16 would
+            // shift the top-P/top-K thresholds and the categorical draw, so a
+            // request could sample differently batched vs. single. The greedy
+            // `argMax` fast path below is order-preserving and needs no cast.
+            let sampleLogits =
+                stepLogits.dtype == .bfloat16 ? stepLogits.asType(.float32) : stepLogits
+            let logprobs = sampleLogits - logSumExp(sampleLogits, axis: -1, keepDims: true)
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
             for i in 0 ..< uids.count {

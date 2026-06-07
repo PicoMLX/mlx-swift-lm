@@ -73,19 +73,26 @@ public func makeRowSampler(
 
 // MARK: - Top-K
 
-/// Mask all but the top-K logits along the last axis to `-inf`. If
-/// `k >= vocab` the input is returned unchanged.
+/// Mask all but the top-K logits along the last axis to `-inf`, keeping
+/// exactly `k` tokens. If `k >= vocab` the input is returned unchanged.
+///
+/// Mirrors the single-request `TopKSampler.applyTopK` in `Evaluate.swift`
+/// (`apply_top_k` from `mlx_lm.sample_utils`): an O(V) `argPartition` on the
+/// negated logprobs lands the top-`k` token indices in `[0, k)`, and the
+/// remaining `[k, V)` indices are masked to `-inf`. Unlike a threshold
+/// comparison (`logprobs >= cutoff`), this keeps exactly `k` tokens even when
+/// several tokens tie at the cutoff logprob (e.g. uniform logits with
+/// `topK: 1` keeps a single token instead of the whole vocabulary), matching
+/// single-stream top-K semantics.
 @usableFromInline
 func applyTopK(_ logprobs: MLXArray, k: Int) -> MLXArray {
     let vocab = logprobs.shape.last ?? 0
     if k <= 0 || k >= vocab { return logprobs }
 
-    let sortedIdx = argSort(-logprobs, axis: -1)
-    let topIdx = sortedIdx[.ellipsis, 0 ..< k]
-    let topVals = takeAlong(logprobs, topIdx, axis: -1)
-    let threshold = topVals.min(axes: [-1], keepDims: true)
     let negInf = MLXArray(-Float.infinity)
-    return which(logprobs .>= threshold, logprobs, negInf)
+    // Indices at [k, V) after partitioning are the tokens to mask out.
+    let maskIndices = MLX.argPartition(-logprobs, kth: k - 1, axis: -1)[.ellipsis, k...]
+    return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
 }
 
 // MARK: - Top-P (nucleus)
