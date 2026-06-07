@@ -133,7 +133,19 @@ extension SchedulerTokenHandler {
             },
             processEndOfSequence: {
                 box.withMutableState { state in
-                    state.toolCallProcessor.processEOS()
+                    // Flush any text the ToolCallProcessor buffered while
+                    // deciding whether it was a tool call. Without
+                    // `returnBufferedText: true` a trailing non-tool fragment
+                    // (e.g. an unmatched `{...` at the end of ordinary text) is
+                    // silently dropped — parity with `generateTask`'s
+                    // `TextToolTokenLoopHandler.onGenerationEnd`.
+                    if let buffered = state.toolCallProcessor.processEOS(
+                        returnBufferedText: true), !buffered.isEmpty
+                    {
+                        if case .terminated = box.continuation.yield(.chunk(buffered)) {
+                            return
+                        }
+                    }
                     for toolCall in state.toolCallProcessor.toolCalls {
                         if case .terminated = box.continuation.yield(.toolCall(toolCall)) {
                             break

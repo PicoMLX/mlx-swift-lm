@@ -472,9 +472,24 @@ actor EngineDriver {
         if !arrays.isEmpty {
             eval(arrays)
         }
+
+        // The prompt-cache key must be the FULL token history the stored KV
+        // state actually covers (prompt + generated). Freshly-prefilled rows
+        // already carry the prompt in `allTokens`. Adopted (upgraded) rows do
+        // not: their history was seeded generated-only, while the migrated
+        // caches still hold the original prompt's KV. Keying such a row by the
+        // generated-only suffix would file prompt-bearing KV under an unrelated
+        // key, so a later lookup for that suffix could reuse positions/content
+        // from a different prompt. Reconstruct the full key from the prompt.
+        let keyTokens: [Int]
+        if record.tokensIncludePrompt {
+            keyTokens = finished.allTokens
+        } else {
+            keyTokens = record.inputTokens + finished.allTokens
+        }
         cache.insertCache(
             model: record.modelName,
-            tokens: finished.allTokens,
+            tokens: keyTokens,
             promptCache: finished.finalCache,
             checkpoint: false,
             salt: record.promptCacheSalt
