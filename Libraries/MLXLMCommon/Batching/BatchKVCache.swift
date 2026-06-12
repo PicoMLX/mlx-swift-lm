@@ -233,9 +233,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
 
-        // Shift left to reduce padding
+        // Shift left to reduce padding. Only meaningful once a KV buffer exists:
+        // for a fresh/cancelled-before-prefill cache the tensor slices are no-ops,
+        // but decrementing `_idx` would drive it negative and leave `batchOffsets`
+        // inconsistent with the adjusted padding, corrupting the `prev` range used
+        // by the next prefill. Skip the shift entirely while `keys == nil`.
         let minLeftPad = leftPadding.min().item(Int32.self)
-        if minLeftPad > 0 {
+        if minLeftPad > 0, keys != nil {
             let padInt = Int(minLeftPad)
             keys = keys?[.ellipsis, padInt..., 0...]
             values = values?[.ellipsis, padInt..., 0...]
@@ -250,7 +254,20 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// to align with the longer one along the sequence dimension.
     ///
     /// - Parameter other: The other BatchKVCache to merge into this one.
+    ///
+    /// Admission contract: the engine prefills every admitted sub-batch before
+    /// extending the active batch, so a non-empty `other` always arrives with a
+    /// populated KV buffer. This precondition makes that contract explicit and
+    /// closes the "append empty admitted rows" hole: an `other` that carries row
+    /// metadata (`batchSize > 0`) but no prefilled keys is rejected here instead
+    /// of silently dropping those rows from the enlarged batch.
     public func extend(other: BatchKVCache) {
+        precondition(
+            other.keys != nil || other.batchSize == 0,
+            "BatchKVCache.extend requires a non-empty `other` to be prefilled "
+                + "(keys != nil) before extending; the engine prefills each "
+                + "admitted sub-batch before calling extend."
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
@@ -333,9 +350,16 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// Each cache is right-justified in the batch: shorter caches receive left-padding
     /// to match the longest sequence.
     ///
-    /// - Parameter caches: An array of `KVCache` instances (typically `KVCacheSimple`).
+    /// - Parameter caches: An array of `KVCacheSimple` instances.
     /// - Returns: A new `BatchKVCache` containing all sequences.
     public class func merge(_ caches: [KVCache]) -> BatchKVCache {
+        // The copy loop below reads data only from `KVCacheSimple` instances; a
+        // non-simple cache would silently contribute an all-zero row that the
+        // mask still exposes. Fail loudly instead.
+        precondition(
+            caches.allSatisfy { $0 is KVCacheSimple },
+            "BatchKVCache.merge requires KVCacheSimple instances"
+        )
         let lengths = caches.map { $0.offset }
         let maxLength = lengths.max() ?? 0
         let padding = lengths.map { maxLength - $0 }
@@ -534,6 +558,17 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     /// Full-attention caches have no chunk-local prefill metadata to advance.
     public func advanceBatched(_: Int) {}
+
+    public override func copy() -> any KVCache {
+        let c = BatchKVCache(
+            leftPaddingArray: leftPadding[0...], batchOffsetsArray: batchOffsets[0...])
+        c.keys = keys.map { $0[.ellipsis] }
+        c.values = values.map { $0[.ellipsis] }
+        c._idx = _idx
+        c.step = step
+        c._rightPadding = _rightPadding.map { $0[0...] }
+        return c
+    }
 
     public var debugDescription: String {
         "BatchKVCache batchSize: \(batchSize), _idx: \(_idx), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"

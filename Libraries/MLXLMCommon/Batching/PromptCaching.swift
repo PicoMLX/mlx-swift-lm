@@ -109,6 +109,40 @@ public protocol PromptCaching: Sendable {
     func trim(nSequences: Int?, nBytes: Int?)
 }
 
+// MARK: - Default arguments
+
+/// Default-argument conveniences for `any PromptCaching` callers.
+///
+/// Protocol *requirements* cannot carry default parameter values, so a caller
+/// holding the existential `any PromptCaching` would otherwise have to pass
+/// `salt` / `checkpoint` explicitly. These overloads supply the documented
+/// defaults (`salt: 0`, `checkpoint: false`) by forwarding to the requirements.
+extension PromptCaching {
+    /// Fetch the nearest matching KV cache, defaulting `salt` to `0`.
+    public func fetchNearestCacheResult(
+        model: String,
+        tokens: [Int]
+    ) -> PromptCacheFetchResult {
+        fetchNearestCacheResult(model: model, tokens: tokens, salt: 0)
+    }
+
+    /// Insert a KV cache, defaulting `checkpoint` to `false` and `salt` to `0`.
+    public func insertCache(
+        model: String,
+        tokens: [Int],
+        promptCache: [KVCache],
+        checkpoint: Bool = false
+    ) {
+        insertCache(
+            model: model,
+            tokens: tokens,
+            promptCache: promptCache,
+            checkpoint: checkpoint,
+            salt: 0
+        )
+    }
+}
+
 // MARK: - PersistablePromptCache
 
 /// A ``PromptCaching`` store that can be saved to and loaded from disk.
