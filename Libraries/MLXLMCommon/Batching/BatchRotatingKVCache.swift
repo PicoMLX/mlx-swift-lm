@@ -130,6 +130,14 @@ extension RotatingKVCache {
 ///
 /// Like `BatchKVCache`, inputs are expected to be left-padded so that
 /// variable-length sequences align on the right.
+///
+/// > Warning: `keep > 0` is only sound while every row has zero left padding.
+/// > At the rotation wrap, padded rows roll their pads to the END of the buffer
+/// > to protect the keep prefix, but the prefix-only `leftPadding` mask cannot
+/// > express trailing garbage, so those slots would be attended until
+/// > overwritten. `makeBatchedCacheFactories` therefore rejects keep-prefix
+/// > topologies; direct construction with `keep > 0` is for equal-length
+/// > batches only.
 public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     /// Per-sequence left-padding amounts as an MLXArray of shape `[B]`.
@@ -171,10 +179,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// The maximum size of this cache (sliding window size).
     public override var maxSize: Int? { maxCacheSize }
 
-    /// The scalar offset (returns `_idx` for compatibility with KVCache protocol).
+    /// The logical cache length, capped at `maxCacheSize`.
+    ///
+    /// `_idx` is the circular write pointer (reset to `keep` on wrap), so it is
+    /// not a valid position to expose to generic callers: after the first
+    /// rotation it jumps backward. Paths that derive masks from `cache.offset`
+    /// rather than `makeMask` — e.g. the array-based `createAttentionMask(h:cache:)`
+    /// used by `Gemma2ModelInner` during multi-token cached prefill — would then
+    /// build masks with too small an offset. Report the monotonic logical length
+    /// (`_scalarOffset`) capped at the window, mirroring how single-stream
+    /// `RotatingKVCache.offset` reports a monotonic position rather than the ring
+    /// index. The setter drives `_scalarOffset` for symmetry.
     public override var offset: Int {
-        get { _idx }
-        set { _idx = newValue }
+        get { min(_scalarOffset, maxCacheSize) }
+        set { _scalarOffset = newValue }
     }
 
     /// Initialize a BatchRotatingKVCache with a maximum size and left-padding per sequence.
@@ -587,6 +605,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Sliding-window caches have no chunk-local prefill metadata to advance.
     public func advanceBatched(_: Int) {}
 
+    public override func copy() -> any KVCache {
+        let c = BatchRotatingKVCache(
+            maxSize: maxCacheSize, keep: keep,
+            leftPaddingArray: leftPadding[0...], batchOffsetsArray: batchOffsets[0...])
+        c.keys = keys.map { $0[.ellipsis] }
+        c.values = values.map { $0[.ellipsis] }
+        c._idx = _idx
+        c._scalarOffset = _scalarOffset
+        c.rotated = rotated
+        c.step = step
+        c._lengths = _lengths.map { $0[0...] }
+        return c
+    }
+
     // MARK: - Batch Operations
 
     /// In-place filter to keep only the sequences at the given batch indices.
@@ -603,7 +635,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             // Clear rotation/prefill state so a reused cache starts unrotated.
             rotated = false
             _lengths = nil
-            _rightPadding = nil
             return
         }
 
@@ -620,7 +651,20 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// If the rotation states differ, both caches are put into temporal order first.
     ///
     /// - Parameter other: The other BatchRotatingKVCache to merge into this one.
+    ///
+    /// Admission contract: the engine prefills every admitted sub-batch before
+    /// extending the active batch, so a non-empty `other` always arrives with a
+    /// populated KV buffer. This precondition makes that contract explicit and
+    /// closes the "append empty admitted rows" hole: an `other` that carries row
+    /// metadata (`batchSize > 0`) but no prefilled keys is rejected here instead
+    /// of silently dropping those rows from the enlarged batch.
     public func extend(other: BatchRotatingKVCache) {
+        precondition(
+            other.keys != nil || other.batchSize == 0,
+            "BatchRotatingKVCache.extend requires a non-empty `other` to be "
+                + "prefilled (keys != nil) before extending; the engine prefills "
+                + "each admitted sub-batch before calling extend."
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
@@ -732,8 +776,17 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
             cache.state = [extractedK, extractedV]
             cache.offset = seqOffset
-            // Set metaState to configure idx properly
-            let cacheIdx = extractedK.dim(2)
+            // Restore `idx` as the row's logical cache write position, not the
+            // padded tensor length. In the rotated path the slice keeps trailing
+            // padded slots beyond this row's `seqOffset` (a shorter/left-padded
+            // row in a globally-rotated batch), so `extractedK.dim(2)` would push
+            // the next write past those pad slots while `offset == seqOffset`,
+            // landing the next token outside the returned `..<(offset+1)` slice and
+            // losing the first post-extraction token. Clamp to the logical length
+            // (`min(seqOffset, maxCacheSize)`) and the physical tensor length so a
+            // full row still restores `idx == maxCacheSize` (wraps to `keep`) while
+            // a shorter row writes at its true logical position.
+            let cacheIdx = min(min(seqOffset, maxCacheSize), extractedK.dim(2))
             cache.metaState = [
                 String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
             ]
@@ -759,7 +812,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                     "BatchRotatingKVCache.merge requires RotatingKVCache instances")
             }
             let ms = rotCache.maxSize ?? 0
-            let k = rotCache.keep
+            // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
+            let k = Int(rotCache.metaState.first ?? "0") ?? 0
             if targetMaxSize == 0 {
                 targetMaxSize = ms
                 targetKeep = k
@@ -774,6 +828,17 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 )
             }
         }
+
+        // Over-window sources are not yet supported: `temporalState` is
+        // oldest-first, so slicing its first `maxSize` entries below would keep
+        // the OLDEST tokens and drop the newest — the opposite of sliding-window
+        // semantics. Fail loudly instead of silently merging the wrong window.
+        // (PR #8 review, Codex C4.)
+        precondition(
+            caches.allSatisfy { $0.offset <= targetMaxSize },
+            "BatchRotatingKVCache.merge does not yet support caches whose offset "
+                + "exceeds maxSize (wrapped/over-window sources)"
+        )
 
         let lengths = caches.map { min($0.offset, targetMaxSize) }
         let maxLength = lengths.max() ?? 0
@@ -812,10 +877,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
         for (i, (p, c)) in zip(padding, caches).enumerated() {
             // Get temporally ordered keys/values from the RotatingKVCache.
-            // NOTE (deferred to PR4): when a source prompt exceeds `maxSize`, the
-            // tail-vs-head retention of the temporal slice here needs validation
-            // against the single-stream rotating cache. `merge` is not wired until
-            // PR4, so this is exercised and tested there. (PR #8 review, Codex C4.)
+            // Sources are guaranteed `offset <= maxSize` by the precondition
+            // above, so `temporalState` is the full linear history and the
+            // head slice below is exact.
             guard let rotCache = c as? RotatingKVCache else { continue }
             let temporalData = rotCache.temporalState
             if temporalData.count >= 2 {
@@ -848,7 +912,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// - Returns: A new `BatchRotatingKVCache` with batch size 1.
     public class func fromSingle(_ cache: RotatingKVCache) -> BatchRotatingKVCache {
         let ms = cache.maxSize ?? 0
-        let k = cache.keep
+        // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
+        let k = Int(cache.metaState.first ?? "0") ?? 0
         let batchCache = BatchRotatingKVCache(maxSize: ms, leftPadding: [0], keep: k)
 
         let temporalData = cache.temporalState

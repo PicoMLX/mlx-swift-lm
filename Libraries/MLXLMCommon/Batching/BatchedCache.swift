@@ -95,6 +95,26 @@ public final class BatchedCacheList: CacheList, BatchedCache {
             cache.advanceBatched(n)
         }
     }
+
+    /// Deep-copy as a `BatchedCacheList`, preserving the `BatchedCache` wrapper.
+    ///
+    /// `CacheList.copy()` rebuilds a plain `CacheList` from copied children, which
+    /// would strip the continuous-batching protocol from a snapshot taken after the
+    /// factory builds a composite batched cache. Each batched child's `copy()`
+    /// returns the same concrete batched type, so it re-conforms to `BatchedCache`.
+    public override func copy() -> any KVCache {
+        BatchedCacheList(
+            caches: batchedCaches.map { child in
+                guard let copied = child.copy() as? any BatchedCache else {
+                    preconditionFailure(
+                        "BatchedCache.copy() must return a BatchedCache for "
+                            + "BatchedCacheList snapshots"
+                    )
+                }
+                return copied
+            }
+        )
+    }
 }
 
 // MARK: - SSM cache conformance
@@ -221,10 +241,23 @@ private func makeBatchedCacheFactory(
             throw unsupported("RotatingKVCache must have a non-nil maxSize.")
         }
 
-        // `BatchRotatingKVCache` handles keep-prefix rotation, so (unlike a
-        // keep-only sliding window) any `keep` value can be batched. metaState
-        // layout is [keep, maxCacheSize, step, offset, idx].
+        // RotatingKVCache.keep is private; metaState layout is
+        // [keep, maxCacheSize, step, offset, idx].
         let keep = Int(rotating.metaState.first ?? "0") ?? 0
+
+        // keep > 0 cannot currently be combined with per-row left padding: at
+        // the rotation wrap, `BatchRotatingKVCache` rolls a padded row's pads
+        // to the END of the buffer to protect the keep prefix, but the
+        // prefix-only `leftPadding` mask cannot express trailing garbage, so
+        // those zero-K/V slots would be attended until overwritten. Until the
+        // mask model supports it, keep-prefix topologies fall back to
+        // single-stream (in-repo models all use keep == 0; keep == 4 arises
+        // only via `GenerateParameters.maxKVSize`).
+        guard keep == 0 else {
+            throw unsupported(
+                "RotatingKVCache with keep > 0 is not supported by continuous batching."
+            )
+        }
 
         return { leftPadding in
             BatchRotatingKVCache(maxSize: maxSize, leftPadding: leftPadding, keep: keep)
