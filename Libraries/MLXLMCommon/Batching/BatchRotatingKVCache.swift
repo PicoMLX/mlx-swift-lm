@@ -130,6 +130,14 @@ extension RotatingKVCache {
 ///
 /// Like `BatchKVCache`, inputs are expected to be left-padded so that
 /// variable-length sequences align on the right.
+///
+/// > Warning: `keep > 0` is only sound while every row has zero left padding.
+/// > At the rotation wrap, padded rows roll their pads to the END of the buffer
+/// > to protect the keep prefix, but the prefix-only `leftPadding` mask cannot
+/// > express trailing garbage, so those slots would be attended until
+/// > overwritten. `makeBatchedCacheFactories` therefore rejects keep-prefix
+/// > topologies; direct construction with `keep > 0` is for equal-length
+/// > batches only.
 public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     /// Per-sequence left-padding amounts as an MLXArray of shape `[B]`.
@@ -821,6 +829,17 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             }
         }
 
+        // Over-window sources are not yet supported: `temporalState` is
+        // oldest-first, so slicing its first `maxSize` entries below would keep
+        // the OLDEST tokens and drop the newest — the opposite of sliding-window
+        // semantics. Fail loudly instead of silently merging the wrong window.
+        // (PR #8 review, Codex C4.)
+        precondition(
+            caches.allSatisfy { $0.offset <= targetMaxSize },
+            "BatchRotatingKVCache.merge does not yet support caches whose offset "
+                + "exceeds maxSize (wrapped/over-window sources)"
+        )
+
         let lengths = caches.map { min($0.offset, targetMaxSize) }
         let maxLength = lengths.max() ?? 0
         let padding = lengths.map { maxLength - $0 }
@@ -858,10 +877,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
         for (i, (p, c)) in zip(padding, caches).enumerated() {
             // Get temporally ordered keys/values from the RotatingKVCache.
-            // NOTE (deferred to PR4): when a source prompt exceeds `maxSize`, the
-            // tail-vs-head retention of the temporal slice here needs validation
-            // against the single-stream rotating cache. `merge` is not wired until
-            // PR4, so this is exercised and tested there. (PR #8 review, Codex C4.)
+            // Sources are guaranteed `offset <= maxSize` by the precondition
+            // above, so `temporalState` is the full linear history and the
+            // head slice below is exact.
             guard let rotCache = c as? RotatingKVCache else { continue }
             let temporalData = rotCache.temporalState
             if temporalData.count >= 2 {

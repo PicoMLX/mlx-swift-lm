@@ -350,9 +350,16 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// Each cache is right-justified in the batch: shorter caches receive left-padding
     /// to match the longest sequence.
     ///
-    /// - Parameter caches: An array of `KVCache` instances (typically `KVCacheSimple`).
+    /// - Parameter caches: An array of `KVCacheSimple` instances.
     /// - Returns: A new `BatchKVCache` containing all sequences.
     public class func merge(_ caches: [KVCache]) -> BatchKVCache {
+        // The copy loop below reads data only from `KVCacheSimple` instances; a
+        // non-simple cache would silently contribute an all-zero row that the
+        // mask still exposes. Fail loudly instead.
+        precondition(
+            caches.allSatisfy { $0 is KVCacheSimple },
+            "BatchKVCache.merge requires KVCacheSimple instances"
+        )
         let lengths = caches.map { $0.offset }
         let maxLength = lengths.max() ?? 0
         let padding = lengths.map { maxLength - $0 }
