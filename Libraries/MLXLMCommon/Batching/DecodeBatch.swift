@@ -74,6 +74,26 @@ public final class DecodeBatch {
 
     public private(set) var samplers: [RowSampler?]
     public let fallbackSampler: RowSampler
+
+    /// Whether `fallbackSampler` is the deterministic ``greedySampler``. The
+    /// greedy `argMax` fast path in `step()` is gated on this: when a row has
+    /// no explicit sampler it falls back to `fallbackSampler`, so the fast
+    /// path may only be taken when that fallback is itself greedy (otherwise
+    /// rows that intended to sample would silently get `argMax`).
+    ///
+    /// `extend(_:)` conservatively ANDs the two batches' flags so a merged
+    /// batch never takes the fast path if either side's fallback may sample.
+    public private(set) var fallbackIsGreedy: Bool
+
+    /// Per-row ``LogitProcessor`` (repetition / presence / frequency
+    /// penalties), mirroring the single path's `GenerateParameters.processor()`
+    /// applied per `TokenIterator`. `nil` for a row with no penalties.
+    ///
+    /// These are **built** (non-`Sendable`, stateful) processors. `DecodeBatch`
+    /// is itself not `Sendable` and is driven from a single executor, so it may
+    /// hold them directly; the engine builds them on its executor from the
+    /// `Sendable` ``RowProcessorSource`` before constructing the batch.
+    private var processors: [LogitProcessor?]
     public private(set) var stateMachines: [StopSequenceMatcher]
 
     /// Tokens queued for the next model call. At construction this is the
@@ -85,6 +105,15 @@ public final class DecodeBatch {
     private var matcherStates: [StopSequenceMatcherState]
 
     /// - Parameters:
+    ///   - fallbackIsGreedy: Whether `fallbackSampler` is ``greedySampler``.
+    ///     Gates the greedy `argMax` fast path; pass `false` whenever the
+    ///     fallback may sample so rows without an explicit sampler are not
+    ///     silently forced to `argMax`.
+    ///   - processors: Per-row ``LogitProcessor`` (penalties), or `nil` to
+    ///     run all rows penalty-free. Built by the engine on its executor
+    ///     from the `Sendable` ``RowProcessorSource``; a row that has a
+    ///     processor is routed through the sampler path (never the greedy
+    ///     `argMax` fast path, which penalties would invalidate).
     ///   - numTokens: Per-row count of tokens already produced before this
     ///     batch took over. Defaults to all-zeros (a fresh decode). Used by
     ///     the single→batch upgrade so a migrated request's `maxTokens`
@@ -98,6 +127,8 @@ public final class DecodeBatch {
         maxTokens: [Int],
         samplers: [RowSampler?]? = nil,
         fallbackSampler: @escaping RowSampler = greedySampler,
+        fallbackIsGreedy: Bool = true,
+        processors: [LogitProcessor?]? = nil,
         stateMachines: [StopSequenceMatcher]? = nil,
         numTokens: [Int]? = nil
     ) {
@@ -106,6 +137,15 @@ public final class DecodeBatch {
         if let numTokens {
             precondition(uids.count == numTokens.count, "uids/numTokens count mismatch")
         }
+        if let samplers {
+            precondition(uids.count == samplers.count, "uids/samplers count mismatch")
+        }
+        if let processors {
+            precondition(uids.count == processors.count, "uids/processors count mismatch")
+        }
+        if let stateMachines {
+            precondition(uids.count == stateMachines.count, "uids/stateMachines count mismatch")
+        }
         self.model = model
         self.uids = uids
         self.promptCache = promptCache
@@ -113,11 +153,26 @@ public final class DecodeBatch {
         self.maxTokens = maxTokens
         self.samplers = samplers ?? Array(repeating: nil, count: uids.count)
         self.fallbackSampler = fallbackSampler
+        self.fallbackIsGreedy = fallbackIsGreedy
+        self.processors = processors ?? Array(repeating: nil, count: uids.count)
         let machines = stateMachines ?? Array(repeating: StopSequenceMatcher(), count: uids.count)
         self.stateMachines = machines
         self.matcherStates = machines.map { $0.makeState() }
         self.numTokens = numTokens ?? Array(repeating: 0, count: uids.count)
         self.nextTokens = seedTokens
+
+        // Seed each row's penalty processor with its prompt prefix, mirroring
+        // the single path's `processor?.prompt(input.text.tokens)` before any
+        // step. `tokens[i]` here is the prompt history *excluding* the seed
+        // (the seed is the row's final prompt token in `seedTokens`); the seed
+        // is fed to the processor as the first `didSample` inside the priming
+        // `step()` below, so by the time `process()` runs to predict the first
+        // generated token the ring holds the full prompt -- exactly the single
+        // path's invariant.
+        for i in 0 ..< self.processors.count
+        where self.processors[i] != nil && !self.tokens[i].isEmpty {
+            self.processors[i]?.prompt(MLXArray(self.tokens[i].map { Int32($0) }))
+        }
 
         // Match upstream mlx_lm.GenerationBatch: immediately run one
         // decode step in the constructor so the first call to `next()`
@@ -222,6 +277,7 @@ public final class DecodeBatch {
         uids = keep.map { uids[$0] }
         tokens = keep.map { tokens[$0] }
         samplers = keep.map { samplers[$0] }
+        processors = keep.map { processors[$0] }
         maxTokens = keep.map { maxTokens[$0] }
         stateMachines = keep.map { stateMachines[$0] }
         matcherStates = keep.map { matcherStates[$0] }
@@ -244,10 +300,15 @@ public final class DecodeBatch {
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
         samplers.append(contentsOf: other.samplers)
+        processors.append(contentsOf: other.processors)
         maxTokens.append(contentsOf: other.maxTokens)
         stateMachines.append(contentsOf: other.stateMachines)
         matcherStates.append(contentsOf: other.matcherStates)
         numTokens.append(contentsOf: other.numTokens)
+        // Conservatively disable the greedy fast path if either side's
+        // fallback may sample, so merged rows that relied on a sampling
+        // fallback are not forced to `argMax`.
+        fallbackIsGreedy = fallbackIsGreedy && other.fallbackIsGreedy
         nextTokens = concatenated([nextTokens, other.nextTokens], axis: 0)
     }
 
@@ -271,13 +332,45 @@ public final class DecodeBatch {
         // [B, 1, vocab] -> [B, vocab]
         let stepLogits = logits[.ellipsis, -1, 0...]
 
+        // The greedy `argMax` fast path is valid only when *every* row resolves
+        // to plain greedy: no explicit per-row sampler, no per-row penalty
+        // processor (penalties change the arg-max), and a known-greedy fallback
+        // (a non-greedy `fallbackSampler` would otherwise be silently dropped
+        // for rows without an explicit sampler).
+        let anySampler = samplers.contains { $0 != nil }
+        let anyProcessor = processors.contains { $0 != nil }
+        let useSamplerPath = anySampler || anyProcessor || !fallbackIsGreedy
+
         let sampledTokens: MLXArray
-        if samplers.contains(where: { $0 != nil }) {
-            let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
+        if useSamplerPath {
+            // Promote bfloat16 logits to float32 before building logprobs, so
+            // the batched sampler path matches the single-request `TopPSampler`
+            // (Evaluate.swift), which casts bfloat16 -> float32 before
+            // `logSoftmax`. Computing logprobs directly from bfloat16 would
+            // shift the top-P/top-K thresholds and the categorical draw, so a
+            // request could sample differently batched vs. single. The greedy
+            // `argMax` fast path below is order-preserving and needs no cast.
+            let sampleLogits =
+                stepLogits.dtype == .bfloat16 ? stepLogits.asType(.float32) : stepLogits
+            let logprobs = sampleLogits - logSumExp(sampleLogits, axis: -1, keepDims: true)
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
             for i in 0 ..< uids.count {
-                let rowLogprobs = logprobs[i ..< (i + 1), 0...]
+                // Drive this row's penalty processor incrementally, exactly as
+                // the single `TokenIterator` does: feed it the current input
+                // token (`currentTokens[i]`, which was the previous step's
+                // sampled token), then `process()` the row's logit slice before
+                // the sampler runs. With the prompt prefix loaded in the
+                // constructor, the ring holds the full history through the
+                // current token at `process()` time -- matching the single
+                // path's `process -> sample -> didSample` invariant. These are
+                // GPU-only mask writes (see `TokenRing`), so they don't force a
+                // CPU sync and preserve `asyncEval` pipelining.
+                var rowLogprobs = logprobs[i ..< (i + 1), 0...]
+                if processors[i] != nil {
+                    processors[i]?.didSample(token: currentTokens[i ..< (i + 1)])
+                    rowLogprobs = processors[i]?.process(logits: rowLogprobs) ?? rowLogprobs
+                }
                 let sampler = samplers[i] ?? fallbackSampler
                 samples.append(sampler(rowLogprobs))
             }

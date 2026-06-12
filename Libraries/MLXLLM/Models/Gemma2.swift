@@ -44,7 +44,7 @@ class Gemma2Attention: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXArray?, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none, cache: KVCache?
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         var queries = wq(x)
@@ -73,9 +73,10 @@ class Gemma2Attention: Module {
         var scores = matmul(queries, keys.swappedAxes(-1, -2))
         scores = tanh(scores / logitSoftCap) * logitSoftCap
 
-        if let mask {
-            scores = scores + mask
-        }
+        // The mask is applied AFTER logit softcapping (matching upstream
+        // gemma2), so it cannot go through scaledDotProductAttention; apply
+        // the cache-built mask mode manually.
+        scores = applyGemma2AttentionMask(mask, to: scores)
         scores = softmax(scores, axis: -1, precise: true)
         var output = matmul(scores, values)
         if repeats > 1 {
@@ -83,6 +84,53 @@ class Gemma2Attention: Module {
         }
         output = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         return wo(output)
+    }
+}
+
+/// Apply a cache-built attention mask mode to manually-computed (softcapped)
+/// attention scores.
+///
+/// Replaces the legacy pattern of adding the array helper's mask directly:
+/// that mask is BOOLEAN, so `scores + mask` added 0/1 to the logits instead of
+/// excluding masked positions. Boolean masks are applied with `where` and a
+/// large negative fill; additive (float) masks are added.
+///
+/// `scores` may be 5-D (`[B, nKVHeads, repeats, L, S]`) when GQA is active, so
+/// a 4-D per-sequence `[B, 1, L, S]` mask (e.g. a batched cache's left-padding
+/// mask) gets the head-group axis inserted to line up the batch dimension.
+private func applyGemma2AttentionMask(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode, to scores: MLXArray
+) -> MLXArray {
+    func blend(_ maskArray: MLXArray) -> MLXArray {
+        var maskArray = maskArray
+        if scores.ndim == 5 && maskArray.ndim == 4 {
+            maskArray = expandedDimensions(maskArray, axis: -3)
+        }
+        if maskArray.dtype == .bool {
+            // -1e9 saturates to the most negative representable value in
+            // reduced precision; softcapped true scores are tiny by
+            // comparison, so masked positions vanish after softmax.
+            return MLX.where(maskArray, scores, MLXArray(Float(-1e9)).asType(scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+    }
+
+    switch mask {
+    case .none:
+        return scores
+    case .causal:
+        let (qL, kL) = (scores.dim(-2), scores.dim(-1))
+        let qIndices = MLXArray(Int32(kL - qL) ..< Int32(kL))
+        let kIndices = MLXArray(Int32(0) ..< Int32(kL))
+        let causal = greaterEqual(
+            expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
+        return MLX.where(causal, scores, MLXArray(Float(-1e9)).asType(scores.dtype))
+    case .array(let maskArray):
+        return blend(maskArray)
+    case .arrays(let maskArrays):
+        guard let maskArray = maskArrays.first else { return scores }
+        return blend(maskArray)
     }
 }
 
@@ -126,7 +174,7 @@ class Gemma2TransformerBlock: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXArray?, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none, cache: KVCache?
     ) -> MLXArray {
         var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + postAttentionLayerNorm(r)
@@ -164,8 +212,13 @@ public class Gemma2ModelInner: Module {
         var h = embedTokens(inputs)
         h = h * hiddenScale
 
-        // Gemma2 uses the older array-based mask pattern with manual application in attention
-        let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
+        // Build the mask from the (possibly batched) cache via the shared
+        // createAttentionMask so cache-specific state — including per-row left
+        // padding — is respected. The legacy array-based helper returned a
+        // BOOLEAN causal mask that the attention layer then ADDED to the
+        // logits (a 0/1 nudge instead of exclusion), so multi-token prefill
+        // leaked future positions; the mask-mode path fixes that too.
+        let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])

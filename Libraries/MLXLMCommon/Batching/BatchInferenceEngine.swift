@@ -50,6 +50,12 @@ public final class BatchInferenceEngine {
 
     public let defaultEosTokens: [[Int]]
     public let defaultSampler: RowSampler
+
+    /// Whether ``defaultSampler`` is the deterministic ``greedySampler``.
+    /// Forwarded as `fallbackIsGreedy` to every batch the engine builds so
+    /// the greedy `argMax` fast path is only taken when the fallback truly is
+    /// greedy. (The engine currently always uses ``greedySampler`` here.)
+    private let defaultSamplerIsGreedy: Bool
     public let defaultStateMachine: StopSequenceMatcher
 
     private var uidCounter: Int = 0
@@ -88,6 +94,7 @@ public final class BatchInferenceEngine {
         self.defaultMaxTokens = defaultMaxTokens
         self.defaultEosTokens = eosTokens
         self.defaultSampler = greedySampler
+        self.defaultSamplerIsGreedy = true
         self.cacheFactories = try makeBatchedCacheFactories(
             for: model.newCache(parameters: cacheParameters)
         )
@@ -106,17 +113,30 @@ public final class BatchInferenceEngine {
     ///
     /// Throws ``BatchInferenceEngineError`` for empty prompt rows, mismatched
     /// per-row option counts, or nonpositive max-token limits.
+    ///
+    /// - Parameters:
+    ///   - samplers: Per-row ``RowSampler``. Build with `makeRowSampler`,
+    ///     which already encodes temperature / top-p / **min-p** / top-k, so
+    ///     min-p is carried here (there is no separate `minP` engine
+    ///     parameter).
+    ///   - processorSources: Per-row ``RowProcessorSource`` carrying the
+    ///     repetition / presence / frequency penalties. `RowProcessorSource`
+    ///     is `Sendable`; the engine invokes it on its own executor to build
+    ///     the stateful (non-`Sendable`) ``LogitProcessor`` for the row.
+    ///     Build with `makeRowProcessorSource(parameters)`.
     @discardableResult
     public func insert(
         prompts: [[Int]],
         maxTokens: [Int]? = nil,
         samplers: [RowSampler?]? = nil,
+        processorSources: [RowProcessorSource?]? = nil,
         stateMachines: [StopSequenceMatcher]? = nil
     ) throws -> [Int] {
         try Self.validateRequest(
             prompts: prompts,
             maxTokens: maxTokens,
             samplers: samplers,
+            processorSources: processorSources,
             stateMachines: stateMachines
         )
 
@@ -133,6 +153,7 @@ public final class BatchInferenceEngine {
                     tokens: prompts[i],
                     maxTokens: maxTokens?[i] ?? defaultMaxTokens,
                     sampler: samplers?[i] ?? nil,
+                    processorSource: processorSources?[i] ?? nil,
                     stateMachine: stateMachines?[i] ?? defaultStateMachine
                 ))
         }
@@ -159,6 +180,7 @@ public final class BatchInferenceEngine {
         prompts: [[Int]],
         maxTokens: [Int]?,
         samplers: [RowSampler?]?,
+        processorSources: [RowProcessorSource?]?,
         stateMachines: [StopSequenceMatcher]?
     ) throws {
         if let rowIndex = prompts.firstIndex(where: { $0.isEmpty }) {
@@ -167,6 +189,8 @@ public final class BatchInferenceEngine {
 
         try validateRequestArrayLength("maxTokens", maxTokens?.count, prompts.count)
         try validateRequestArrayLength("samplers", samplers?.count, prompts.count)
+        try validateRequestArrayLength(
+            "processorSources", processorSources?.count, prompts.count)
         try validateRequestArrayLength("stateMachines", stateMachines?.count, prompts.count)
 
         if let maxTokens {
@@ -291,33 +315,77 @@ public final class BatchInferenceEngine {
     ///
     /// `maxTokens`/`numTokens` carry the migrated request's original limit and
     /// the count it already produced while running single, so its remaining
-    /// budget is honored. `tokens` is the full per-row token history so the
-    /// final response reports the complete sequence.
+    /// budget is honored. `tokens` is the full per-row token history (including
+    /// the current/seed token) so the final response reports the complete
+    /// sequence.
     ///
     /// Constructing the batch runs one priming decode step (the double-buffer)
-    /// just like a freshly-prefilled batch.
+    /// just like a freshly-prefilled batch. That priming `step()` treats
+    /// `seedTokens` as the current token and appends it to the batch's
+    /// `tokens`. To avoid double-counting the seed, we hand `DecodeBatch` the
+    /// history with the already-counted current token dropped from each row;
+    /// after priming, the batch's `tokens` (and thus `allTokens` / any
+    /// prompt-cache write-back keyed by it) equals the true history with no
+    /// duplicate. This mirrors `PrefillBatch.generate`, which seeds the last
+    /// prompt token and passes only the preceding prefix to `DecodeBatch`.
+    ///
+    /// The adopted rows' engine UIDs are allocated here, from the engine's own
+    /// `uidCounter` — the single source of truth for row identity — and
+    /// returned alongside the batch, so a later `insert` can never reuse one
+    /// and collide with an adopted row's bookkeeping in the caller.
+    ///
+    /// - Parameters:
+    ///   - samplers: Per-row ``RowSampler`` (includes min-p via
+    ///     `makeRowSampler`), or `nil` for the greedy fallback.
+    ///   - processorSources: Per-row ``RowProcessorSource`` carrying the
+    ///     penalties; built into the row's ``LogitProcessor`` on this (engine)
+    ///     executor. The migrated row's full `tokens` history seeds the
+    ///     processor's penalty context so penalties continue seamlessly across
+    ///     the single→batch upgrade.
     public func makeAdoptedBatch(
-        uids: [Int],
         seedTokens: MLXArray,
         caches: [any BatchedCache],
         samplers: [RowSampler?]? = nil,
+        processorSources: [RowProcessorSource?]? = nil,
         stateMachines: [StopSequenceMatcher]? = nil,
         maxTokens: [Int],
         numTokens: [Int]? = nil,
         tokens: [[Int]]
-    ) -> DecodeBatch {
-        DecodeBatch(
+    ) -> (batch: DecodeBatch, uids: [Int]) {
+        precondition(
+            !tokens.contains(where: { $0.isEmpty }),
+            "makeAdoptedBatch requires non-empty token histories; each row's "
+                + "last element is the current/seed token re-appended by priming"
+        )
+        if let processorSources {
+            precondition(
+                processorSources.count == tokens.count,
+                "makeAdoptedBatch: processorSources/tokens count mismatch")
+        }
+        var uids: [Int] = []
+        uids.reserveCapacity(tokens.count)
+        for _ in 0 ..< tokens.count {
+            uids.append(uidCounter)
+            uidCounter += 1
+        }
+        let priorTokens = tokens.map { Array($0.dropLast()) }
+        let batch = DecodeBatch(
             model: model,
             uids: uids,
             seedTokens: seedTokens,
             promptCache: caches,
-            tokens: tokens,
+            tokens: priorTokens,
             maxTokens: maxTokens,
             samplers: samplers,
             fallbackSampler: defaultSampler,
+            fallbackIsGreedy: defaultSamplerIsGreedy,
+            processors: processorSources.map { sources in
+                sources.map { $0?() }
+            },
             stateMachines: stateMachines,
             numTokens: numTokens
         )
+        return (batch, uids)
     }
 
     // MARK: - Admission
@@ -339,6 +407,10 @@ public final class BatchInferenceEngine {
         unprocessed.removeFirst(admitCount)
 
         let promptCache = makeBatchedCache(batchSize: batchSlice.count)
+        // Build each row's penalty processor on this (engine) executor from its
+        // `Sendable` source. The stateful `LogitProcessor` is held only inside
+        // the actor-confined prefill/decode batches and never crosses an actor
+        // boundary -- mirroring how `RowSampler` closures are constructed.
         let prompt = PrefillBatch(
             model: model,
             uids: batchSlice.map { $0.uid },
@@ -348,6 +420,8 @@ public final class BatchInferenceEngine {
             prefillStepSize: prefillStepSize,
             samplers: batchSlice.map { $0.sampler },
             fallbackSampler: defaultSampler,
+            fallbackIsGreedy: defaultSamplerIsGreedy,
+            processors: batchSlice.map { $0.processorSource?() },
             stateMachines: batchSlice.map { $0.stateMachine }
         )
 
@@ -375,6 +449,9 @@ public final class BatchInferenceEngine {
         let tokens: [Int]
         let maxTokens: Int
         let sampler: RowSampler?
+        /// `Sendable` factory for this row's penalty processor; the processor
+        /// itself is built on the engine executor at admission time.
+        let processorSource: RowProcessorSource?
         let stateMachine: StopSequenceMatcher
     }
 }
