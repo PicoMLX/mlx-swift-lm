@@ -182,12 +182,15 @@ struct BatchedCacheFactoryTests {
         #expect(composite[0]([0, 0]) is BatchedCacheList)
     }
 
-    @Test("Rotating caches with keep > 0 are supported (no throw)")
-    func rotatingWithKeepIsSupported() throws {
-        let factories = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 4)])
-        let cache = factories[0]([0])
-        let rotating = try #require(cache as? BatchRotatingKVCache)
-        #expect(rotating.keep == 4)
+    @Test("Rotating caches with keep > 0 are rejected (single-stream fallback)")
+    func rotatingWithKeepIsRejected() {
+        // keep-prefix rotation + per-row left padding cannot be represented by
+        // the prefix-only padding mask after the wrap roll; the factory routes
+        // these topologies back to single-stream until the mask model supports
+        // trailing-garbage exclusion.
+        #expect(throws: BatchedCacheError.self) {
+            _ = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 4)])
+        }
     }
 
     @Test("Factory routes quantized caches and preserves quantization parameters")
