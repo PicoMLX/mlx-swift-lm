@@ -88,7 +88,7 @@ struct RowSamplerTests {
 @Suite(.serialized)
 struct BatchInferenceEngineTopologyTests {
 
-    @Test("Accepts supported cache topologies (incl. rotating keep > 0)")
+    @Test("Accepts supported cache topologies")
     func acceptsSupportedCacheTopologies() throws {
         _ = try BatchInferenceEngine(
             model: CacheTopologyLanguageModel { _ in [KVCacheSimple()] }
@@ -106,12 +106,6 @@ struct BatchInferenceEngineTopologyTests {
             model: CacheTopologyLanguageModel { _ in [RotatingKVCache(maxSize: 8, keep: 0)] }
         )
 
-        // PR1's factory supports keep > 0 (routes to BatchRotatingKVCache),
-        // so this no longer throws (unlike the original layr engine).
-        _ = try BatchInferenceEngine(
-            model: CacheTopologyLanguageModel { _ in [RotatingKVCache(maxSize: 8, keep: 4)] }
-        )
-
         _ = try BatchInferenceEngine(
             model: CacheTopologyLanguageModel { _ in [CacheList(MambaCache(), KVCacheSimple())] }
         )
@@ -127,6 +121,13 @@ struct BatchInferenceEngineTopologyTests {
         assertEngineRejectsCache(
             ChunkedKVCache(),
             expectedType: "ChunkedKVCache",
+            expectedPath: "layer"
+        )
+        // keep-prefix rotation cannot be combined with per-row left padding
+        // (see makeBatchedCacheFactory); these topologies stay single-stream.
+        assertEngineRejectsCache(
+            RotatingKVCache(maxSize: 8, keep: 4),
+            expectedType: "RotatingKVCache",
             expectedPath: "layer"
         )
         assertEngineRejectsCache(

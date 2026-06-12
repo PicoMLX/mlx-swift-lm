@@ -329,6 +329,11 @@ public final class BatchInferenceEngine {
     /// duplicate. This mirrors `PrefillBatch.generate`, which seeds the last
     /// prompt token and passes only the preceding prefix to `DecodeBatch`.
     ///
+    /// The adopted rows' engine UIDs are allocated here, from the engine's own
+    /// `uidCounter` — the single source of truth for row identity — and
+    /// returned alongside the batch, so a later `insert` can never reuse one
+    /// and collide with an adopted row's bookkeeping in the caller.
+    ///
     /// - Parameters:
     ///   - samplers: Per-row ``RowSampler`` (includes min-p via
     ///     `makeRowSampler`), or `nil` for the greedy fallback.
@@ -338,7 +343,6 @@ public final class BatchInferenceEngine {
     ///     processor's penalty context so penalties continue seamlessly across
     ///     the single→batch upgrade.
     public func makeAdoptedBatch(
-        uids: [Int],
         seedTokens: MLXArray,
         caches: [any BatchedCache],
         samplers: [RowSampler?]? = nil,
@@ -347,7 +351,7 @@ public final class BatchInferenceEngine {
         maxTokens: [Int],
         numTokens: [Int]? = nil,
         tokens: [[Int]]
-    ) -> DecodeBatch {
+    ) -> (batch: DecodeBatch, uids: [Int]) {
         precondition(
             !tokens.contains(where: { $0.isEmpty }),
             "makeAdoptedBatch requires non-empty token histories; each row's "
@@ -355,11 +359,17 @@ public final class BatchInferenceEngine {
         )
         if let processorSources {
             precondition(
-                processorSources.count == uids.count,
-                "makeAdoptedBatch: processorSources/uids count mismatch")
+                processorSources.count == tokens.count,
+                "makeAdoptedBatch: processorSources/tokens count mismatch")
+        }
+        var uids: [Int] = []
+        uids.reserveCapacity(tokens.count)
+        for _ in 0 ..< tokens.count {
+            uids.append(uidCounter)
+            uidCounter += 1
         }
         let priorTokens = tokens.map { Array($0.dropLast()) }
-        return DecodeBatch(
+        let batch = DecodeBatch(
             model: model,
             uids: uids,
             seedTokens: seedTokens,
@@ -375,6 +385,7 @@ public final class BatchInferenceEngine {
             stateMachines: stateMachines,
             numTokens: numTokens
         )
+        return (batch, uids)
     }
 
     // MARK: - Admission
