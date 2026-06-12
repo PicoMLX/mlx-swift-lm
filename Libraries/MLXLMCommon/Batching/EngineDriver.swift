@@ -127,6 +127,7 @@ actor EngineDriver {
         let cancelToken: Int
         let maxTokens: Int
         let sampler: RowSampler?
+        let processorSource: RowProcessorSource?
         let stateMachine: StopSequenceMatcher?
     }
 
@@ -203,6 +204,7 @@ actor EngineDriver {
         cancelToken: Int,
         maxTokens: Int,
         sampler: RowSampler?,
+        processorSource: RowProcessorSource? = nil,
         stateMachine: StopSequenceMatcher?
     ) -> Int? {
         if freeSlots <= 0 {
@@ -213,6 +215,7 @@ actor EngineDriver {
                     cancelToken: cancelToken,
                     maxTokens: maxTokens,
                     sampler: sampler,
+                    processorSource: processorSource,
                     stateMachine: stateMachine
                 ))
             return nil
@@ -223,6 +226,7 @@ actor EngineDriver {
             cancelToken: cancelToken,
             maxTokens: maxTokens,
             sampler: sampler,
+            processorSource: processorSource,
             stateMachine: stateMachine
         )
     }
@@ -234,6 +238,7 @@ actor EngineDriver {
         cancelToken: Int,
         maxTokens: Int,
         sampler: RowSampler?,
+        processorSource: RowProcessorSource?,
         stateMachine: StopSequenceMatcher?
     ) -> Int? {
         let uids: [Int]
@@ -242,6 +247,7 @@ actor EngineDriver {
                 prompts: [request.inputTokens],
                 maxTokens: [maxTokens],
                 samplers: [sampler],
+                processorSources: [processorSource],
                 stateMachines: stateMachine.map { [$0] }
             )
         } catch {
@@ -309,6 +315,7 @@ actor EngineDriver {
         seedToken: Int,
         caches: sending [any BatchedCache],
         sampler: RowSampler?,
+        processorSource: RowProcessorSource? = nil,
         stateMachine: StopSequenceMatcher?,
         maxTokens: Int,
         numTokens: Int,
@@ -319,6 +326,7 @@ actor EngineDriver {
             seedTokens: MLXArray([UInt32(seedToken)]),
             caches: caches,
             samplers: sampler.map { [$0] },
+            processorSources: [processorSource],
             stateMachines: stateMachine.map { [$0] },
             maxTokens: [maxTokens],
             numTokens: [numTokens],
@@ -539,6 +547,7 @@ actor EngineDriver {
                 cancelToken: pending.cancelToken,
                 maxTokens: pending.maxTokens,
                 sampler: pending.sampler,
+                processorSource: pending.processorSource,
                 stateMachine: pending.stateMachine
             )
         }

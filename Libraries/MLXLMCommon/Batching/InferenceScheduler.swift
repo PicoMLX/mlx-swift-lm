@@ -349,8 +349,28 @@ extension InferenceScheduler {
     /// iterator instead of discovering the rejection only after the handshake.
     private func canUpgrade(parameters: GenerateParameters) -> Bool {
         guard let context else { return false }
-        guard parameters.kvBits == nil else { return false }
+        guard Self.parametersAreBatchable(parameters) else { return false }
         return Self.migrateCaches(context.model.newCache(parameters: parameters)) != nil
+    }
+
+    /// Whether a request with these parameters may run on the shared batch
+    /// engine at all. The engine's per-layer cache factories are built once
+    /// from `newCache(parameters: nil)`, so per-request parameters that change
+    /// the cache *topology* cannot be honored there:
+    ///
+    /// - `kvBits` — the single path rewrites caches to `QuantizedKVCache`
+    ///   mid-decode (`maybeQuantizeKVCache`); the batched engine has no
+    ///   equivalent, so the request would silently lose its quantization.
+    /// - `maxKVSize` — `newCache` returns `RotatingKVCache(keep: 4)` for every
+    ///   layer; migrating or admitting such rows next to the engine's
+    ///   `BatchKVCache` rows would trip `extendBatched`'s topology
+    ///   precondition (and the factory rejects keep > 0 regardless). The
+    ///   request would otherwise silently lose its KV-memory cap.
+    ///
+    /// Non-batchable requests run on their own single iterator instead
+    /// (correctness over batching).
+    static func parametersAreBatchable(_ parameters: GenerateParameters) -> Bool {
+        parameters.kvBits == nil && parameters.maxKVSize == nil
     }
 }
 
@@ -498,7 +518,14 @@ extension InferenceScheduler {
             try startSingle(scheduled)
 
         case .single(let single):
-            if canUpgrade(parameters: single.parameters) {
+            if !Self.parametersAreBatchable(scheduled.request.parameters) {
+                // The NEW request's parameters (kvBits / maxKVSize) cannot run
+                // on the shared engine; hold it behind the running single
+                // request and run it on its own iterator once the scheduler is
+                // idle again (drained by singleTaskFinished / batchLoopFinished).
+                queuedRequests.append(scheduled)
+                state = .pendingUpgrade(single)
+            } else if canUpgrade(parameters: single.parameters) {
                 // The running request's caches can migrate single→batch; perform
                 // the handshake and join both into the batch.
                 await upgrade(from: single, joining: scheduled)
@@ -581,13 +608,42 @@ extension InferenceScheduler {
         let promptTokenCount = inputTokens.count
         let ticket = scheduled.request.wiredMemoryTicket
 
+        // Cross-request prompt-cache reuse: fetch the nearest cached prefix and
+        // prefill only the remainder. The fetched cache is a deep copy owned by
+        // this request, so the stored entry is never aliased. (Batched-path
+        // fetch — mixed-depth prefill in the engine — is not wired yet; engine
+        // rows still prefill fully and only write back.)
+        var iteratorCache: [KVCache]? = nil
+        var iteratorInput = scheduled.request.input
+        if let promptCache, writeBack,
+            LRUPromptCache.canUsePromptCache(
+                input: scheduled.request.input, parameters: parameters, model: context.model)
+        {
+            let fetch = promptCache.fetchNearestCacheResult(
+                model: modelName, tokens: inputTokens, salt: salt)
+            if let fetched = fetch.cache {
+                var remainder = fetch.remainder
+                if remainder.isEmpty, canTrimPromptCache(fetched), let last = inputTokens.last {
+                    // Exact hit: the iterator still needs at least one token to
+                    // evaluate, so trim the final token's KV and re-feed it.
+                    trimPromptCache(fetched, numTokens: 1)
+                    remainder = [last]
+                }
+                if !remainder.isEmpty {
+                    iteratorCache = fetched
+                    iteratorInput = LMInput(tokens: MLXArray(remainder.map { Int32($0) }))
+                }
+            }
+        }
+
         // Construct the iterator on the actor so a failing prefill/`prepare`
         // throws to the caller (the stream has not been handed back yet on the
         // primary `idle` route). A thrown error leaves `state`/the handler
         // untouched — no task is launched and the request is simply not started.
         let iterator = try TokenIterator(
-            input: scheduled.request.input,
+            input: iteratorInput,
             model: context.model,
+            cache: iteratorCache,
             parameters: parameters
         )
 
@@ -603,6 +659,10 @@ extension InferenceScheduler {
                 iterator: iterator
             ))
 
+        // The (Sendable) prompt cache rides into the task for write-back on
+        // natural completion; nil when this request did not opt in.
+        let cacheForWriteBack = writeBack ? self.promptCache : nil
+
         let task = Task<Void, Never> { [weak self] in
             let inputs = boxed.consume()
             await Self.runSingle(
@@ -615,6 +675,10 @@ extension InferenceScheduler {
                 promptTokenCount: promptTokenCount,
                 submitTime: submitTime,
                 wiredMemoryTicket: ticket,
+                promptCache: cacheForWriteBack,
+                modelName: modelName,
+                promptCacheSalt: salt,
+                inputTokens: inputTokens,
                 onFinished: { tokenIds in
                     await self?.singleTaskFinished(
                         requestID: requestID, generatedTokenIds: tokenIds)
@@ -667,6 +731,10 @@ extension InferenceScheduler {
         promptTokenCount: Int,
         submitTime: TimeInterval,
         wiredMemoryTicket: WiredMemoryTicket?,
+        promptCache: (any PromptCaching)?,
+        modelName: String,
+        promptCacheSalt: UInt64,
+        inputTokens: [Int],
         onFinished: @Sendable @escaping ([Int]) async -> Void
     ) async {
         // The iterator was constructed on the actor (its prefill `prepare` ran
@@ -680,6 +748,10 @@ extension InferenceScheduler {
 
         var it = iterator
         var generated: [Int] = []
+        // The stop token that ended the loop, if any. Its forward pass already
+        // ran (the step that returned it wrote its KV), so the prompt-cache
+        // write-back key must include it even though it is never emitted.
+        var finalStopToken: Int? = nil
 
         // The synchronous decode loop, run under the wired-memory limit when a
         // ticket is supplied (parity with `generateTask`). It captures live
@@ -716,6 +788,7 @@ extension InferenceScheduler {
                 // the stop token is NOT emitted to the consumer.
                 if token == unknownTokenId || stopTokenIds.contains(token) {
                     stopReason = .stop
+                    finalStopToken = token
                     break
                 }
 
@@ -773,6 +846,28 @@ extension InferenceScheduler {
         )
         handler.yieldInfo(info)
         handler.finish()
+
+        // Write the finished request's KV state back to the prompt cache (the
+        // single-path counterpart of EngineDriver.writeBack). The iterator's
+        // caches cover the full prompt plus every token whose forward pass
+        // ran: all generated tokens, and the stop token when the loop broke on
+        // EOS. `insertCache` deep-copies, so the stored entry never aliases
+        // the iterator's live caches; incompatible caches (e.g. quantized via
+        // kvBits mid-run) are rejected inside `insertCache`.
+        if let promptCache {
+            var coveredTokens = inputTokens + generated
+            if let finalStopToken {
+                coveredTokens.append(finalStopToken)
+            }
+            promptCache.insertCache(
+                model: modelName,
+                tokens: coveredTokens,
+                promptCache: it.cache,
+                checkpoint: false,
+                salt: promptCacheSalt
+            )
+        }
+
         await onFinished(generated)
     }
 
@@ -859,6 +954,19 @@ extension InferenceScheduler {
     /// decode loop is running. Used for 3rd+ concurrent requests and for the
     /// manual ``generateBatched(_:)`` path.
     private func admitToBatch(_ scheduled: sending ScheduledRequest) async {
+        // Topology-changing parameters (kvBits / maxKVSize) cannot run on the
+        // shared engine (see `parametersAreBatchable`). Hold such a request
+        // until the scheduler is idle again, then run it on its own single
+        // iterator — never silently drop its cache configuration.
+        guard Self.parametersAreBatchable(scheduled.request.parameters) else {
+            if case .idle = state {
+                startSingleIfIdle(scheduled)
+            } else {
+                queuedRequests.append(scheduled)
+            }
+            return
+        }
+
         // `ensureDriver` suspends; resolve it before consuming `scheduled` so
         // the non-Sendable request is not held across the await unnecessarily.
         guard let driver = await ensureDriver() else {
@@ -874,6 +982,7 @@ extension InferenceScheduler {
         let handler = scheduled.handler
         let cancelToken = scheduled.requestID
         let sampler = Self.rowSampler(for: scheduled.request.parameters)
+        let processorSource = Self.rowProcessorSource(for: scheduled.request.parameters)
         let maxTokens = scheduled.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
             input: scheduled.request.input,
@@ -891,6 +1000,7 @@ extension InferenceScheduler {
             cancelToken: cancelToken,
             maxTokens: maxTokens,
             sampler: sampler,
+            processorSource: processorSource,
             stateMachine: nil
         )
         startBatchLoop(driver)
@@ -909,31 +1019,40 @@ extension InferenceScheduler {
             try startSingle(scheduled)
         } catch {
             handler.finish()
+            // `startSingle` throws before installing any state; make sure a
+            // stale `.upgrading` marker from the calling path cannot strand
+            // the scheduler (subsequent requests would route to the batch
+            // forever even with nothing running).
+            if case .upgrading = state { state = .idle }
         }
     }
 
-    /// Build a `RowSampler` from generation parameters.
-    ///
-    /// - Note: The batched engine samples per row via the `RowSampler` closure,
-    ///   which currently models temperature/top-p/top-k only. These are NOT yet
-    ///   carried over to the batched/upgraded path and behave as the single
-    ///   stream's `GenerateParameters.sampler()`/`.processor()` would otherwise:
-    ///   - `minP` (min-p truncation),
-    ///   - `LogitProcessor` penalties (repetition / presence / frequency).
-    ///   TODO(PR4 sampling-parity): extend `makeRowSampler` with min-p and a
-    ///   per-row penalty processor so the batched path matches the single path.
+    /// Build a `RowSampler` from generation parameters: temperature / top-p /
+    /// min-p / top-k, matching the single path's `TopPSampler` filter order.
     static func rowSampler(for parameters: GenerateParameters) -> RowSampler {
         makeRowSampler(
             temperature: parameters.temperature,
             topP: parameters.topP,
             topK: parameters.topK,
+            minP: parameters.minP,
             seed: nil
         )
     }
 
-    /// Default per-request token budget when `maxTokens` is unset, matching the
-    /// engine's own default.
-    private var defaultMaxTokens: Int { 128 }
+    /// Build the per-row penalty-processor source (repetition / presence /
+    /// frequency) from generation parameters. The source is `Sendable`; the
+    /// engine materializes the stateful processor on its own executor, and it
+    /// yields `nil` (no per-step cost) when no penalties are configured.
+    static func rowProcessorSource(for parameters: GenerateParameters) -> RowProcessorSource {
+        makeRowProcessorSource(parameters)
+    }
+
+    /// Per-request token budget when `maxTokens` is unset. The single path
+    /// treats nil as unlimited (`TokenIterator` never length-stops), so the
+    /// batched path must not invent a smaller limit — otherwise a request's
+    /// output length would depend on whether another request happened to
+    /// arrive concurrently.
+    private var defaultMaxTokens: Int { Int.max }
 
     /// Start (or no-op if already running) the driver's decode loop as a
     /// detached task. The loop ends when the engine empties; on completion the
@@ -953,6 +1072,7 @@ extension InferenceScheduler {
     private func batchLoopFinished() async {
         guard let driver else {
             state = .idle
+            await drainQueuedRequests()
             return
         }
         if await driver.hasWork {
@@ -960,6 +1080,10 @@ extension InferenceScheduler {
             startBatchLoop(driver)
         } else {
             state = .idle
+            // Requests held because their parameters could not run on the
+            // shared engine (see `parametersAreBatchable`) are drained once
+            // the batch empties, mirroring `singleTaskFinished`.
+            await drainQueuedRequests()
         }
     }
 }
@@ -1115,6 +1239,7 @@ extension InferenceScheduler {
         // and overwrite the row's record. The scheduler-owned request id rides
         // along as `cancelToken` for stream-cancellation routing.
         let sampler = Self.rowSampler(for: liveParameters)
+        let processorSource = Self.rowProcessorSource(for: liveParameters)
         let stopMatcher = defaultStopMatcher()
         let firstRecord = EngineDriver.AdoptedRecord(
             handler: single.handler,
@@ -1143,6 +1268,7 @@ extension InferenceScheduler {
             seedToken: liveCurrentToken,
             caches: batchedCaches,
             sampler: sampler,
+            processorSource: processorSource,
             stateMachine: stopMatcher,
             maxTokens: budgetLimit,
             numTokens: liveTokenCount + 1,
@@ -1161,6 +1287,7 @@ extension InferenceScheduler {
         let joinHandler = joining.handler
         let joinCancelToken = joining.requestID
         let joinSampler = Self.rowSampler(for: joining.request.parameters)
+        let joinProcessorSource = Self.rowProcessorSource(for: joining.request.parameters)
         let joinMax = joining.request.parameters.maxTokens ?? defaultMaxTokens
         let req = SchedulerRequest(
             input: joining.request.input,
@@ -1177,6 +1304,7 @@ extension InferenceScheduler {
             cancelToken: joinCancelToken,
             maxTokens: joinMax,
             sampler: joinSampler,
+            processorSource: joinProcessorSource,
             stateMachine: nil
         )
 
@@ -1243,10 +1371,8 @@ extension InferenceScheduler {
             // The request was upgraded or superseded; nothing to do.
             return
         }
-        // Write the finished single request's KV state back to the prompt
-        // cache, if enabled. (Single-path write-back is a future hookup; the
-        // single task does not currently surface its final caches here.
-        // TODO(PR4): wire single-path prompt-cache write-back.)
+        // (Prompt-cache write-back happens inside `runSingle` on the task that
+        // owns the iterator's caches, before this callback fires.)
         state = .idle
         await drainQueuedRequests()
     }

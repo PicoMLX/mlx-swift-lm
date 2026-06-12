@@ -282,9 +282,12 @@ public final class ModelContainer: Sendable {
     /// Explicitly batched generation: submit several requests at once and get a
     /// per-request `AsyncStream<Generation>` back, in input order.
     ///
-    /// Unlike the transparent ``generate(input:parameters:wiredMemoryTicket:)``
-    /// routing (which auto-upgrades only when a second request races the first),
-    /// this admits all requests straight to the continuous-batching engine.
+    /// Requests route through the scheduler's normal state machine: the first
+    /// starts on the single-stream path and is upgraded into the batch when the
+    /// second is routed, with the rest admitted to the engine directly. (Models
+    /// whose caches cannot migrate single→batch — SSM/hybrid topologies — run
+    /// the requests sequentially instead; admitting fresh batches directly to
+    /// the engine for those models is a planned scheduler improvement.)
     /// Requires a scheduler to be installed; throws otherwise.
     ///
     /// Requests are transferred with `sending` (they carry non-`Sendable`
