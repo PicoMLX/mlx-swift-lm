@@ -133,16 +133,13 @@ public struct LFM2BidirectionalConfiguration: Decodable, Sendable {
         let ropeParameters = try c.decodeIfPresent(RopeParameters.self, forKey: .ropeParameters)
         ropeTheta = theta ?? ropeParameters?.ropeTheta ?? 1_000_000.0
 
-        // The custom `mlx` block is present on the converted checkpoints. If a config
-        // omits it (e.g. a raw SentenceTransformer LFM2.5 export), default to a
-        // CLS-pooled embedding head — a plain encoder with no projection — rather than
-        // throwing. ColBERT still requires the block, since the projection head can't
-        // be inferred from config.json alone.
-        mlx =
-            try c.decodeIfPresent(MLXHead.self, forKey: .mlx)
-            ?? MLXHead(
-                head: .embedding, pooling: "cls", prompts: nil, projDim: nil,
-                queryPrefix: nil, documentPrefix: nil, queryLength: nil, documentLength: nil)
+        // The custom `mlx` block selects the retrieval head (embedding vs colbert)
+        // and carries the prompt/prefix conventions; it can't be inferred from
+        // config.json alone, so it is required. A config that omits it fails to decode
+        // rather than silently building the wrong model — matching how the library
+        // fails loud on architecture-selecting config (e.g. `ModelTypeRegistry` throws
+        // `unsupportedModelType` for an unknown `model_type`).
+        mlx = try c.decode(MLXHead.self, forKey: .mlx)
     }
 }
 

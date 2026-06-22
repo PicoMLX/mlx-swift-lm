@@ -179,8 +179,8 @@ struct LFM2BidirectionalTests {
         }
     }
 
-    @Test("A config without an mlx block defaults to a CLS embedding head")
-    func testConfigWithoutMLXBlockDefaultsToEmbedding() throws {
+    @Test("A config without an mlx block fails to decode (the head can't be inferred)")
+    func testConfigWithoutMLXBlockThrows() {
         let json = """
             {
               "model_type": "lfm2", "vocab_size": 64, "hidden_size": 32,
@@ -191,10 +191,12 @@ struct LFM2BidirectionalTests {
               "layer_types": ["conv", "full_attention"]
             }
             """
-        let c = try decode(json)
-        #expect(c.mlx.head == .embedding)
-        Device.withDefaultDevice(.cpu) {
-            #expect(LFM2BidirectionalModel(c).poolingStrategy == .cls)
+        // The mlx block selects the retrieval head and can't be inferred from
+        // config.json, so a config that omits it must fail loudly rather than silently
+        // building an embedding model — matching the library's fail-loud handling of
+        // architecture-selecting config (e.g. ModelTypeRegistry's unsupportedModelType).
+        #expect(throws: DecodingError.self) {
+            _ = try decode(json)
         }
     }
 
