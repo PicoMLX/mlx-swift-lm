@@ -1,0 +1,45 @@
+name: Swift Build (fork)
+
+# Fork-only CI: builds the package (and compiles the tests, without running them)
+# on every pushed commit.
+#
+# This is intentionally a SEPARATE file from pull_request.yml (the workflow shared
+# with upstream ml-explore) for two reasons:
+#   1. Syncing from upstream never produces a merge conflict on this file.
+#   2. The job is gated to this fork via `if: github.repository == ...`, mirroring
+#      how upstream's jobs are gated to ml-explore. If this file ever reaches the
+#      upstream repo, the job is simply skipped there -- it can never run or
+#      interfere upstream.
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+# Cancel an in-progress build for a branch when a newer commit is pushed to it,
+# so rapid pushes don't pile up (macOS runner minutes are billed at 10x).
+concurrency:
+  group: swift-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Fork-only. Never runs on upstream ml-explore (kept inert if it lands there).
+    if: github.repository == 'PicoMLX/mlx-swift-lm'
+    # Apple Silicon hosted runner: provides Xcode + the Metal toolchain needed to
+    # produce the Metal library that `swift build` alone cannot.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build for testing (Xcode, macOS)
+        run: |
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
