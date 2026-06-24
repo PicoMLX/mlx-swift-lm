@@ -540,7 +540,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// cache is in the correct state for subsequent decode steps.
     ///
     /// Matches Python mlx-lm's `BatchRotatingKVCache.finalize()`.
-    public func finalize() {
+    public override func finalize() {
         guard let lengths = _lengths else { return }
         let roll = MLX.maximum(MLXArray(Int32(0)), batchOffsets - lengths)
         if let k = keys, let v = values {

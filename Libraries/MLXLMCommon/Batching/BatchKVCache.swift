@@ -505,7 +505,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// the causal mask correctly excludes it.
     ///
     /// Matches Python mlx-lm's `BatchKVCache.finalize()`.
-    public func finalize() {
+    public override func finalize() {
         guard let padding = _rightPadding else { return }
 
         if let k = keys, let v = values {
