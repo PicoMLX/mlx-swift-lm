@@ -238,8 +238,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         // but decrementing `_idx` would drive it negative and leave `batchOffsets`
         // inconsistent with the adjusted padding, corrupting the `prev` range used
         // by the next prefill. Skip the shift entirely while `keys == nil`.
+        //
+        // Also require `_idx >= minLeftPad`: during chunked prefill the KV buffer
+        // can exist before the write pointer has advanced past the padding. Shifting
+        // then would drive `_idx` negative and slice past the written region (keeping
+        // uninitialized data), so skip until enough tokens have been written.
         let minLeftPad = leftPadding.min().item(Int32.self)
-        if minLeftPad > 0, keys != nil {
+        if minLeftPad > 0, keys != nil, _idx >= Int(minLeftPad) {
             let padInt = Int(minLeftPad)
             keys = keys?[.ellipsis, padInt..., 0...]
             values = values?[.ellipsis, padInt..., 0...]
