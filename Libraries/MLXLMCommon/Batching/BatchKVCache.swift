@@ -222,6 +222,9 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
             leftPadding = MLXArray([Int32]())
             batchOffsets = MLXArray([Int32]())
             _idx = 0
+            // Clear pending right-padding so a later finalize() can't roll/subtract
+            // with stale per-row metadata against the now-empty batch.
+            _rightPadding = nil
             return
         }
 
@@ -232,6 +235,11 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         values = values?[indices]
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
+        // Transient right-padding metadata (set by prepareBatched, consumed by
+        // finalize) is per-row too: filter it with the same indices so a cancel
+        // between prepare and finalize doesn't leave finalize rolling/subtracting
+        // against the pre-filter batch shape.
+        _rightPadding = _rightPadding?[indices]
 
         // Shift left to reduce padding. Only meaningful once a KV buffer exists:
         // for a fresh/cancelled-before-prefill cache the tensor slices are no-ops,

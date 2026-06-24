@@ -644,6 +644,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         values = values?[indices]
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
+        // Transient prepared-prefill lengths are per-row too: filter with the same
+        // indices so a cancel between prepare and finalize doesn't roll surviving
+        // rows with another row's padding (or hit a shape mismatch) in finalize.
+        _lengths = _lengths?[indices]
     }
 
     /// In-place extend this cache with another BatchRotatingKVCache.
