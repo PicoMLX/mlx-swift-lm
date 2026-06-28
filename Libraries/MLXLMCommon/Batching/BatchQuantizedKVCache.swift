@@ -330,6 +330,9 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
             leftPadding = MLXArray([Int32]())
             batchOffsets = MLXArray([Int32]())
             _idx = 0
+            // Clear pending right-padding so a later finalize() can't roll/subtract
+            // with stale per-row metadata against the now-empty batch.
+            _rightPadding = nil
             return
         }
 
@@ -339,12 +342,21 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
         values = values.map { triple in Self.mapTriple({ $0[indices] }, triple) }
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
+        // Transient right-padding metadata (set by prepareBatched, consumed by
+        // finalize) is per-row too: filter it with the same indices so a cancel
+        // between prepare and finalize doesn't leave finalize rolling/subtracting
+        // against the pre-filter batch shape. Same as `BatchKVCache.filter`.
+        _rightPadding = _rightPadding?[indices]
 
         // Shift left to reduce padding. Skipped while `keys == nil` for the
         // same reason as `BatchKVCache.filter`: decrementing `_idx` on an
         // unpopulated cache would corrupt the next prefill's write range.
+        // Also require `_idx >= minLeftPad`: during chunked prefill the KV
+        // buffer can exist before the write pointer has advanced past the
+        // padding, and shifting then would drive `_idx` negative and slice
+        // past the written region.
         let minLeftPad = leftPadding.min().item(Int32.self)
-        if minLeftPad > 0, keys != nil {
+        if minLeftPad > 0, keys != nil, _idx >= Int(minLeftPad) {
             let padInt = Int(minLeftPad)
             keys = keys.map { triple in
                 Self.mapTriple({ $0[.ellipsis, padInt..., 0...] }, triple)
@@ -364,8 +376,19 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
     /// Admission contract: same as ``BatchKVCache/extend(other:)`` — a
     /// non-empty `other` must arrive prefilled.
     public func extend(other: BatchQuantizedKVCache) {
+        // `bits`/`mode` are fixed at construction and never resolved, so they
+        // must always match. `groupSize`, however, is resolved lazily on the
+        // first `updateQuantized`: an empty receiver still holds its unresolved
+        // *requested* value, so a strict `groupSize` equality check would trap
+        // when admitting the first prefilled sub-batch. Only enforce it once the
+        // receiver is populated; an empty receiver adopts `other`'s resolved
+        // `groupSize` in the adoption branch below.
         precondition(
-            groupSize == other.groupSize && bits == other.bits && mode == other.mode,
+            bits == other.bits && mode == other.mode,
+            "BatchQuantizedKVCache.extend requires matching quantization parameters"
+        )
+        precondition(
+            keys == nil || groupSize == other.groupSize,
             "BatchQuantizedKVCache.extend requires matching quantization parameters"
         )
         precondition(
@@ -383,6 +406,10 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
                 self.batchOffsets = other.batchOffsets
                 self.leftPadding = other.leftPadding
                 self._idx = other._idx
+                // Adopt `other`'s resolved `groupSize`: an empty receiver's was
+                // still the unresolved requested value. (`bits`/`mode` are fixed
+                // at construction and already validated to match above.)
+                self.groupSize = other.groupSize
             }
             return
         }
