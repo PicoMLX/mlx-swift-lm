@@ -338,26 +338,36 @@ private func makeBatchedCacheFactory(
 
     if Swift.type(of: cache) == KVCacheSimple.self {
         // KNOWN LIMITATION (not gateable here): a few models read `cache[0].offset`
-        // as a SCALAR sequence position *outside* the RoPE helper and feed it into
-        // Llama-4-style attention scaling — `Mistral3TextModelInner`,
-        // `Mistral3` (VLM), and `NemotronLabsDiffusionEncoder`, each gated by a
-        // `rope_parameters.llama_4_scaling_beta` config entry. `BatchKVCache.offset`
-        // returns the padded MAX width (`_idx`) shared by all rows, so on a ragged
-        // batch the shorter rows receive the longest row's scaling factor.
+        // as a SCALAR sequence position and use it in a way that bypasses the
+        // batched per-row plumbing. `BatchKVCache.offset` returns the padded MAX
+        // width (`_idx`) shared by all rows, so on a ragged batch the shorter rows
+        // silently use the longest row's position. Two distinct families:
         //
-        // This is NOT cleanly gateable in the factory: the probe is an ordinary
+        //   a) Attention scaling: `Mistral3TextModelInner`, `Mistral3` (VLM), and
+        //      `NemotronLabsDiffusionEncoder` feed `offset` into Llama-4-style
+        //      attention scaling, each gated by a `rope_parameters.llama_4_scaling_beta`
+        //      config entry — shorter rows get the longest row's scaling factor.
+        //
+        //   b) Scalar-offset RoPE: `PaliGemma` (`Paligemma.swift:60-61`) and
+        //      `Qwen2VL` (`Qwen2VL.swift:102-104`) apply RoPE with `cache.offset`
+        //      DIRECTLY (`rope(queries, offset: cache.offset)`) instead of the
+        //      batched `cache.ropeOffset` / `applyRotaryPosition(...)` path, so
+        //      shorter rows are rotated with the longest row's position rather than
+        //      their own per-row `batchOffset`.
+        //
+        // Neither is cleanly gateable in the factory: the probe is an ordinary
         // `KVCacheSimple` (the core full-attention cache type used by nearly every
         // model), with no cache-instance signal that distinguishes these models
         // from the safe majority. Rejecting `KVCacheSimple` would disable batching
         // for essentially all full-attention models, so that is the wrong trade.
         //
-        // Accepted as a documented limitation: those specific models combined with
-        // `rope_parameters` Llama-4 attention scaling are not batch-safe for ragged
-        // batches until that scaling path consumes per-row offsets (e.g. via the
-        // `BatchPositionedKVCache.batchOffset` per-row positions, mirroring how RoPE
-        // already does). The batched-engine wiring should refuse to admit ragged
-        // batches for models advertising that scaling; the cache-type factory
-        // cannot and should not try to encode that model-level constraint.
+        // Accepted as a documented limitation: these specific models are not
+        // batch-safe for ragged batches until their scaling / RoPE call sites
+        // consume per-row offsets (e.g. via the `BatchPositionedKVCache.batchOffset`
+        // per-row positions, mirroring how `applyRotaryPosition(_:offset:)` already
+        // does for the batched RoPE path). The batched-engine wiring should refuse
+        // to admit ragged batches for these models; the cache-type factory cannot
+        // and should not try to encode that model-level constraint.
         return { leftPadding in BatchKVCache(leftPadding: leftPadding) }
     }
 
