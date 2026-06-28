@@ -569,7 +569,13 @@ public final class ChatSession {
     /// and relies on ``ModelContainer/promptCache`` for prefix KV reuse; the
     /// session keeps a `.history` cache rather than a `[KVCache]`. Restarts on
     /// tool calls (dispatched via `toolDispatch`).
-    private static func streamThroughScheduler<R: Sendable>(
+    /// `emit` delivers one generation event to the consumer and returns
+    /// `false` if the consumer has terminated the stream (so generation should
+    /// stop). Passing a non-generic `@Sendable` closure (rather than a generic
+    /// `continuation`/`transform` pair) keeps this function non-generic, which
+    /// avoids a Swift type-checker performance cliff when it is compiled inside
+    /// the `streamMap` `Task` closure.
+    private static func streamThroughScheduler(
         model: ModelContainer,
         processor: any UserInputProcessor,
         processing: UserInput.Processing,
@@ -580,8 +586,7 @@ public final class ChatSession {
         priorMessages: [Chat.Message],
         cache: Cache,
         newMessages: SendableBox<[Chat.Message]>,
-        continuation: AsyncThrowingStream<R, Error>.Continuation,
-        transform: @Sendable @escaping (Generation) -> R?
+        emit: @Sendable (Generation) -> Bool
     ) async throws -> Cache {
         // Reconstruct the persisted history (prior turns minus the system
         // prompt, which `priorMessages` already carries) from the cache.
@@ -628,10 +633,8 @@ public final class ChatSession {
                 if let chunk = item.chunk {
                     assistantText += chunk
                 }
-                if let value = transform(item) {
-                    if case .terminated = continuation.yield(value) {
-                        break
-                    }
+                if !emit(item) {
+                    break
                 }
             }
             // If `messages` was repopulated with a tool result, `restart`
@@ -693,8 +696,13 @@ public final class ChatSession {
                             priorMessages: messages,
                             cache: cache,
                             newMessages: inputMessages,
-                            continuation: continuation,
-                            transform: transform
+                            emit: { generation in
+                                guard let value = transform(generation) else { return true }
+                                if case .terminated = continuation.yield(value) {
+                                    return false
+                                }
+                                return true
+                            }
                         )
                         continuation.finish()
                         return
