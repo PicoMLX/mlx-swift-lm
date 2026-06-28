@@ -193,11 +193,18 @@ struct BatchedCacheFactoryTests {
         }
     }
 
-    @Test("Factory rejects quantized and chunked caches")
+    @Test("Factory routes quantized caches and preserves quantization parameters")
+    func factoryRoutesQuantizedCaches() throws {
+        let factories = try makeBatchedCacheFactories(
+            for: [QuantizedKVCache(groupSize: 32, bits: 4)])
+        let cache = try #require(factories[0]([0, 0]) as? BatchQuantizedKVCache)
+        #expect(cache.groupSize == 32)
+        #expect(cache.bits == 4)
+        #expect(cache.batchSize == 2)
+    }
+
+    @Test("Factory rejects chunked caches")
     func factoryRejectsUnsupportedTypes() {
-        #expect(throws: BatchedCacheError.self) {
-            _ = try makeBatchedCacheFactories(for: [QuantizedKVCache()])
-        }
         #expect(throws: BatchedCacheError.self) {
             _ = try makeBatchedCacheFactories(for: [ChunkedKVCache(chunkSize: 16)])
         }

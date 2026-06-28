@@ -173,7 +173,7 @@ public enum BatchedCacheError: Error, CustomStringConvertible, Equatable {
 /// allocation is a cheap closure call that cannot fail.
 ///
 /// - Throws: ``BatchedCacheError`` if any layer's cache type has no batched
-///   implementation (e.g. quantized or chunked caches).
+///   implementation (e.g. chunked caches).
 public func makeBatchedCacheFactories(for probe: [any KVCache]) throws -> [BatchedCacheFactory] {
     try probe.enumerated().map { layer, cache in
         try makeBatchedCacheFactory(for: cache, layer: layer, path: "layer")
@@ -204,11 +204,24 @@ private func makeBatchedCacheFactory(
         )
     }
 
-    if cache is QuantizedKVCache {
-        throw unsupported("Quantized KV caches are not supported by continuous batching.")
+    if let quantized = cache as? QuantizedKVCache {
+        // Probe rows allocate with the probe's quantization parameters;
+        // `BatchQuantizedKVCache` resolves an incompatible group size against
+        // the model's head dimensions on first update, exactly like
+        // `QuantizedKVCache`.
+        let groupSize = quantized.groupSize
+        let bits = quantized.bits
+        let mode = quantized.mode
+        return { leftPadding in
+            BatchQuantizedKVCache(
+                leftPadding: leftPadding, groupSize: groupSize, bits: bits, mode: mode)
+        }
     }
 
     if cache is ChunkedKVCache {
+        // ChunkedKVCache (Llama 4 chunked attention) trims the buffer front as
+        // chunks complete; reconciling that with per-row left-padding needs a
+        // dedicated design, so it stays single-stream for now.
         throw unsupported("Chunked KV caches are not supported by continuous batching.")
     }
 
