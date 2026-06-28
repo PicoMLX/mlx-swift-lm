@@ -288,6 +288,38 @@ struct BatchedSSMCacheTests {
         let extracted = list.extractBatched(0)
         #expect(extracted is CacheList)
     }
+
+    @Test("BatchedCacheList delegates masking to its attention child")
+    func batchedCacheListDelegatesMask() {
+        // A composite layer cache (e.g. BaichuanM1's recurrent + attention pair)
+        // must honour the attention child's per-row left padding when a model asks
+        // it for an attention mask via createAttentionMask(h:cache: cache?.first).
+        // Without the makeMask override the inherited BaseKVCache.makeMask would
+        // return .none for n=1 / .causal otherwise, exposing left-padded KV slots.
+        let attention = BatchKVCache(leftPadding: [1, 3])
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 4, headDim: 4)
+        _ = attention.update(keys: keys, values: values)
+
+        let list = BatchedCacheList(caches: [attention])
+        // Offset/ropeOffset delegate to the attention child.
+        #expect(list.offset == attention.offset)
+        guard case .batch = list.ropeOffset else {
+            Issue.record("BatchedCacheList.ropeOffset should delegate to the batched child")
+            return
+        }
+
+        // Even for a single-token decode step the composite must emit an explicit
+        // array mask that masks the left padding.
+        let mode = list.makeMask(n: 1, windowSize: nil, returnArray: false)
+        switch mode {
+        case .array(let mask):
+            #expect(mask.dim(0) == 2)
+            // Row 1 has left padding 3 → its first padded slot is masked out.
+            #expect(mask[1, 0, 0, 0].item(Bool.self) == false)
+        case .arrays, .causal, .none:
+            Issue.record("BatchedCacheList should delegate to the batched array mask")
+        }
+    }
 }
 
 // MARK: - Masking

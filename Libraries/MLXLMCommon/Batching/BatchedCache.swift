@@ -96,6 +96,54 @@ public final class BatchedCacheList: CacheList, BatchedCache {
         }
     }
 
+    /// The attention child that carries the per-row left-padding mask, if any.
+    ///
+    /// Composite per-layer caches (e.g. BaichuanM1's `CacheList(MambaCache,
+    /// KVCacheSimple/RotatingKVCache)`) pair a recurrent/SSM child with a
+    /// full-attention child. Only the full-attention child (a
+    /// `BatchPositionedKVCache`) holds the per-row `leftPadding` needed to build
+    /// a correct batched attention mask; the SSM child produces no attention mask.
+    private var maskingChild: (any BatchPositionedKVCache)? {
+        batchedCaches.lazy.compactMap { $0 as? any BatchPositionedKVCache }.first
+    }
+
+    /// Delegate masking to the attention child so composite caches honour per-row
+    /// left padding.
+    ///
+    /// `BaichuanM1ModelInner` builds its attention mask via
+    /// `createAttentionMask(h:cache: cache?.first)` where `cache?.first` is this
+    /// composite (a `CacheList`/`BatchedCacheList`). Without this override the
+    /// inherited `BaseKVCache.makeMask` returns `.causal`/`.none` and never masks
+    /// the left-padded KV slots under continuous batching. Delegating to the
+    /// `BatchPositionedKVCache` child reuses its batched `createCausalMask`
+    /// (which honours `leftPadding`).
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if let child = maskingChild {
+            return child.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    /// Report the attention child's offset so callers that derive masks from
+    /// `cache.offset` (e.g. the array-based `createAttentionMask(h:cache:)`
+    /// overload) see the batched progress rather than the inherited scalar `0`.
+    public override var offset: Int {
+        get { maskingChild?.offset ?? super.offset }
+        set { super.offset = newValue }
+    }
+
+    public override var maxSize: Int? {
+        maskingChild?.maxSize ?? super.maxSize
+    }
+
+    /// Surface the attention child's per-row RoPE offset so composite caches use
+    /// the batched positions rather than the inherited scalar offset.
+    public override var ropeOffset: RoPEOffset {
+        maskingChild?.ropeOffset ?? super.ropeOffset
+    }
+
     /// Deep-copy as a `BatchedCacheList`, preserving the `BatchedCache` wrapper.
     ///
     /// `CacheList.copy()` rebuilds a plain `CacheList` from copied children, which
