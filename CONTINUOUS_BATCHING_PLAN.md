@@ -30,7 +30,8 @@ These answer the open questions raised against v1.
 
 3. **CI on the fork without touching upstream** — see §2.
 
-4. **Naming** — concrete proposals in §3 (confirm before the rename churn).
+4. **Naming** — decided (§3): `BatchInferenceEngine → BatchGenerationEngine`,
+   `EngineDriver → BatchEngineActor`, keep `InferenceScheduler`.
 
 5. **Forward-compatibility for Flux / BERT / embeddings / speculative decoding** — verified
    feasible with the current layering; required seams documented in §4. We still do **not**
@@ -40,18 +41,31 @@ These answer the open questions raised against v1.
 
 ## 1. Branch & merge order
 
+**New branches / new PRs (keep the originals).** We open a fresh branch + PR for each stack
+member rather than force-pushing the rebase onto the existing branches. The current PRs
+(#16, #10, #9, #11, #12) are **closed, not deleted**, each with a comment pointing to its
+replacement — so the original review history and code stay around as a fallback.
+
+| Role | New branch | Rebased from (old) | Replaces PR |
+|---|---|---|---|
+| CI enable | `claude/cb-ci-enable` | (off `main`) | — |
+| PR1 caches | `claude/cb-1-caches` | `claude/sweet-shannon-144odn` (#16) | #16 (and #8) |
+| PR2 engine | `claude/cb-2-engine` | `claude/batched-2-engine` | #10 |
+| PR3 prompt cache | `claude/cb-3-promptcache` | `claude/batched-3-promptcache` | #9 |
+| PR4 scheduler/API | `claude/cb-4-scheduler` | `claude/batched-4-scheduler` | #11 |
+| PR12 quantized | `claude/cb-5-quantized` | `claude/tender-darwin-5jshar` | #12 |
+
 Merge order (each rebased on the previous, all ultimately on current `main`):
 
 1. **CI-enable PR → `main`** (standalone, tiny; §2). Merge first so every CB branch inherits it.
-2. **PR1 — caches**: PR #16 `claude/sweet-shannon-144odn`.
-3. *(optional)* **PR12 — quantized cache**: `claude/tender-darwin-5jshar`, stacked on PR1,
-   rebased on `main` **after #17 lands** (§0.1). Keep as a follow-up unless the team wants
-   `kvBits` batching in the first merge.
-4. **PR2 — batch engine**: `claude/batched-2-engine`.
-5. **PR3 — prompt cache**: `claude/batched-3-promptcache`.
-6. **PR4 — scheduler + public API**: `claude/batched-4-scheduler`.
+2. **PR1 — caches** (`claude/cb-1-caches`).
+3. *(optional)* **PR12 — quantized cache** (`claude/cb-5-quantized`), stacked on PR1, rebased
+   on `main` **after #17 lands** (§0.1). Follow-up unless the team wants `kvBits` in the first merge.
+4. **PR2 — batch engine** (`claude/cb-2-engine`).
+5. **PR3 — prompt cache** (`claude/cb-3-promptcache`).
+6. **PR4 — scheduler + public API** (`claude/cb-4-scheduler`).
 
-Delete the frozen `claude/batched-stack-base` integration branch; PR4 rebases directly on the
+Drop the frozen `claude/batched-stack-base` integration branch; PR4 rebases directly on the
 live PR1/PR2/PR3 tips.
 
 ---
@@ -97,7 +111,11 @@ standalone CI-enable PR to `main` (item 1.1) so all CB branches inherit it on re
 
 ---
 
-## 3. Naming (confirm before the rename)
+## 3. Naming (DECIDED — confirmed by maintainer 2026-06-28)
+
+Apply the renames below in Phase 0. `InferenceScheduler` stays; `BatchInferenceEngine →
+BatchGenerationEngine` (in PR2's files); `EngineDriver → BatchEngineActor` (in PR4's files).
+
 
 Rationale ties directly to §4: the **scheduler/admission/memory layer is reusable across
 modalities, but the engine is autoregressive-LLM/VLM-specific.** Names should reflect that
@@ -161,6 +179,15 @@ Seams to preserve (verify during PR2/PR4 review; do not implement):
 
 These are review checks on PR2/PR4, not new code. The §8 assumption ("no outer coordinator in
 this stack") stands.
+
+**Follow-up project (not this stack): public executor seam for external packages.** Flux is an
+external package, not in this repo. The longer-term goal is interleaving flexible enough that
+*external* packages can plug in — i.e. make the per-modality executor seam (§4.2) a **public**
+protocol so a package can register its own batched executor under our shared
+`InferenceScheduler` (admission / FIFO / wired-memory / max-batch). That is a separate project
+**after** the current PRs are stabilized; here we only avoid decisions that would close the
+door on it (keep the scheduler modality-agnostic, don't hard-limit token fan-out, don't
+over-couple `GenerationRequest`).
 
 ---
 
