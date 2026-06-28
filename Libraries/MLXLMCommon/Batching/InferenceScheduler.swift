@@ -894,16 +894,16 @@ extension InferenceScheduler {
 
 extension InferenceScheduler {
 
-    /// Lazily create the ``EngineDriver`` (and its ``BatchInferenceEngine``)
+    /// Lazily create the ``EngineDriver`` (and its ``BatchGenerationEngine``)
     /// for the bound context. Reuses an existing driver. Returns `nil` if the
     /// model's cache topology cannot be batched (caller falls back to single).
     private func ensureDriver() async -> EngineDriver? {
         if let driver { return driver }
         guard let context else { return nil }
 
-        let engine: BatchInferenceEngine
+        let engine: BatchGenerationEngine
         do {
-            engine = try BatchInferenceEngine(
+            engine = try BatchGenerationEngine(
                 model: context.model,
                 eosTokens: Self.eosSequences(
                     configuration: context.configuration, tokenizer: context.tokenizer),
@@ -935,7 +935,7 @@ extension InferenceScheduler {
     }
 
     /// The default per-row stop matcher (model EOS), matching what
-    /// `BatchInferenceEngine.insert` installs for freshly-admitted rows. Used
+    /// `BatchGenerationEngine.insert` installs for freshly-admitted rows. Used
     /// for the adopted (upgraded) row so it keeps stopping on EOS instead of
     /// running to `maxTokens` (`DecodeBatch.init` does not fall back to the
     /// engine default the way `insert` does).

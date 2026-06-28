@@ -4,11 +4,11 @@ import Foundation
 import MLX
 
 /// The single serial executor that owns the non-thread-safe
-/// ``BatchInferenceEngine`` and (optionally) the cross-request prompt cache.
+/// ``BatchGenerationEngine`` and (optionally) the cross-request prompt cache.
 ///
 /// ## Why this exists
 ///
-/// ``BatchInferenceEngine``, ``DecodeBatch``, and the per-layer
+/// ``BatchGenerationEngine``, ``DecodeBatch``, and the per-layer
 /// ``BatchedCache`` instances are **not** `Sendable` and **not** thread-safe.
 /// They must be touched by exactly one executor. `EngineDriver` is an `actor`,
 /// so every method below runs with mutual exclusion: `submit`, `cancel`,
@@ -90,7 +90,7 @@ actor EngineDriver {
     }
 
     /// The sole owner of the engine. Never escapes the actor.
-    private let engine: BatchInferenceEngine
+    private let engine: BatchGenerationEngine
 
     /// Optional cross-request prompt cache. Owned here so `FinishedRowCache`
     /// write-back happens on this executor (the cache itself is `Sendable`).
@@ -131,7 +131,7 @@ actor EngineDriver {
         let stateMachine: StopSequenceMatcher?
     }
 
-    init(engine: BatchInferenceEngine, promptCache: (any PromptCaching)? = nil) {
+    init(engine: BatchGenerationEngine, promptCache: (any PromptCaching)? = nil) {
         self.engine = engine
         self.promptCache = promptCache
     }
