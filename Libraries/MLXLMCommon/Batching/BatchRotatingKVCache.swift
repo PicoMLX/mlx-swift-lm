@@ -773,10 +773,22 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                     extractedK = MLX.roll(extractedK, shift: -_idx, axis: 2)
                     extractedV = MLX.roll(extractedV, shift: -_idx, axis: 2)
                 }
-                // After unrolling, strip padding from the front
-                let seqEnd = maxCacheSize
-                extractedK = MLX.contiguous(extractedK[0..., 0..., padding ..< seqEnd, 0...])
-                extractedV = MLX.contiguous(extractedV[0..., 0..., padding ..< seqEnd, 0...])
+                // Strip front padding only while the window is not yet full. Once
+                // `seqOffset >= maxCacheSize` the row's window is logically full, so
+                // keep the full `maxCacheSize` buffer: a shorter buffer with an
+                // offset already at/over the window makes the extracted
+                // RotatingKVCache's next `updateInPlace` compute a non-positive
+                // growth (`maxSize - offset`) and write out of bounds. Residual left
+                // padding is ~0 by the time a row wraps (updateInPlace decrements it
+                // each step), so the kept front slots are the wrapped window, not pad.
+                if seqOffset < maxCacheSize {
+                    let seqEnd = maxCacheSize
+                    extractedK = MLX.contiguous(extractedK[0..., 0..., padding ..< seqEnd, 0...])
+                    extractedV = MLX.contiguous(extractedV[0..., 0..., padding ..< seqEnd, 0...])
+                } else {
+                    extractedK = MLX.contiguous(extractedK)
+                    extractedV = MLX.contiguous(extractedV)
+                }
             } else {
                 extractedK = MLX.contiguous(extractedK[0..., 0..., padding ..< _idx, 0...])
                 extractedV = MLX.contiguous(extractedV[0..., 0..., padding ..< _idx, 0...])
