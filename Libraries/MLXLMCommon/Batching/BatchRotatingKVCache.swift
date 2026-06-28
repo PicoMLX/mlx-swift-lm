@@ -805,17 +805,33 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
             cache.state = [extractedK, extractedV]
             cache.offset = seqOffset
-            // Restore `idx` as the row's logical cache write position, not the
-            // padded tensor length. In the rotated path the slice keeps trailing
-            // padded slots beyond this row's `seqOffset` (a shorter/left-padded
-            // row in a globally-rotated batch), so `extractedK.dim(2)` would push
-            // the next write past those pad slots while `offset == seqOffset`,
-            // landing the next token outside the returned `..<(offset+1)` slice and
-            // losing the first post-extraction token. Clamp to the logical length
-            // (`min(seqOffset, maxCacheSize)`) and the physical tensor length so a
-            // full row still restores `idx == maxCacheSize` (wraps to `keep`) while
-            // a shorter row writes at its true logical position.
-            let cacheIdx = min(min(seqOffset, maxCacheSize), extractedK.dim(2))
+            // Restore `idx` (the RotatingKVCache ring write position) consistently
+            // with the extracted state's layout. The two extraction branches above
+            // produce different layouts:
+            //
+            //  • ROTATED: the slice keeps trailing padded slots beyond this row's
+            //    `seqOffset` (a shorter/left-padded row in a globally-rotated
+            //    batch), so `extractedK.dim(2)` would push the next write past
+            //    those pad slots while `offset == seqOffset`, landing the next
+            //    token outside the returned `..<(offset+1)` slice and losing the
+            //    first post-extraction token. Clamp to the logical length
+            //    (`min(seqOffset, maxCacheSize)`) and the physical tensor length so
+            //    a full row restores `idx == maxCacheSize` (wraps to `keep`) while
+            //    a shorter row writes at its true logical position.
+            //
+            //  • UNROTATED: the slice is exactly the live LINEAR temporal sequence
+            //    (`padding ..< _idx`), with no trailing pad. For an oversized
+            //    prompt (wider than the window, not yet trimmed) this length
+            //    exceeds `maxCacheSize`. `RotatingKVCache.temporalOrder` only
+            //    leaves the buffer untouched when `idx == state.dim(2)`; any
+            //    smaller `idx` (e.g. a window-capped `maxCacheSize`) is treated as
+            //    a wrapped ring and circularly reordered, corrupting the linear
+            //    prompt on the next multi-token update. So serialize `idx` as the
+            //    full physical length to mark it linear.
+            let cacheIdx =
+                rotated
+                ? min(min(seqOffset, maxCacheSize), extractedK.dim(2))
+                : extractedK.dim(2)
             cache.metaState = [
                 String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
             ]
@@ -1012,22 +1028,29 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Window mask: restrict attention to the window
         mask = mask & (linds .< rindsRow + Int32(effectiveWindowSize))
 
-        // Adjust left_padding for trimming during multi-token concat.
+        // Adjust left_padding for the trim that `updateConcat` will apply. This
+        // must mirror that trim exactly, but `makeMask` runs BEFORE the update so
+        // the span we compute it from depends on the cache's rotation state. Two
+        // distinct over-window cases must be handled separately:
         //
-        // This must mirror the trim that `updateConcat` applies, which is computed
-        // from the LOGICAL window length: `updateConcat` calls `temporalOrder()`
-        // first, which resets `_idx` to the temporal length and clears `rotated`.
-        // Here, however, `makeMask` runs BEFORE the update, so once the cache has
-        // wrapped (`rotated == true`) `_idx` is the circular write pointer (reset
-        // to `keep` on wrap) and is much smaller than the logical span. Using the
-        // raw `_idx` then makes `trimSize` negative, skipping the pad adjustment,
-        // so a still-left-padded row hides one extra pad slot and can't attend to
-        // its first valid retained KV token. Use the logical window length —
-        // `min(_scalarOffset, maxCacheSize)`, which equals `maxCacheSize` once
-        // wrapped — when the buffer is rotated.
-        let logicalIdx =
-            (rotated || _idx >= maxCacheSize) ? min(_scalarOffset, maxCacheSize) : _idx
-        let trimSize = logicalIdx - maxCacheSize + (n > 1 ? 1 : 0)
+        //  1. RING-ROTATED (`rotated == true`): `_idx` is the circular write
+        //     pointer (reset to `keep` on wrap), much smaller than the logical
+        //     span. `updateConcat` calls `temporalOrder()` first, which restores
+        //     `_idx` to the temporal length (== maxCacheSize once wrapped) before
+        //     trimming. So mirror that with the LOGICAL window length
+        //     `min(_scalarOffset, maxCacheSize)` (== maxCacheSize when wrapped).
+        //     Capping here is correct: the ring already holds only one window.
+        //
+        //  2. UNROTATED OVERSIZED (`rotated == false`, `_idx >= maxCacheSize`): an
+        //     initial prompt WIDER than the window that has not been trimmed yet.
+        //     `temporalOrder()` is a no-op (it guards on `rotated`), so the trim
+        //     uses the full PHYSICAL `_idx`, dropping `_idx - maxCacheSize + 1`
+        //     old slots. The pad mask must be reduced by that full pending trim —
+        //     NOT capped to the window — or a heavily left-padded short row (e.g.
+        //     leftPadding 99 against a 16-col window) masks out every retained
+        //     valid key. Use the physical `_idx` uncapped here.
+        let spanForTrim = rotated ? min(_scalarOffset, maxCacheSize) : _idx
+        let trimSize = spanForTrim - maxCacheSize + (n > 1 ? 1 : 0)
         if trimSize > 0 {
             effectiveLeftPadding = effectiveLeftPadding - Int32(trimSize)
         }

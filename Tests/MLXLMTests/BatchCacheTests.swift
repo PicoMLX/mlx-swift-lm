@@ -208,6 +208,59 @@ struct BatchRotatingKVCacheCoverageTests {
         }
     }
 
+    @Test("Unrotated oversized prefill mask subtracts the full pending trim")
+    func unrotatedOversizedPrefillMaskSubtractsPendingTrim() {
+        // An UNROTATED prompt WIDER than the window (not yet trimmed) leaves
+        // `_idx` at the full physical width with `rotated == false`. The next
+        // multi-token prefill's mask must reduce effectiveLeftPadding by the FULL
+        // pending physical trim (`_idx - maxCacheSize + 1`), not a window-capped
+        // amount, or a heavily left-padded short row masks out every retained key.
+        //
+        // maxSize 4, leftPadding [10, 0], prefill width 12 → _idx 12,
+        // batchOffsets [2, 12], rotated false. makeMask(n: 2): trimSize =
+        // 12 - 4 + 1 = 9, so row 0's effective padding is 10 - 9 = 1 (only key
+        // column 0 masked). The buggy window-capped span gave trimSize 1 →
+        // effective padding 9, masking the whole short row.
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [10, 0], keep: 0)
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 12, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        #expect(cache.rotated == false)
+
+        let mode = cache.makeMask(n: 2, windowSize: nil, returnArray: false)
+        switch mode {
+        case .array(let mask):
+            // Padded row 0, first query: key column 0 stays masked (padding 1),
+            // but column 1 is a retained valid key and must be attendable. Under
+            // the window-capped bug the whole row was masked (column 1 false).
+            #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+            #expect(mask[0, 0, 0, 1].item(Bool.self) == true)
+        case .arrays, .causal, .none:
+            Issue.record("Unrotated oversized prefill should produce an array mask")
+        }
+    }
+
+    @Test("Oversized unrotated extract preserves linear state indices")
+    func oversizedUnrotatedExtractPreservesLinearState() {
+        // A single prompt wider than the window, never decoded (unrotated), keeps
+        // the full linear temporal state on extract. The serialized RotatingKVCache
+        // `idx` must equal the state width so `RotatingKVCache.temporalOrder` treats
+        // it as linear (idx == dim) instead of circularly rolling it on the next
+        // multi-token update, which would corrupt the prompt.
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0], keep: 0)
+        let (keys, values) = makeKV(batchSize: 1, heads: 2, seqLen: 6, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        #expect(cache.rotated == false)
+
+        let extracted = cache.extract(idx: 0)
+        #expect(extracted.offset == 6)
+        let stateWidth = extracted.state.first?.dim(2) ?? -1
+        #expect(stateWidth == 6)
+        // metaState layout is [keep, maxCacheSize, step, offset, idx]; idx must
+        // equal the linear state width so the state is not treated as a ring.
+        let idx = Int(extracted.metaState[4]) ?? -1
+        #expect(idx == stateWidth)
+    }
+
     @Test("prepare/finalize preserve extractable state")
     func prepareFinalizePreserveExtractableState() {
         let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)
