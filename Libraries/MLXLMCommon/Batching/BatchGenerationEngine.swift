@@ -3,10 +3,10 @@
 import Foundation
 import MLX
 
-/// Validation errors raised by ``BatchInferenceEngine`` for malformed
+/// Validation errors raised by ``BatchGenerationEngine`` for malformed
 /// configuration or requests. Unsupported cache topologies surface as
 /// ``BatchedCacheError`` from the PR1 cache factory.
-public enum BatchInferenceEngineError: Error, CustomStringConvertible, Equatable {
+public enum BatchGenerationEngineError: Error, CustomStringConvertible, Equatable {
     case invalidConfiguration(field: String, value: Int)
     case emptyPrompt(rowIndex: Int)
     case requestArrayLengthMismatch(field: String, expected: Int, got: Int)
@@ -35,12 +35,12 @@ public enum BatchInferenceEngineError: Error, CustomStringConvertible, Equatable
 ///      admissions on the next call.
 ///   3. `close()` releases resources.
 ///
-/// `BatchInferenceEngine` is stateful and intentionally **not** `Sendable`.
+/// `BatchGenerationEngine` is stateful and intentionally **not** `Sendable`.
 /// Drive each instance from one execution context at a time. For concurrent
 /// request admission, cancellation, or streaming, wrap the engine in an actor
 /// or scheduler that serializes access to `insert`, `cancel`, `next`,
 /// `adoptActiveBatch`, and `close` (this is what PR4's `EngineDriver` does).
-public final class BatchInferenceEngine {
+public final class BatchGenerationEngine {
 
     public let model: any LanguageModel
     public let prefillStepSize: Int
@@ -111,7 +111,7 @@ public final class BatchInferenceEngine {
 
     /// Append a batch of prompts. Returns the assigned UIDs in input order.
     ///
-    /// Throws ``BatchInferenceEngineError`` for empty prompt rows, mismatched
+    /// Throws ``BatchGenerationEngineError`` for empty prompt rows, mismatched
     /// per-row option counts, or nonpositive max-token limits.
     ///
     /// - Parameters:
@@ -172,7 +172,7 @@ public final class BatchInferenceEngine {
             ("prefillBatchSize", prefillBatchSize),
             ("completionBatchSize", completionBatchSize),
         ] where value <= 0 {
-            throw BatchInferenceEngineError.invalidConfiguration(field: field, value: value)
+            throw BatchGenerationEngineError.invalidConfiguration(field: field, value: value)
         }
     }
 
@@ -184,7 +184,7 @@ public final class BatchInferenceEngine {
         stateMachines: [StopSequenceMatcher]?
     ) throws {
         if let rowIndex = prompts.firstIndex(where: { $0.isEmpty }) {
-            throw BatchInferenceEngineError.emptyPrompt(rowIndex: rowIndex)
+            throw BatchGenerationEngineError.emptyPrompt(rowIndex: rowIndex)
         }
 
         try validateRequestArrayLength("maxTokens", maxTokens?.count, prompts.count)
@@ -195,7 +195,7 @@ public final class BatchInferenceEngine {
 
         if let maxTokens {
             for (rowIndex, value) in maxTokens.enumerated() where value <= 0 {
-                throw BatchInferenceEngineError.nonPositiveMaxTokens(
+                throw BatchGenerationEngineError.nonPositiveMaxTokens(
                     rowIndex: rowIndex,
                     value: value
                 )
@@ -209,7 +209,7 @@ public final class BatchInferenceEngine {
         _ expected: Int
     ) throws {
         if let count, count != expected {
-            throw BatchInferenceEngineError.requestArrayLengthMismatch(
+            throw BatchGenerationEngineError.requestArrayLengthMismatch(
                 field: field,
                 expected: expected,
                 got: count

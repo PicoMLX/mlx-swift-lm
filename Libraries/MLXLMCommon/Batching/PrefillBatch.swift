@@ -10,7 +10,7 @@ import MLX
 /// position via per-cache finalization. Transition into a ``DecodeBatch``
 /// via `generate(lastTokensOf:)`.
 ///
-/// This is mutable engine state owned by ``BatchInferenceEngine`` and is
+/// This is mutable engine state owned by ``BatchGenerationEngine`` and is
 /// intentionally **not** `Sendable`. Do not share a prefill batch across
 /// concurrent tasks.
 public final class PrefillBatch {
@@ -185,7 +185,7 @@ public final class PrefillBatch {
         precondition(
             !inputTokens.contains(where: { $0.isEmpty }),
             "PrefillBatch.generate requires non-empty token rows; "
-                + "BatchInferenceEngine.insert validates this public invariant"
+                + "BatchGenerationEngine.insert validates this public invariant"
         )
         if inputTokens.contains(where: { $0.count > 1 }) {
             let prefixes = inputTokens.map { Array($0.dropLast()) }

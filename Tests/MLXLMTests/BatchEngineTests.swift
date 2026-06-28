@@ -86,27 +86,27 @@ struct RowSamplerTests {
 // MARK: - Engine: cache topology validation
 
 @Suite(.serialized)
-struct BatchInferenceEngineTopologyTests {
+struct BatchGenerationEngineTopologyTests {
 
     @Test("Accepts supported cache topologies")
     func acceptsSupportedCacheTopologies() throws {
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [KVCacheSimple()] }
         )
 
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [ArraysCache(size: 3)] }
         )
 
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [MambaCache()] }
         )
 
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [RotatingKVCache(maxSize: 8, keep: 0)] }
         )
 
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [CacheList(MambaCache(), KVCacheSimple())] }
         )
     }
@@ -141,7 +141,7 @@ struct BatchInferenceEngineTopologyTests {
     func passesCacheParametersToModel() throws {
         let model = CacheTopologyLanguageModel { _ in [KVCacheSimple()] }
 
-        _ = try BatchInferenceEngine(
+        _ = try BatchGenerationEngine(
             model: model,
             cacheParameters: GenerateParameters(maxKVSize: 17)
         )
@@ -153,12 +153,12 @@ struct BatchInferenceEngineTopologyTests {
 // MARK: - Engine: input validation
 
 @Suite(.serialized)
-struct BatchInferenceEngineValidationTests {
+struct BatchGenerationEngineValidationTests {
 
     @Test("Rejects nonpositive configuration values")
     func rejectsInvalidConfiguration() {
-        #expect(throws: BatchInferenceEngineError.self) {
-            _ = try BatchInferenceEngine(
+        #expect(throws: BatchGenerationEngineError.self) {
+            _ = try BatchGenerationEngine(
                 model: IncrementingLanguageModel(),
                 defaultMaxTokens: 0
             )
@@ -167,24 +167,24 @@ struct BatchInferenceEngineValidationTests {
 
     @Test("Rejects empty prompt rows")
     func rejectsEmptyPromptRows() throws {
-        let engine = try BatchInferenceEngine(model: IncrementingLanguageModel())
-        #expect(throws: BatchInferenceEngineError.self) {
+        let engine = try BatchGenerationEngine(model: IncrementingLanguageModel())
+        #expect(throws: BatchGenerationEngineError.self) {
             _ = try engine.insert(prompts: [[1, 2], []])
         }
     }
 
     @Test("Rejects mismatched per-row option counts")
     func rejectsMismatchedOptionCounts() throws {
-        let engine = try BatchInferenceEngine(model: IncrementingLanguageModel())
-        #expect(throws: BatchInferenceEngineError.self) {
+        let engine = try BatchGenerationEngine(model: IncrementingLanguageModel())
+        #expect(throws: BatchGenerationEngineError.self) {
             _ = try engine.insert(prompts: [[1], [2]], maxTokens: [4])
         }
     }
 
     @Test("Rejects nonpositive max tokens")
     func rejectsNonPositiveMaxTokens() throws {
-        let engine = try BatchInferenceEngine(model: IncrementingLanguageModel())
-        #expect(throws: BatchInferenceEngineError.self) {
+        let engine = try BatchGenerationEngine(model: IncrementingLanguageModel())
+        #expect(throws: BatchGenerationEngineError.self) {
             _ = try engine.insert(prompts: [[1]], maxTokens: [0])
         }
     }
@@ -193,11 +193,11 @@ struct BatchInferenceEngineValidationTests {
 // MARK: - Engine: pull loop
 
 @Suite(.serialized)
-struct BatchInferenceEnginePullLoopTests {
+struct BatchGenerationEnginePullLoopTests {
 
     @Test("Admits queued rows and reports finish reasons")
     func admitsQueuedRowsAndReportsFinishReasons() throws {
-        let engine = try BatchInferenceEngine(
+        let engine = try BatchGenerationEngine(
             model: IncrementingLanguageModel(),
             eosTokens: [[5]],
             defaultMaxTokens: 4,
@@ -234,7 +234,7 @@ struct BatchInferenceEnginePullLoopTests {
 
     @Test("Cancel removes a queued request")
     func cancelRemovesQueuedRequest() throws {
-        let engine = try BatchInferenceEngine(
+        let engine = try BatchGenerationEngine(
             model: IncrementingLanguageModel(),
             defaultMaxTokens: 3,
             prefillBatchSize: 1,
@@ -260,7 +260,7 @@ struct BatchInferenceEnginePullLoopTests {
 
     @Test("Cancel removes an active request mid-decode")
     func cancelRemovesActiveRequest() throws {
-        let engine = try BatchInferenceEngine(
+        let engine = try BatchGenerationEngine(
             model: IncrementingLanguageModel(),
             defaultMaxTokens: 4,
             prefillBatchSize: 2,
@@ -291,7 +291,7 @@ struct BatchInferenceEnginePullLoopTests {
 
     @Test("Capturing final caches yields one cache per finished row")
     func capturingFinalCachesYieldsCachePerFinishedRow() throws {
-        let engine = try BatchInferenceEngine(
+        let engine = try BatchGenerationEngine(
             model: IncrementingLanguageModel(),
             eosTokens: [[5]],
             defaultMaxTokens: 4,
@@ -332,7 +332,7 @@ private func assertEngineRejectsCache(
     let model = CacheTopologyLanguageModel { _ in [cache] }
 
     do {
-        _ = try BatchInferenceEngine(model: model)
+        _ = try BatchGenerationEngine(model: model)
         Issue.record("Expected BatchedCacheError.unsupportedCacheTopology, but no error was thrown")
     } catch let BatchedCacheError.unsupportedCacheTopology(_, path, cacheType, reason) {
         if let expectedPath {

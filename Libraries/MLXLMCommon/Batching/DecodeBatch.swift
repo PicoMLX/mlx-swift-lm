@@ -60,7 +60,7 @@ public struct FinishedRowCache {
 /// Construct after prefill has populated the caches; call `next()` to
 /// drive generation one step at a time.
 ///
-/// This is mutable decode engine state owned by ``BatchInferenceEngine`` and
+/// This is mutable decode engine state owned by ``BatchGenerationEngine`` and
 /// is intentionally **not** `Sendable`. Drive it from a single executor.
 /// ``BatchStepResult`` is the `Sendable` value type for crossing concurrency
 /// domains.
