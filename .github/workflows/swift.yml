@@ -61,9 +61,17 @@ jobs:
       # the numerical paths that can't be verified in the Linux authoring env.
       # Broader model-parity tests (PR2+) need the hosted-runner model-cache setup
       # and are added with those PRs.
+      # Select the actual @Suite identifiers (the struct names), not the source
+      # file name — `-only-testing:MLXLMTests/BatchCacheTests` matched nothing and
+      # ran zero tests (a false green). These five are the batched-cache suites in
+      # Tests/MLXLMTests/BatchCacheTests.swift; none download models.
       - name: Run batched-cache tests (Xcode, macOS)
         run: |
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
-            -only-testing:MLXLMTests/BatchCacheTests
+            -only-testing:MLXLMTests/BatchKVCacheCoverageTests \
+            -only-testing:MLXLMTests/BatchRotatingKVCacheCoverageTests \
+            -only-testing:MLXLMTests/BatchedCacheFactoryTests \
+            -only-testing:MLXLMTests/BatchedSSMCacheTests \
+            -only-testing:MLXLMTests/BatchMaskingTests
