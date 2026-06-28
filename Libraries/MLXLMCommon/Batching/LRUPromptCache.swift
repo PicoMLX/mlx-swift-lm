@@ -831,7 +831,7 @@ public final class LRUPromptCache: PersistablePromptCache {
 extension LRUPromptCache.State {
 
     /// Search the trie for the best match.
-    private func search(key: RootKey, tokens: [Int]) -> LRUPromptCache.SearchResult {
+    private func search(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.SearchResult {
         guard let root = cache[key] else {
             return LRUPromptCache.SearchResult(
                 key: key, exact: nil, shorter: nil, longer: nil, commonPrefix: 0)
@@ -890,7 +890,7 @@ extension LRUPromptCache.State {
     }
 
     /// Get the cache entry at the given path.
-    private func get(key: RootKey, tokens: [Int]) -> LRUPromptCache.CacheEntry {
+    private func get(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.CacheEntry {
         var current = cache[key]!
         for tok in tokens {
             current = current.children[Int32(tok)]!
@@ -899,7 +899,7 @@ extension LRUPromptCache.State {
     }
 
     /// Delete a cache entry from the trie.
-    mutating func delete(key: RootKey, tokens: [Int]) {
+    mutating func delete(key: LRUPromptCache.RootKey, tokens: [Int]) {
         guard let root = cache[key] else { return }
 
         var path = [root]
@@ -924,7 +924,7 @@ extension LRUPromptCache.State {
     }
 
     /// Refresh LRU recency for the given entry (move to most-recently-used).
-    private func touch(key: RootKey, tokens: [Int]) {
+    private func touch(key: LRUPromptCache.RootKey, tokens: [Int]) {
         let entry = get(key: key, tokens: tokens)
         entry.lastUsed = Date().timeIntervalSince1970
         // Preserve the entry's eviction class: re-push as a checkpoint if it was
@@ -935,7 +935,7 @@ extension LRUPromptCache.State {
     }
 
     /// Internal fetch (must be called while holding the lock).
-    func fetchNearestCache(key: RootKey, tokens: [Int]) -> LRUPromptCache.FetchResult {
+    func fetchNearestCache(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.FetchResult {
         let result = search(key: key, tokens: tokens)
 
         // Exact match
@@ -992,7 +992,7 @@ extension LRUPromptCache.State {
 
     /// Internal insert (must be called while holding the lock).
     mutating func insertCache(
-        key: RootKey,
+        key: LRUPromptCache.RootKey,
         tokens: [Int],
         promptCache: [KVCache],
         checkpoint: Bool,
