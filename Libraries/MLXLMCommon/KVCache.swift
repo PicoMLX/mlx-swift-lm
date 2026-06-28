@@ -1308,13 +1308,22 @@ public class ArraysCache: BaseKVCache {
         leftPadding = nil
     }
 
+    /// Allocate an empty single-row cache of this concrete type for ``extract(_:)``.
+    ///
+    /// Subclasses (e.g. ``MambaCache``) override this so an extracted row keeps its
+    /// concrete type and `cache as? MambaCache` downcasts in hybrid/SSM model blocks
+    /// still succeed.
+    func makeEmptyExtractedRow() -> ArraysCache {
+        ArraysCache(size: cache.count)
+    }
+
     /// Extract one row as its own single-row cache.
     ///
-    /// Note: a ``MambaCache`` row is returned as a base ``ArraysCache`` (the
-    /// stored slots are identical); the Mamba auto-upgrade path can refine this
-    /// to preserve the concrete subtype if needed.
+    /// The concrete subtype is preserved via ``makeEmptyExtractedRow()`` so a
+    /// ``MambaCache`` row stays a ``MambaCache`` — otherwise its recurrent/conv
+    /// state would be silently ignored once the row leaves the batch.
     public func extract(_ idx: Int) -> ArraysCache {
-        let extracted = ArraysCache(size: cache.count)
+        let extracted = makeEmptyExtractedRow()
         extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
         extracted.offset = offset
         extracted.leftPadding = leftPadding?[idx ..< (idx + 1)]
@@ -1351,16 +1360,25 @@ public class ArraysCache: BaseKVCache {
 
     internal var slotCount: Int { cache.count }
 
-    /// Create attention mask based on left padding or prepared sequence lengths
+    /// Create attention mask from left padding and/or prepared sequence lengths.
+    ///
+    /// Both are independent constraints: `leftPadding` hides leading pad
+    /// (`position >= leftPadding`) and a prepared `lengths` hides trailing
+    /// right-pad during ragged cached-prompt prefill (`position < lengths`). When
+    /// both are set they are AND-ed. Previously `leftPadding` short-circuited and a
+    /// prepared `lengths` was ignored, leaving right-padded suffix tokens visible
+    /// (with `[0, 0]` left padding the mask admitted every position).
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
+        var mask: MLXArray? = nil
         if let leftPadding {
-            return positions .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
-            return positions .< lengths[0..., .newAxis]
-        } else {
-            return nil
+            mask = positions .>= leftPadding[0..., .newAxis]
         }
+        if let lengths {
+            let rightMask = positions .< lengths[0..., .newAxis]
+            mask = mask.map { $0 & rightMask } ?? rightMask
+        }
+        return mask
     }
 
     // MARK: - Serialization
@@ -1427,6 +1445,10 @@ public class ArraysCache: BaseKVCache {
 public class MambaCache: ArraysCache {
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    override func makeEmptyExtractedRow() -> ArraysCache {
+        MambaCache()
     }
 
     public override func copy() -> any KVCache {
