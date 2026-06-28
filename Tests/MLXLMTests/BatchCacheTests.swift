@@ -178,6 +178,36 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.batchOffsets[1].item(Int32.self) == 4)
     }
 
+    @Test("Rotated multi-token prefill mask uses the logical window span")
+    func rotatedPrefillMaskUsesLogicalSpan() {
+        // Drive the cache past its window so it wraps (rotated == true), which
+        // resets the circular `_idx` to a small value (here `keep == 0`). A later
+        // multi-token (prefill) mask must derive its trim from the LOGICAL window
+        // length, not the ring index. With maxSize 4 and leftPadding [2]:
+        //   prefill 4 → _idx 4, _scalarOffset 4
+        //   decode 1 → wrap: rotated, _idx 1, _scalarOffset 5, leftPadding 1
+        // makeMask(n: 2) then computes trimSize from the logical span (min(5,4)=4
+        // → trimSize 1), reducing effectiveLeftPadding from 1 to 0 so the first
+        // retained key column (col 0) stays attendable for the first query row.
+        // The buggy ring-index path computed trimSize = _idx(1) - 4 + 1 = -2,
+        // skipped the reduction, and masked column 0 out.
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [2], keep: 0)
+        let prefill = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
+        _ = cache.update(keys: prefill.0, values: prefill.1)
+        let decode = makeKV(batchSize: 1, heads: 2, seqLen: 1, headDim: 4, value: 2)
+        _ = cache.update(keys: decode.0, values: decode.1)
+
+        let mode = cache.makeMask(n: 2, windowSize: nil, returnArray: false)
+        switch mode {
+        case .array(let mask):
+            // First query row attends to retained key column 0 (true). Under the
+            // ring-index bug this would have been masked out (false).
+            #expect(mask[0, 0, 0, 0].item(Bool.self) == true)
+        case .arrays, .causal, .none:
+            Issue.record("Rotated multi-token prefill should produce an array mask")
+        }
+    }
+
     @Test("prepare/finalize preserve extractable state")
     func prepareFinalizePreserveExtractableState() {
         let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)

@@ -1012,8 +1012,22 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Window mask: restrict attention to the window
         mask = mask & (linds .< rindsRow + Int32(effectiveWindowSize))
 
-        // Adjust left_padding for trimming during multi-token concat
-        let trimSize = _idx - maxCacheSize + (n > 1 ? 1 : 0)
+        // Adjust left_padding for trimming during multi-token concat.
+        //
+        // This must mirror the trim that `updateConcat` applies, which is computed
+        // from the LOGICAL window length: `updateConcat` calls `temporalOrder()`
+        // first, which resets `_idx` to the temporal length and clears `rotated`.
+        // Here, however, `makeMask` runs BEFORE the update, so once the cache has
+        // wrapped (`rotated == true`) `_idx` is the circular write pointer (reset
+        // to `keep` on wrap) and is much smaller than the logical span. Using the
+        // raw `_idx` then makes `trimSize` negative, skipping the pad adjustment,
+        // so a still-left-padded row hides one extra pad slot and can't attend to
+        // its first valid retained KV token. Use the logical window length —
+        // `min(_scalarOffset, maxCacheSize)`, which equals `maxCacheSize` once
+        // wrapped — when the buffer is rotated.
+        let logicalIdx =
+            (rotated || _idx >= maxCacheSize) ? min(_scalarOffset, maxCacheSize) : _idx
+        let trimSize = logicalIdx - maxCacheSize + (n > 1 ? 1 : 0)
         if trimSize > 0 {
             effectiveLeftPadding = effectiveLeftPadding - Int32(trimSize)
         }
