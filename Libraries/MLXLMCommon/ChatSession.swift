@@ -578,11 +578,11 @@ public final class ChatSession {
         additionalContext: [String: any Sendable]?,
         generateParameters: GenerateParameters,
         priorMessages: [Chat.Message],
-        cache: inout Cache,
+        cache: Cache,
         newMessages: consuming [Chat.Message],
         continuation: AsyncThrowingStream<R, Error>.Continuation,
         transform: @Sendable @escaping (Generation) -> R?
-    ) async throws {
+    ) async throws -> Cache {
         // Reconstruct the persisted history (prior turns minus the system
         // prompt, which `priorMessages` already carries) from the cache.
         var history: [Chat.Message] = []
@@ -641,7 +641,7 @@ public final class ChatSession {
         if !assistantText.isEmpty {
             history.append(.assistant(assistantText))
         }
-        cache = .history(history)
+        return .history(history)
     }
 
     private func streamMap<R: Sendable>(
@@ -682,7 +682,7 @@ public final class ChatSession {
                     // session-held KV cache cannot be shared with the batched
                     // engine, which manages its own per-request caches.)
                     if model.usesScheduler {
-                        try await Self.streamThroughScheduler(
+                        cache = try await Self.streamThroughScheduler(
                             model: model,
                             processor: processor,
                             processing: processing,
@@ -691,7 +691,7 @@ public final class ChatSession {
                             additionalContext: additionalContext,
                             generateParameters: generateParameters,
                             priorMessages: messages,
-                            cache: &cache,
+                            cache: cache,
                             newMessages: inputMessages.consume(),
                             continuation: continuation,
                             transform: transform
