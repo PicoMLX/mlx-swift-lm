@@ -1,7 +1,9 @@
 name: Swift Build (fork)
 
-# Fork-only CI: builds the package (and compiles the tests, without running them)
-# on every pushed commit.
+# Fork-only CI: builds the package, compiles the tests, and runs the batched-cache
+# unit tests (which need no model downloads) on every pushed commit. The macos-15
+# hosted runner has a Metal GPU, so these exercise real MLX kernels — the parity
+# gate the Linux authoring environment can't provide.
 #
 # This is intentionally a SEPARATE file from pull_request.yml (the workflow shared
 # with upstream ml-explore) for two reasons:
@@ -53,3 +55,15 @@ jobs:
       - name: Build for testing (Xcode, macOS)
         run: |
           xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+
+      # Run only the batched-cache suite: it is self-contained (no model downloads)
+      # and exercises the Metal kernels that back rotation/extract/merge/finalize —
+      # the numerical paths that can't be verified in the Linux authoring env.
+      # Broader model-parity tests (PR2+) need the hosted-runner model-cache setup
+      # and are added with those PRs.
+      - name: Run batched-cache tests (Xcode, macOS)
+        run: |
+          xcodebuild test-without-building \
+            -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -only-testing:MLXLMTests/BatchCacheTests
