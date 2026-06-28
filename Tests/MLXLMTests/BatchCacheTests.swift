@@ -206,17 +206,31 @@ struct BatchedCacheFactoryTests {
         let rotating = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16)])
         #expect(rotating[0]([0]) is BatchRotatingKVCache)
 
-        let arrays = try makeBatchedCacheFactories(for: [ArraysCache(size: 2)])
-        let arraysCache = arrays[0]([0])
-        #expect(arraysCache is ArraysCache)
-        #expect((arraysCache as? ArraysCache)?.slotCount == 2)
-
-        let mamba = try makeBatchedCacheFactories(for: [MambaCache()])
-        #expect(mamba[0]([0]) is MambaCache)
-
         let composite = try makeBatchedCacheFactories(
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
         #expect(composite[0]([0, 0]) is BatchedCacheList)
+    }
+
+    @Test("Factory rejects SSM (Mamba/ArraysCache) caches")
+    func factoryRejectsSSMCaches() {
+        // SSM caches are only safe under continuous batching when the model
+        // threads createSSMMask into its conv/SSM mixers; several in-repo Mamba
+        // users do not (their SSM mask is hard-coded nil), so ragged batches would
+        // corrupt recurrent state. The factory cannot see the model from the cache
+        // probe, so it conservatively rejects all SSM topologies.
+        #expect(throws: BatchedCacheError.self) {
+            _ = try makeBatchedCacheFactories(for: [ArraysCache(size: 2)])
+        }
+        #expect(throws: BatchedCacheError.self) {
+            _ = try makeBatchedCacheFactories(for: [MambaCache()])
+        }
+        // A composite layer cache containing an SSM child (e.g. BaichuanM1's
+        // CacheList(MambaCache, KVCacheSimple)) is rejected too, since the child
+        // factory throws.
+        #expect(throws: BatchedCacheError.self) {
+            _ = try makeBatchedCacheFactories(
+                for: [CacheList(MambaCache(), KVCacheSimple())])
+        }
     }
 
     @Test("Rotating caches with keep > 0 are rejected (single-stream fallback)")

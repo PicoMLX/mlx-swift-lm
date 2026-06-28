@@ -275,13 +275,37 @@ private func makeBatchedCacheFactory(
 
     // Exact-type matches avoid misclassifying subclasses such as
     // MambaCache : ArraysCache and ChunkedKVCache : KVCacheSimple.
+    //
+    // SSM caches (MambaCache / ArraysCache) only mask left-padded / right-padded
+    // positions when the *model* threads `createSSMMask(...)` into its conv/SSM
+    // mixers. Several in-repo Mamba users never do this — their SSM mask is
+    // hard-coded `nil` (e.g. `GraniteMoeHybrid`'s `createSSMMask` returns `nil`
+    // and is passed at its mixer call sites; `Jamba`, `LFM2`, and `BaichuanM1`
+    // call their conv/SSM mixers without any mask argument). For those models a
+    // ragged or right-padded continuous batch would feed pad-token embeddings
+    // through the recurrent state instead of zeroing them, silently corrupting
+    // every later token in the row.
+    //
+    // The factory only sees the cache *instance*, not the model, so it cannot
+    // distinguish the safe SSM users (NemotronH, Qwen3Next, Qwen35, LFM2MoE,
+    // FalconH1 — all route a real `createSSMMask`) from the unsafe ones. Per the
+    // conservative policy, keep SSM topologies OUT of continuous batching until a
+    // model-level guarantee that the SSM mask is honoured exists; reject them
+    // here rather than risk corrupting recurrent state. The batched `MambaCache`
+    // / `ArraysCache` machinery still exists and is exercised directly by the
+    // SSM lifecycle tests; only the topology-probing factory rejects it.
     if Swift.type(of: cache) == MambaCache.self {
-        return { leftPadding in MambaCache(leftPadding: leftPadding) }
+        throw unsupported(
+            "SSM (Mamba) caches are not supported by continuous batching: some "
+                + "in-repo models do not thread createSSMMask into their conv/SSM "
+                + "mixers, so ragged batches would corrupt recurrent state.")
     }
 
-    if Swift.type(of: cache) == ArraysCache.self, let arrays = cache as? ArraysCache {
-        let slotCount = arrays.slotCount
-        return { leftPadding in ArraysCache(size: slotCount, leftPadding: leftPadding) }
+    if Swift.type(of: cache) == ArraysCache.self {
+        throw unsupported(
+            "SSM (ArraysCache) caches are not supported by continuous batching: "
+                + "some in-repo models do not thread createSSMMask into their "
+                + "conv/SSM mixers, so ragged batches would corrupt recurrent state.")
     }
 
     if let rotating = cache as? RotatingKVCache {
