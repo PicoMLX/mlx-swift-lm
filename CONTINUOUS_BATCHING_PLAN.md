@@ -80,31 +80,27 @@ PR1 (and `main`, post-#17). Resolve conflicts in favor of `main`'s upstream-alig
 surface the `Batching/` files require. Do the rebase **before** applying review fixes so fixes
 are not re-overwritten by stale copies in PR4.
 
-**2.2 Enable CI on the fork — upstream-safe.**
-`/.github/workflows/pull_request.yml` gates both jobs (`lint`, `mac_build_and_test`) on:
+**2.2 Enable CI on the fork — upstream-safe (DECIDED: separate `swift.yml`).**
 
-```yaml
-if: github.repository == 'ml-explore/mlx-swift-lm'
-```
+PR #16 already ships the chosen pattern: a **separate** `.github/workflows/swift.yml` that
+(a) triggers on `push`, (b) is gated `if: github.repository == 'PicoMLX/mlx-swift-lm'`, (c)
+builds on a hosted `macos-15` runner via `xcodebuild build-for-testing`, and (d) **never
+touches the shared upstream `pull_request.yml`** — so syncing from upstream can't conflict and
+the job is simply skipped if the file ever reaches ml-explore. This matches the "don't touch
+upstream CI" requirement directly. **Propagate `swift.yml` to every CB branch** (only PR1 has
+it today; PR2/PR3/PR4/PR12 do not).
 
-Change each to an OR clause that adds the fork **without** altering upstream behavior:
+Default coverage is **build-only** (compile + `build-for-testing`) on hosted `macos-15`, which
+needs no infra we can't confirm. Two optional upgrades, gated on team input:
+- If a **self-hosted macOS+Metal runner** is registered to the fork, extend `swift.yml` (or add
+  a sibling job) to actually **run** the parity tests — the real numerical gate.
+- A Linux **lint** job (swift-format + pre-commit) can be added to `swift.yml` to fix the
+  recurring "authored on Linux, couldn't run swift-format" gap, independent of any Metal runner.
 
-```yaml
-if: github.repository == 'ml-explore/mlx-swift-lm' || github.repository == 'PicoMLX/mlx-swift-lm'
-```
-
-This is inert upstream (the first clause still matches in ml-explore), so it cannot
-"accidentally change" upstream CI even if the file is ever PR'd there. Do this as the
-standalone CI-enable PR to `main` (item 1.1) so all CB branches inherit it on rebase.
-
-- The **`lint` job** runs on `ubuntu-22.04` (swift-format + pre-commit) — fork-safe and
-  directly fixes the recurring "authored on Linux, couldn't run swift-format" gap. Enable it
-  even if the Metal lane isn't ready.
-- The **`mac_build_and_test` job** needs `runs-on: [self-hosted, macos]` with the Metal
-  toolchain. **Prerequisite:** a self-hosted macOS+Metal runner registered to the PicoMLX
-  fork. If none exists, that runner is a hard dependency for the build/numerics gate — flag
-  to the team. (GitHub-hosted `macos-15` is a weak fallback: it builds, but heavier
-  model-download/Metal parity tests are slow/unreliable there.)
+*Alternative (parked, not used):* the `claude/cb-ci-enable` branch edits the shared
+`pull_request.yml` with an upstream-safe OR clause to run its existing lint + build-and-test
+jobs on the fork. Kept as a fallback if the team later prefers reusing upstream's full
+lint+test infra over the separate file; no PR opened.
 
 > Note: CI ≠ the Codex/Gemini review bots. CI gives build+test+lint; the bots review every
 > push (§7). Both are wanted on every CB PR.
