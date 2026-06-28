@@ -352,10 +352,13 @@ struct BatchModelRegressionTests {
         let input = MLXArray(flat, [prompts.count, maxLength])
         let cache: [KVCache] = model.newCache(parameters: nil).map { layerCache in
             if let rotatingCache = layerCache as? RotatingKVCache {
+                // RotatingKVCache.keep is private; read it via metaState[0] (= keep),
+                // matching the pattern used in the batched cache factories.
+                let keep = Int(rotatingCache.metaState.first ?? "0") ?? 0
                 return BatchRotatingKVCache(
                     maxSize: rotatingCache.maxSize ?? 0,
                     leftPadding: leftPadding,
-                    keep: rotatingCache.keep
+                    keep: keep
                 )
             } else {
                 return BatchKVCache(leftPadding: leftPadding)
