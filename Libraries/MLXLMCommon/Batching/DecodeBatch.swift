@@ -390,7 +390,10 @@ public final class DecodeBatch {
         asyncEval(sampledTokens)
 
         eval(currentTokens)
-        let stepTokens = currentTokens.asArray(UInt32.self).map { Int($0) }
+        // `currentTokens` may be `uint32` (greedy `argMax`) or `int32`
+        // (`MLXRandom.categorical` on the sampler path), so normalize to
+        // `int32` before extracting to avoid a dtype-mismatch crash.
+        let stepTokens = currentTokens.asType(.int32).asArray(Int32.self).map { Int($0) }
 
         for (i, t) in stepTokens.enumerated() {
             tokens[i].append(t)
