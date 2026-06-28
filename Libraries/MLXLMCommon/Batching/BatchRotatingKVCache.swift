@@ -926,7 +926,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             batchCache.values = temporalData[1]
             let seqLen = min(cache.offset, ms)
             batchCache._idx = seqLen
-            batchCache._scalarOffset = seqLen
+            // `_scalarOffset` holds the *absolute* offset (the `offset` getter caps
+            // it at `maxCacheSize`); capping it here would desync from `batchOffsets`
+            // after `trim()` when the source cache has wrapped (offset > maxSize).
+            batchCache._scalarOffset = cache.offset
             batchCache.batchOffsets = MLXArray([Int32(cache.offset)])
         }
 
@@ -983,7 +986,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Check if rotated during single-token decode
         let isRotated = n == 1 && (rotated || _idx >= maxCacheSize)
         if isRotated {
-            effectiveLeftPadding = effectiveLeftPadding - 1
+            effectiveLeftPadding = effectiveLeftPadding - Int32(1)
         }
 
         // Apply left-padding mask
