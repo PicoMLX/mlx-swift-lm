@@ -337,6 +337,27 @@ private func makeBatchedCacheFactory(
     }
 
     if Swift.type(of: cache) == KVCacheSimple.self {
+        // KNOWN LIMITATION (not gateable here): a few models read `cache[0].offset`
+        // as a SCALAR sequence position *outside* the RoPE helper and feed it into
+        // Llama-4-style attention scaling — `Mistral3TextModelInner`,
+        // `Mistral3` (VLM), and `NemotronLabsDiffusionEncoder`, each gated by a
+        // `rope_parameters.llama_4_scaling_beta` config entry. `BatchKVCache.offset`
+        // returns the padded MAX width (`_idx`) shared by all rows, so on a ragged
+        // batch the shorter rows receive the longest row's scaling factor.
+        //
+        // This is NOT cleanly gateable in the factory: the probe is an ordinary
+        // `KVCacheSimple` (the core full-attention cache type used by nearly every
+        // model), with no cache-instance signal that distinguishes these models
+        // from the safe majority. Rejecting `KVCacheSimple` would disable batching
+        // for essentially all full-attention models, so that is the wrong trade.
+        //
+        // Accepted as a documented limitation: those specific models combined with
+        // `rope_parameters` Llama-4 attention scaling are not batch-safe for ragged
+        // batches until that scaling path consumes per-row offsets (e.g. via the
+        // `BatchPositionedKVCache.batchOffset` per-row positions, mirroring how RoPE
+        // already does). The batched-engine wiring should refuse to admit ragged
+        // batches for models advertising that scaling; the cache-type factory
+        // cannot and should not try to encode that model-level constraint.
         return { leftPadding in BatchKVCache(leftPadding: leftPadding) }
     }
 
