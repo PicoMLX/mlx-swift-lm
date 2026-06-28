@@ -525,8 +525,16 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         guard let padding = _rightPadding else { return }
 
         if let k = keys, let v = values {
-            self.keys = dynamicRoll(k, shifts: padding[0..., .newAxis], axis: 2)
-            self.values = dynamicRoll(v, shifts: padding[0..., .newAxis], axis: 2)
+            // Roll only the populated `[0, _idx)` span. The buffer is allocated in
+            // `step`-sized blocks, so `keys.dim(2)` is usually larger than `_idx`
+            // with a zero-filled spare tail; rolling the whole buffer would wrap
+            // that tail into the valid prefix and corrupt the next attention step.
+            // Operating on the head slice also shrinks the buffer to `_idx`, which
+            // the next `update` re-grows as needed.
+            let kHead = k[.ellipsis, ..<_idx, 0...]
+            let vHead = v[.ellipsis, ..<_idx, 0...]
+            self.keys = dynamicRoll(kHead, shifts: padding[0..., .newAxis], axis: 2)
+            self.values = dynamicRoll(vHead, shifts: padding[0..., .newAxis], axis: 2)
         }
         batchOffsets = batchOffsets - padding
         leftPadding = leftPadding + padding
