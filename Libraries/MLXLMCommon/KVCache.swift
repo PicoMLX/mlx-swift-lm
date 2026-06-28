@@ -302,11 +302,20 @@ public func makeAttentionMask(
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let t = h.dim(1)
     if t > 1 {
-        var offset = 0
         if let c = cache?.first {
-            offset = c.offset
+            // Batched caches carry per-row left padding (and prepared lengths) that
+            // a plain causal mask ignores; route through the cache's own mask so
+            // models using this legacy array overload (e.g. Gemma2) don't attend to
+            // padded KV slots under continuous batching. Single (non-batched) caches
+            // keep the original causal-mask path unchanged.
+            if c is BatchPositionedKVCache,
+                case .array(let m) = c.makeMask(n: t, windowSize: c.maxSize, returnArray: true)
+            {
+                return m
+            }
+            return createCausalMask(n: t, offset: c.offset)
         }
-        return createCausalMask(n: t, offset: offset)
+        return createCausalMask(n: t, offset: 0)
     }
     return nil
 }
