@@ -233,7 +233,11 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Dispatches to the concat path for multi-token updates (prefill) or
     /// the in-place rotation path for single-token updates (decode).
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        if keys.dim(2) == 1 {
+        // A prepared cached-prompt prefill (`_lengths != nil`) must always take the
+        // concat/finalize path, even when it is one token wide — e.g. one uncached
+        // token batched with a fully cached, width-1 right-padded row. `updateInPlace`
+        // requires `_lengths == nil` and would otherwise crash that valid prefill.
+        if keys.dim(2) == 1 && _lengths == nil {
             return updateInPlace(keys: keys, values: values)
         } else {
             return updateConcat(keys: keys, values: values)
