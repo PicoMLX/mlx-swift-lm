@@ -368,10 +368,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     public class func merge(_ caches: [KVCache]) -> BatchKVCache {
         // The copy loop below reads data only from `KVCacheSimple` instances; a
         // non-simple cache would silently contribute an all-zero row that the
-        // mask still exposes. Fail loudly instead.
+        // mask still exposes. Fail loudly instead. `ChunkedKVCache` subclasses
+        // `KVCacheSimple` but keeps an absolute `offset` after front-trimming, so
+        // it would mis-slice past its retained chunk here — reject it explicitly
+        // (matching the factory's rejection of chunked topologies).
         precondition(
-            caches.allSatisfy { $0 is KVCacheSimple },
-            "BatchKVCache.merge requires KVCacheSimple instances"
+            caches.allSatisfy { $0 is KVCacheSimple && !($0 is ChunkedKVCache) },
+            "BatchKVCache.merge requires non-chunked KVCacheSimple instances"
         )
         let lengths = caches.map { $0.offset }
         let maxLength = lengths.max() ?? 0

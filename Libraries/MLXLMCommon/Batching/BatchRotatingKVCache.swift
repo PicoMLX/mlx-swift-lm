@@ -922,9 +922,19 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
         let temporalData = cache.temporalState
         if temporalData.count >= 2 {
-            batchCache.keys = temporalData[0]
-            batchCache.values = temporalData[1]
             let seqLen = min(cache.offset, ms)
+            // `temporalState` is oldest-first and, for an over-window source
+            // (offset > maxSize), can be longer than the window. Keep the newest
+            // `seqLen` tokens (the live sliding window) rather than the oldest —
+            // otherwise later state/extraction would expose stale prompt tokens.
+            let total = temporalData[0].dim(2)
+            if total > seqLen {
+                batchCache.keys = temporalData[0][.ellipsis, (total - seqLen)..., 0...]
+                batchCache.values = temporalData[1][.ellipsis, (total - seqLen)..., 0...]
+            } else {
+                batchCache.keys = temporalData[0]
+                batchCache.values = temporalData[1]
+            }
             batchCache._idx = seqLen
             // `_scalarOffset` holds the *absolute* offset (the `offset` getter caps
             // it at `maxCacheSize`); capping it here would desync from `batchOffsets`
