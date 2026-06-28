@@ -579,7 +579,7 @@ public final class ChatSession {
         generateParameters: GenerateParameters,
         priorMessages: [Chat.Message],
         cache: Cache,
-        newMessages: consuming [Chat.Message],
+        newMessages: SendableBox<[Chat.Message]>,
         continuation: AsyncThrowingStream<R, Error>.Continuation,
         transform: @Sendable @escaping (Generation) -> R?
     ) async throws -> Cache {
@@ -598,7 +598,7 @@ public final class ChatSession {
 
         var messages = priorMessages
         messages.append(contentsOf: history)
-        let incoming = newMessages
+        let incoming = newMessages.consume()
         messages.append(contentsOf: incoming)
         history.append(contentsOf: incoming)
 
@@ -692,7 +692,7 @@ public final class ChatSession {
                             generateParameters: generateParameters,
                             priorMessages: messages,
                             cache: cache,
-                            newMessages: inputMessages.consume(),
+                            newMessages: inputMessages,
                             continuation: continuation,
                             transform: transform
                         )
