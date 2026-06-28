@@ -66,4 +66,6 @@ jobs:
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
-            -only-testing:MLXLMTests/BatchCacheTests
+            -only-testing:MLXLMTests/BatchCacheTests \
+            -only-testing:MLXLMTests/BatchQuantizedKVCacheTests \
+            -only-testing:MLXLMTests/QuantizedAttentionMaskTests

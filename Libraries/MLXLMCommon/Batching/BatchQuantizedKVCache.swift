@@ -506,7 +506,7 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
     /// Roll right-padding zeros to the left side of the buffers and convert
     /// them to left-padding. The roll permutes whole positions along the
     /// sequence axis, so quantized rows stay bit-exact.
-    public func finalize() {
+    public override func finalize() {
         guard let padding = _rightPadding else { return }
 
         if let k = keys, let v = values {
