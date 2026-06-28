@@ -76,6 +76,26 @@ struct BatchKVCacheCoverageTests {
         }
     }
 
+    @Test("trim clamps to the minimum live per-row length")
+    func trimClampsToMinimumLiveRow() {
+        // Ragged batch: leftPadding [4, 0], then prefill 5 tokens. Row offsets
+        // become [1, 5] (live lengths 1 and 5). Trimming by 2 must not drive the
+        // shorter row's offset negative; the trim is clamped to the min live row
+        // length (1) so no row underflows.
+        let cache = BatchKVCache(leftPadding: [4, 0])
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        #expect(cache.batchOffsets[0].item(Int32.self) == 1)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 5)
+
+        let trimmed = cache.trim(2)
+        #expect(trimmed == 1)
+        #expect(cache.offset == 4)
+        // No row offset is driven negative.
+        #expect(cache.batchOffsets[0].item(Int32.self) == 0)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 4)
+    }
+
     @Test("ropeOffset dispatches to .batch through the KVCache type")
     func ropeOffsetDispatchesThroughKVCache() {
         // Models read `cache?.ropeOffset` with `cache` typed as `KVCache?`, so the
@@ -139,6 +159,23 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.keep == 2)
         #expect(extracted.maxSize == 4)
         #expect(keys.dim(2) <= 4)
+    }
+
+    @Test("trim clamps to the minimum live per-row offset")
+    func trimClampsToMinimumLiveRow() {
+        // Ragged batch: leftPadding [4, 0], prefill 5 tokens → row offsets [1, 5].
+        // Trimming by 2 must clamp to the min live row offset (1) so the shorter
+        // row's batchOffsets is not driven negative and _idx stays >= its padding.
+        let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [4, 0], keep: 0)
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        #expect(cache.batchOffsets[0].item(Int32.self) == 1)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 5)
+
+        let trimmed = cache.trim(2)
+        #expect(trimmed == 1)
+        #expect(cache.batchOffsets[0].item(Int32.self) == 0)
+        #expect(cache.batchOffsets[1].item(Int32.self) == 4)
     }
 
     @Test("prepare/finalize preserve extractable state")

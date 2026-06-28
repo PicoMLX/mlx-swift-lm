@@ -498,7 +498,16 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(_scalarOffset, n)
+        // `_scalarOffset` is the global padded progress, not the shortest row's
+        // live length, and `batchOffsets[i]` is the live per-row offset (starts at
+        // `-leftPadding`, advances per token written). Subtracting the full `n`
+        // from every row drives a shorter row's `batchOffsets` negative and can
+        // push `_idx` before its left padding, so subsequent extraction or decode
+        // uses invalid slices/positions. Clamp the trim to the minimum live per-row
+        // offset before applying it to all rows, and return the clamped amount.
+        guard _scalarOffset > 0 else { return 0 }
+        let minLiveRow = max(0, Int(batchOffsets.min().item(Int32.self)))
+        let trimmed = min(n, _scalarOffset, minLiveRow)
         _scalarOffset -= trimmed
         _idx -= trimmed
         batchOffsets = batchOffsets - Int32(trimmed)
