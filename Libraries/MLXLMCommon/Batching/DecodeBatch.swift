@@ -328,7 +328,14 @@ public final class DecodeBatch {
         }
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
-        samplers.append(contentsOf: other.samplers)
+        // Materialize `other`'s fallback sampler for its rows that have no
+        // explicit per-row sampler. After merging, nil sampler slots resolve
+        // through *this* batch's `fallbackSampler`, which may differ from the
+        // one `other`'s rows relied on -- silently switching, e.g., a
+        // stochastic fallback to greedy. Binding `other.fallbackSampler` into
+        // those slots preserves each appended row's intended sampling.
+        let otherFallback = other.fallbackSampler
+        samplers.append(contentsOf: other.samplers.map { $0 ?? otherFallback })
         processors.append(contentsOf: other.processors)
         maxTokens.append(contentsOf: other.maxTokens)
         stateMachines.append(contentsOf: other.stateMachines)

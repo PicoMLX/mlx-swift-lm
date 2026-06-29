@@ -149,7 +149,7 @@ struct DecodeBatchPenaltyOrderingTests {
             model: model,
             uids: [0],
             seedTokens: MLXArray([UInt32(1)]),
-            promptCache: [KVCacheSimple()],
+            promptCache: [BatchKVCache(leftPadding: [0])],
             tokens: [[1]],
             maxTokens: [4],
             processors: [MaxRecordingProcessor(box: box)]
@@ -182,7 +182,7 @@ struct DecodeBatchMatcherReplayTests {
             model: IncrementingLanguageModel(),
             uids: [0],
             seedTokens: MLXArray([UInt32(8)]),
-            promptCache: [KVCacheSimple()],
+            promptCache: [BatchKVCache(leftPadding: [0])],
             tokens: [[8]],
             maxTokens: [10],
             stateMachines: [machine],
@@ -206,7 +206,7 @@ struct DecodeBatchMatcherReplayTests {
             model: IncrementingLanguageModel(),
             uids: [0],
             seedTokens: MLXArray([UInt32(8)]),
-            promptCache: [KVCacheSimple()],
+            promptCache: [BatchKVCache(leftPadding: [0])],
             tokens: [[8]],
             maxTokens: [10],
             stateMachines: [machine],
@@ -218,6 +218,55 @@ struct DecodeBatchMatcherReplayTests {
         #expect(responses[0].token == 9)
         // The matcher only saw `9`, never the preceding `8`, so no stop.
         #expect(responses[0].finishReason == nil)
+    }
+}
+
+// MARK: - Decode batch: fallback sampler preservation on extend
+
+@Suite(.serialized)
+struct DecodeBatchExtendFallbackTests {
+
+    @Test("Extending preserves the other batch's fallback for nil-sampler rows")
+    func extendPreservesOtherFallback() {
+        // `other` has a nil per-row sampler but a distinctive fallback that
+        // always returns token 5, regardless of the logits. The left batch's
+        // fallback is greedy. After `extend`, the appended row must still pick
+        // token 5 (its own fallback), not resolve through the greedy fallback.
+        let constantFive: RowSampler = { logits in
+            let rows = logits.dim(0)
+            return MLXArray(Array(repeating: Int32(5), count: rows))
+        }
+
+        let left = DecodeBatch(
+            model: IncrementingLanguageModel(),
+            uids: [0],
+            seedTokens: MLXArray([UInt32(1)]),
+            promptCache: [BatchKVCache(leftPadding: [0])],
+            tokens: [[1]],
+            maxTokens: [10],
+            fallbackSampler: greedySampler,
+            fallbackIsGreedy: true
+        )
+
+        let right = DecodeBatch(
+            model: IncrementingLanguageModel(),
+            uids: [1],
+            seedTokens: MLXArray([UInt32(1)]),
+            promptCache: [BatchKVCache(leftPadding: [0])],
+            tokens: [[1]],
+            maxTokens: [10],
+            fallbackSampler: constantFive,
+            fallbackIsGreedy: false
+        )
+
+        left.extend(right)
+
+        let responses = left.next()
+        let byUID = Dictionary(uniqueKeysWithValues: responses.map { ($0.uid, $0.token) })
+        // Left row resolves through greedy (IncrementingLanguageModel: 1 -> 2).
+        #expect(byUID[0] == 2)
+        // Right row must keep its own fallback (constant 5), not greedy.
+        #expect(byUID[1] == 5)
     }
 }
 
