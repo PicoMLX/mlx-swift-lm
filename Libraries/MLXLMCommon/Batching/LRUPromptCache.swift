@@ -343,7 +343,9 @@ public final class LRUPromptCache: PersistablePromptCache {
         #if DEBUG
             let skipped = snapshots.filter { !Self.isDiskPersistable($0.promptCache) }.count
             if skipped > 0 {
-                print("[PromptCache] skipping disk persistence for \(skipped) non-KVCacheSimple leaves")
+                print(
+                    "[PromptCache] skipping disk persistence for \(skipped) non-KVCacheSimple leaves"
+                )
             }
         #endif
 
@@ -818,10 +820,11 @@ public final class LRUPromptCache: PersistablePromptCache {
 
     private static func canSafelyTrim(_ cache: [KVCache], numTokens: Int) -> Bool {
         guard numTokens > 0 else { return true }
-        let minCachedSeqLen = cache.map { layer -> Int in
-            guard let first = layer.state.first, first.ndim >= 3 else { return 0 }
-            return first.dim(2)
-        }.min() ?? 0
+        let minCachedSeqLen =
+            cache.map { layer -> Int in
+                guard let first = layer.state.first, first.ndim >= 3 else { return 0 }
+                return first.dim(2)
+            }.min() ?? 0
         return numTokens < minCachedSeqLen
     }
 }
@@ -935,7 +938,8 @@ extension LRUPromptCache.State {
     }
 
     /// Internal fetch (must be called while holding the lock).
-    func fetchNearestCache(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.FetchResult {
+    func fetchNearestCache(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.FetchResult
+    {
         let result = search(key: key, tokens: tokens)
 
         // Exact match
