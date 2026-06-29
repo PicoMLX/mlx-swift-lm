@@ -508,6 +508,74 @@ struct BatchGenerationEnginePullLoopTests {
     }
 }
 
+// MARK: - Prefill batch: SSM length advancement (single-stream parity)
+
+@Suite(.serialized)
+struct PrefillBatchSSMAdvanceTests {
+
+    /// A minimal SSM-style model that mimics a Mamba layer's interaction with
+    /// its recurrent cache: each forward pass records the prepared `lengths` it
+    /// observes, then advances the cache by the chunk length -- exactly as the
+    /// real Jamba/FalconH1/LFM2 blocks do via `cache.advance(seqLen)`.
+    final class RecordingSSMModel: Module, LanguageModel, KVCacheDimensionProvider {
+        let vocabularySize = 8
+        var kvHeads: [Int] { [1] }
+        let observed = LengthObserver()
+
+        func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+            -> PrepareResult
+        {
+            .tokens(input.text)
+        }
+
+        func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+            let batchSize = inputs.dim(0)
+            let sequenceLength = inputs.dim(1)
+            if let cache {
+                for layerCache in cache {
+                    if let arrays = layerCache as? ArraysCache {
+                        observed.record(arrays.lengthsValues)
+                        // Mirror a real Mamba block: advance by the chunk length.
+                        arrays.advance(sequenceLength)
+                    }
+                }
+            }
+            let logits = Array(
+                repeating: Float(0),
+                count: batchSize * sequenceLength * vocabularySize)
+            return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
+        }
+    }
+
+    final class LengthObserver {
+        private(set) var chunks: [[Int]?] = []
+        func record(_ lengths: [Int]?) { chunks.append(lengths) }
+    }
+
+    @Test("Ragged multi-chunk prefill advances SSM lengths exactly once per chunk")
+    func raggedMultiChunkPrefillAdvancesOnce() {
+        let model = RecordingSSMModel()
+        // Two ragged rows: lengths [4, 2]. prefillStepSize 2 -> two chunks.
+        let prefill = PrefillBatch(
+            model: model,
+            uids: [0, 1],
+            promptCache: [MambaCache(leftPadding: [0, 0])],
+            tokens: [[], []],
+            maxTokens: [4, 4],
+            prefillStepSize: 2
+        )
+        prefill.prompt([[1, 2, 3, 4], [5, 6]])
+
+        // Chunk 1 must observe the prepared lengths [4, 2]. Chunk 2 must observe
+        // [4 - 2, 2 - 2] = [2, 0] -- a single decrement per chunk. A double
+        // advance would yield [4 - 4, 2 - 4] = [0, -2] on chunk 2 (valid suffix
+        // tokens masked / negative remaining length).
+        #expect(model.observed.chunks.count == 2)
+        #expect(model.observed.chunks[0] == [4, 2])
+        #expect(model.observed.chunks[1] == [2, 0])
+    }
+}
+
 // MARK: - Test models & helpers
 
 private func assertEngineRejectsCache(

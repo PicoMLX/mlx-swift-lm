@@ -153,9 +153,17 @@ public final class PrefillBatch {
             for cache in promptCache {
                 eval(cache.innerState())
             }
-            for cache in promptCache {
-                cache.advanceBatched(n)
-            }
+            // Do NOT advance the caches here. SSM/Mamba model layers already
+            // decrement their prepared `lengths` themselves (every recurrent
+            // block calls `cache.advance(seqLen)` in its forward pass -- see
+            // Jamba/FalconH1/LFM2/NemotronH/Qwen3Next/GraniteMoeHybrid), and
+            // full-attention batched caches advance via `update` (their
+            // `advanceBatched` is a no-op). An extra `advanceBatched(n)` here
+            // double-decrements the SSM `lengths`, so on multi-chunk ragged
+            // prefill the next chunk would see too-small remaining lengths and
+            // mask valid suffix tokens, corrupting the recurrent state. (For a
+            // single chunk `finalizeBatched()` clears `lengths`, hiding the
+            // bug; it only surfaced past `prefillStepSize`.)
             if n == remaining.dim(1) {
                 break
             }
