@@ -388,38 +388,50 @@ public final class DecodeBatch {
             // `argMax` fast path below is order-preserving and needs no cast.
             let sampleLogits =
                 stepLogits.dtype == .bfloat16 ? stepLogits.asType(.float32) : stepLogits
+
+            // Rows without a penalty processor share one batched log-softmax
+            // (logits - logSumExp), exactly equal to slicing each row out --
+            // this keeps the single reduction kernel for the common case.
+            // Penalty rows are handled per-row below from the *raw* logits.
+            let batchLogprobs =
+                sampleLogits - logSumExp(sampleLogits, axis: -1, keepDims: true)
+
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
             for i in 0 ..< uids.count {
-                // Mirror the single path's `convertToToken` ordering exactly:
-                // the penalty processor visits the **raw** logits *before* the
-                // sampler (which itself works in log-prob space). Applying
-                // penalties to already-normalized log-probs would diverge:
-                // `RepetitionContext` branches on the sign of the selected
-                // value, and log-probs are almost always negative, so it would
-                // always multiply (never divide) and penalize differently from
-                // the single stream. So we slice the raw logits, run the
-                // processor on them, and only then form this row's log-probs.
-                //
-                // Drive this row's penalty processor incrementally, exactly as
-                // the single `TokenIterator` does: feed it the current input
-                // token (`currentTokens[i]`, which was the previous step's
-                // sampled token), then `process()` the row's raw logit slice
-                // before computing log-probs. With the prompt prefix loaded in
-                // the constructor, the ring holds the full history through the
-                // current token at `process()` time -- matching the single
-                // path's `process -> sample -> didSample` invariant. These are
-                // GPU-only mask writes (see `TokenRing`), so they don't force a
-                // CPU sync and preserve `asyncEval` pipelining.
-                var rowLogits = sampleLogits[i ..< (i + 1), 0...]
+                let rowLogprobs: MLXArray
                 if processors[i] != nil {
+                    // Mirror the single path's `convertToToken` ordering exactly:
+                    // the penalty processor visits the **raw** logits *before*
+                    // the sampler (which itself works in log-prob space).
+                    // Applying penalties to already-normalized log-probs would
+                    // diverge: `RepetitionContext` branches on the sign of the
+                    // selected value, and log-probs are almost always negative,
+                    // so it would always multiply (never divide) and penalize
+                    // differently from the single stream. So we slice the raw
+                    // logits, run the processor on them, then form this row's
+                    // log-probs.
+                    //
+                    // Drive the processor incrementally as the single
+                    // `TokenIterator` does: feed it the current input token
+                    // (`currentTokens[i]`, the previous step's sampled token),
+                    // then `process()` the raw logit slice. With the prompt
+                    // prefix loaded in the constructor, the ring holds the full
+                    // history through the current token at `process()` time --
+                    // matching the single path's `process -> sample ->
+                    // didSample` invariant. These are GPU-only mask writes (see
+                    // `TokenRing`), so they don't force a CPU sync and preserve
+                    // `asyncEval` pipelining.
+                    var rowLogits = sampleLogits[i ..< (i + 1), 0...]
                     processors[i]?.didSample(token: currentTokens[i ..< (i + 1)])
                     rowLogits = processors[i]?.process(logits: rowLogits) ?? rowLogits
+                    // Normalize after penalties, mirroring `TopPSampler.sample`'s
+                    // `logprobs = logSoftmax(logits)`; the batched `RowSampler`
+                    // consumes log-probs (see `RowSamplers`).
+                    rowLogprobs = rowLogits - logSumExp(rowLogits, axis: -1, keepDims: true)
+                } else {
+                    rowLogprobs = batchLogprobs[i ..< (i + 1), 0...]
                 }
-                // Normalize to log-probs after penalties, mirroring
-                // `TopPSampler.sample`'s `logprobs = logSoftmax(logits)`; the
-                // batched `RowSampler` consumes log-probs (see `RowSamplers`).
-                let rowLogprobs = rowLogits - logSumExp(rowLogits, axis: -1, keepDims: true)
                 let sampler = samplers[i] ?? fallbackSampler
                 samples.append(sampler(rowLogprobs))
             }
