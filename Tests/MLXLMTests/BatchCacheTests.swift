@@ -240,6 +240,20 @@ struct BatchedSSMCacheTests {
         #expect(mamba.batchSize == 1)
     }
 
+    @Test("MambaCache extraction preserves the concrete cache type")
+    func mambaExtractionPreservesConcreteType() {
+        let mamba = MambaCache(leftPadding: [0, 0])
+        mamba[0] = MLXArray.ones([2, 4])
+        mamba[1] = MLXArray.ones([2, 4])
+
+        let cache: any BatchedCache = mamba
+        let extracted = cache.extractBatched(0)
+        // Must stay a MambaCache so Jamba/LFM2/Falcon-H1's `as? MambaCache`
+        // recovery keeps the recurrent state on reuse (e.g. finished-cache
+        // capture / prompt-cache write-back).
+        #expect(extracted is MambaCache)
+    }
+
     @Test("BatchedCacheList preserves nested topology")
     func batchedCacheListNested() throws {
         let factories = try makeBatchedCacheFactories(

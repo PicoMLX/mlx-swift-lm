@@ -1308,13 +1308,23 @@ public class ArraysCache: BaseKVCache {
         leftPadding = nil
     }
 
+    /// Build an empty single-row cache of the receiver's concrete type to be
+    /// populated by ``extract(_:)``. Overridden by subclasses (e.g.
+    /// ``MambaCache``) so extraction preserves the concrete cache type rather
+    /// than downcasting to a base ``ArraysCache``.
+    internal func makeExtractedEmpty() -> ArraysCache {
+        ArraysCache(size: cache.count)
+    }
+
     /// Extract one row as its own single-row cache.
     ///
-    /// Note: a ``MambaCache`` row is returned as a base ``ArraysCache`` (the
-    /// stored slots are identical); the Mamba auto-upgrade path can refine this
-    /// to preserve the concrete subtype if needed.
+    /// The returned cache preserves the receiver's concrete type via
+    /// ``makeExtractedEmpty()`` -- a ``MambaCache`` extracts to a
+    /// ``MambaCache`` so hybrid models (Jamba/LFM2/Falcon-H1) that recover the
+    /// recurrent cache with `cache as? MambaCache` keep their recurrent state
+    /// on reuse (e.g. prompt-cache write-back of finished rows).
     public func extract(_ idx: Int) -> ArraysCache {
-        let extracted = ArraysCache(size: cache.count)
+        let extracted = makeExtractedEmpty()
         extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
         extracted.offset = offset
         extracted.leftPadding = leftPadding?[idx ..< (idx + 1)]
@@ -1433,6 +1443,13 @@ public class MambaCache: ArraysCache {
         let new = MambaCache()
         copyContents(to: new)
         return new
+    }
+
+    /// Preserve the concrete ``MambaCache`` type when extracting a single row,
+    /// so hybrid models that recover the recurrent cache via `as? MambaCache`
+    /// keep their state (see ``ArraysCache/extract(_:)``).
+    internal override func makeExtractedEmpty() -> ArraysCache {
+        MambaCache()
     }
 }
 
