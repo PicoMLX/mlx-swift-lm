@@ -83,6 +83,87 @@ struct RowSamplerTests {
     }
 }
 
+// MARK: - Decode batch: penalty ordering (single-stream parity)
+
+@Suite(.serialized)
+struct DecodeBatchPenaltyOrderingTests {
+
+    /// A `LogitProcessor` spy that records the maximum value of the logits it
+    /// is handed in `process(logits:)`. Used to verify the batched decode path
+    /// applies penalties to the **raw** logits (which can be positive) rather
+    /// than to already-normalized log-probs (which are <= 0), matching the
+    /// single-stream `TokenIterator.convertToToken` ordering.
+    final class MaxRecordingProcessor: LogitProcessor {
+        let box: MaxBox
+        init(box: MaxBox) { self.box = box }
+        func prompt(_ prompt: MLXArray) {}
+        func process(logits: MLXArray) -> MLXArray {
+            box.observed = logits.max().item(Float.self)
+            return logits
+        }
+        func didSample(token: MLXArray) {}
+    }
+
+    final class MaxBox { var observed: Float? = nil }
+
+    /// A model whose final-position logits put a large **positive** value on
+    /// one token, so raw logits and log-probs are clearly distinguishable
+    /// (raw max > 0; log-prob max <= 0).
+    final class PositiveLogitModel: Module, LanguageModel, KVCacheDimensionProvider {
+        let vocabularySize = 8
+        var kvHeads: [Int] { [1] }
+        let peak: Float
+
+        init(peak: Float = 12.0) { self.peak = peak }
+
+        func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+            -> PrepareResult
+        {
+            .tokens(input.text)
+        }
+
+        func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+            let batchSize = inputs.dim(0)
+            let sequenceLength = inputs.dim(1)
+            var logits = Array(
+                repeating: Float(0),
+                count: batchSize * sequenceLength * vocabularySize
+            )
+            // Put `peak` on token index 1 at every position.
+            for b in 0 ..< batchSize {
+                for t in 0 ..< sequenceLength {
+                    let base = (b * sequenceLength + t) * vocabularySize
+                    logits[base + 1] = peak
+                }
+            }
+            return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
+        }
+    }
+
+    @Test("Penalty processor sees raw logits, not log-probs")
+    func processorSeesRawLogits() {
+        let box = MaxBox()
+        let model = PositiveLogitModel(peak: 12.0)
+        // A non-greedy fallback forces the sampler path (where processors run).
+        let batch = DecodeBatch(
+            model: model,
+            uids: [0],
+            seedTokens: MLXArray([UInt32(1)]),
+            promptCache: [KVCacheSimple()],
+            tokens: [[1]],
+            maxTokens: [4],
+            processors: [MaxRecordingProcessor(box: box)]
+        )
+        _ = batch.next()
+
+        // The processor must have observed the raw logit peak (> 0), proving it
+        // ran before log-softmax. If penalties were applied to log-probs the
+        // observed max would be <= 0.
+        let observed = try! #require(box.observed)
+        #expect(observed > 1.0)
+    }
+}
+
 // MARK: - Engine: cache topology validation
 
 @Suite(.serialized)
