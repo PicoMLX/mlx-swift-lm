@@ -368,6 +368,14 @@ public final class BatchGenerationEngine {
             uids.append(uidCounter)
             uidCounter += 1
         }
+        // Mirror `insert`'s `stateMachines?[i] ?? defaultStateMachine`: when an
+        // adopted/migrated row does not carry an explicit stop matcher, fall
+        // back to the engine's default EOS matcher so upgraded rows still stop
+        // on EOS/stop sequences instead of running until `maxTokens`. Without
+        // this, `DecodeBatch` would fill nil with an empty matcher that never
+        // matches.
+        let resolvedStateMachines =
+            stateMachines ?? Array(repeating: defaultStateMachine, count: tokens.count)
         let priorTokens = tokens.map { Array($0.dropLast()) }
         let batch = DecodeBatch(
             model: model,
@@ -382,7 +390,7 @@ public final class BatchGenerationEngine {
             processors: processorSources.map { sources in
                 sources.map { $0?() }
             },
-            stateMachines: stateMachines,
+            stateMachines: resolvedStateMachines,
             numTokens: numTokens
         )
         return (batch, uids)
