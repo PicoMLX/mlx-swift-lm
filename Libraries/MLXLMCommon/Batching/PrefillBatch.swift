@@ -126,6 +126,25 @@ public final class PrefillBatch {
 
         var inputs: MLXArray
         if maxPadding > 0 {
+            // Ragged prompts are right-padded to a uniform `[B, maxLength]`.
+            // `prepareBatched(lengths:)` records each row's true length so the
+            // model can mask the padding. Full-attention caches consume this
+            // via their position mask, and SSM models that build an SSM mask
+            // from `cache.currentLengths` (e.g. Falcon-H1, LFM2-MoE,
+            // NemotronH, Qwen3-Next, Granite-MoE-Hybrid via `createSSMMask`)
+            // correctly skip the trailing padding.
+            //
+            // CAVEAT (model-parity, covered by `BatchModelRegressionTests`,
+            // which run real weights and are intentionally outside this CI):
+            // a recurrent block that ignores the prepared length mask and
+            // advances by the full padded width -- e.g. Jamba's Mamba block
+            // calls `mamba(x, cache:)` with no SSM mask and `advance(x.dim(1))`
+            // -- folds the trailing padding zeros into a shorter row's conv /
+            // recurrent state. A correct general fix needs either per-row SSM
+            // masking threaded through every recurrent model or rejecting
+            // unmasked-SSM topologies (which cannot be distinguished from
+            // masked ones by cache type alone), so it is deferred to the
+            // numerical-parity regression suite rather than guessed at here.
             var padded: [[Int]] = []
             padded.reserveCapacity(promptTokens.count)
             for t in promptTokens {
