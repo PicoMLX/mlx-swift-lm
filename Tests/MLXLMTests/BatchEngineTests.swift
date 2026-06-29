@@ -164,6 +164,63 @@ struct DecodeBatchPenaltyOrderingTests {
     }
 }
 
+// MARK: - Decode batch: matcher replay on adoption
+
+@Suite(.serialized)
+struct DecodeBatchMatcherReplayTests {
+
+    @Test("Replaying generated history completes a partial stop sequence")
+    func replayCompletesPartialStop() {
+        // Stop on the two-token sequence [8, 9]. The migrated row already
+        // produced `8` (the seed) while running single; the next batched token
+        // is `9` (IncrementingLanguageModel: 8 -> 9), which must complete the
+        // stop only because the prior `8` was replayed into the matcher.
+        let machine = StopSequenceMatcher(
+            states: ["normal": [(sequence: [8, 9], next: nil)]]
+        )
+        let batch = DecodeBatch(
+            model: IncrementingLanguageModel(),
+            uids: [0],
+            seedTokens: MLXArray([UInt32(8)]),
+            promptCache: [KVCacheSimple()],
+            tokens: [[8]],
+            maxTokens: [10],
+            stateMachines: [machine],
+            numTokens: [1],
+            replayMatcherTokens: [[8]]
+        )
+
+        let responses = batch.next()
+        #expect(responses.count == 1)
+        #expect(responses[0].token == 9)
+        #expect(responses[0].finishReason == .stop)
+        #expect(responses[0].matchedSequence == [8, 9])
+    }
+
+    @Test("Without replay the same partial stop is missed")
+    func withoutReplayPartialStopMissed() {
+        let machine = StopSequenceMatcher(
+            states: ["normal": [(sequence: [8, 9], next: nil)]]
+        )
+        let batch = DecodeBatch(
+            model: IncrementingLanguageModel(),
+            uids: [0],
+            seedTokens: MLXArray([UInt32(8)]),
+            promptCache: [KVCacheSimple()],
+            tokens: [[8]],
+            maxTokens: [10],
+            stateMachines: [machine],
+            numTokens: [1]
+        )
+
+        let responses = batch.next()
+        #expect(responses.count == 1)
+        #expect(responses[0].token == 9)
+        // The matcher only saw `9`, never the preceding `8`, so no stop.
+        #expect(responses[0].finishReason == nil)
+    }
+}
+
 // MARK: - Engine: cache topology validation
 
 @Suite(.serialized)

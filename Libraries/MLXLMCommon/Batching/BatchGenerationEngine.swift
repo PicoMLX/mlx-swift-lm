@@ -377,6 +377,19 @@ public final class BatchGenerationEngine {
         let resolvedStateMachines =
             stateMachines ?? Array(repeating: defaultStateMachine, count: tokens.count)
         let priorTokens = tokens.map { Array($0.dropLast()) }
+        // Replay the already-generated tokens (including the seed) through each
+        // row's stop matcher so a partial multi-token stop sequence emitted
+        // while running single carries across the handoff. `numTokens[i]` is the
+        // count produced while single, so the last `numTokens[i]` tokens of the
+        // full per-row history are exactly the generated tokens; prompt tokens
+        // before them must not seed the matcher (they would wrongly trigger a
+        // stop). With no `numTokens`, there is no recorded generated history to
+        // replay.
+        let replayMatcherTokens: [[Int]]? = numTokens.map { counts in
+            zip(tokens, counts).map { history, count in
+                count > 0 ? Array(history.suffix(count)) : []
+            }
+        }
         let batch = DecodeBatch(
             model: model,
             uids: uids,
@@ -391,7 +404,8 @@ public final class BatchGenerationEngine {
                 sources.map { $0?() }
             },
             stateMachines: resolvedStateMachines,
-            numTokens: numTokens
+            numTokens: numTokens,
+            replayMatcherTokens: replayMatcherTokens
         )
         return (batch, uids)
     }

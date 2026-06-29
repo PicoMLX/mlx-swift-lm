@@ -130,7 +130,8 @@ public final class DecodeBatch {
         fallbackIsGreedy: Bool = true,
         processors: [LogitProcessor?]? = nil,
         stateMachines: [StopSequenceMatcher]? = nil,
-        numTokens: [Int]? = nil
+        numTokens: [Int]? = nil,
+        replayMatcherTokens: [[Int]]? = nil
     ) {
         precondition(uids.count == tokens.count, "uids/tokens count mismatch")
         precondition(uids.count == maxTokens.count, "uids/max_tokens count mismatch")
@@ -146,6 +147,11 @@ public final class DecodeBatch {
         if let stateMachines {
             precondition(uids.count == stateMachines.count, "uids/stateMachines count mismatch")
         }
+        if let replayMatcherTokens {
+            precondition(
+                uids.count == replayMatcherTokens.count,
+                "uids/replayMatcherTokens count mismatch")
+        }
         self.model = model
         self.uids = uids
         self.promptCache = promptCache
@@ -157,7 +163,30 @@ public final class DecodeBatch {
         self.processors = processors ?? Array(repeating: nil, count: uids.count)
         let machines = stateMachines ?? Array(repeating: StopSequenceMatcher(), count: uids.count)
         self.stateMachines = machines
-        self.matcherStates = machines.map { $0.makeState() }
+        // Seed each row's matcher state. For a fresh prefill the state starts
+        // clean. For the single->batch adoption path the migrated row may have
+        // already produced the prefix of a multi-token stop sequence while
+        // running single; those generated tokens were checked there but the
+        // priming `step()` below never re-checks the seed token. Replay the
+        // already-generated tokens (`replayMatcherTokens`, the row's generated
+        // history *including* the seed) so a partial match carries across the
+        // handoff and the next batched token can complete it -- matching the
+        // single stream, which would have detected the stop on that token.
+        self.matcherStates = machines.enumerated().map { index, machine in
+            var state = machine.makeState()
+            if let replay = replayMatcherTokens?[index] {
+                for token in replay {
+                    let (next, matched, current) = machine.match(state, token)
+                    state = next
+                    // A completed stop inside the already-emitted history means
+                    // the single stream had already stopped this row; we still
+                    // advance the state for consistency but do not act on it
+                    // here (adoption only migrates still-active rows).
+                    _ = (matched, current)
+                }
+            }
+            return state
+        }
         self.numTokens = numTokens ?? Array(repeating: 0, count: uids.count)
         self.nextTokens = seedTokens
 
