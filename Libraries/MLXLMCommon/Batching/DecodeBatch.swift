@@ -175,14 +175,13 @@ public final class DecodeBatch {
         self.matcherStates = machines.enumerated().map { index, machine in
             var state = machine.makeState()
             if let replay = replayMatcherTokens?[index] {
+                // Advance the matcher through the already-emitted tokens. A
+                // completed stop here would mean the single stream had already
+                // stopped this row; adoption only migrates still-active rows,
+                // so we only carry the resulting state (e.g. a partial match)
+                // forward to the next batched token.
                 for token in replay {
-                    let (next, matched, current) = machine.match(state, token)
-                    state = next
-                    // A completed stop inside the already-emitted history means
-                    // the single stream had already stopped this row; we still
-                    // advance the state for consistency but do not act on it
-                    // here (adoption only migrates still-active rows).
-                    _ = (matched, current)
+                    state = machine.match(state, token).next
                 }
             }
             return state
