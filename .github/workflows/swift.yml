@@ -54,8 +54,7 @@ jobs:
 
       - name: Build for testing (Xcode, macOS)
         run: |
-          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
-            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -warn-long-function-bodies=500 -Xfrontend -warn-long-expression-type-checking=500'
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
 
       # Run only the batched-cache suite: it is self-contained (no model downloads)
       # and exercises the Metal kernels that back rotation/extract/merge/finalize —
