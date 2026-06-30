@@ -679,7 +679,7 @@ extension InferenceScheduler {
                 modelName: modelName,
                 promptCacheSalt: salt,
                 inputTokens: inputTokens,
-                onFinished: { tokenIds in
+                onFinished: { [weak self] tokenIds in
                     await self?.singleTaskFinished(
                         requestID: requestID, generatedTokenIds: tokenIds)
                 }
