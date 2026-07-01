@@ -443,7 +443,7 @@ public final class VLMModelFactory: GenericModelFactory {
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+            tokenizer: tokenizer, loadedAsVLM: true)
     }
 
 }
