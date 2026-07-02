@@ -429,13 +429,7 @@ actor EngineDriver {
             if !engine.hasWork { break }
 
             if let ticket = ticketForLoop {
-                // The closure must be non-isolated to satisfy the `sending`
-                // body parameter, so it re-enters the actor with an explicit
-                // `await`; the wired limit is a process-global GPU setting, so
-                // it spans the hop.
-                await WiredMemoryTicket.withWiredLimit(ticket) {
-                    await self.stepOnce(onResult: onResult)
-                }
+                await stepOnceWired(ticket, onResult: onResult)
             } else {
                 stepOnce(onResult: onResult)
             }
@@ -443,6 +437,24 @@ actor EngineDriver {
             // Cooperative yield: lets queued actor messages (submit/cancel)
             // run between steps. Engine mutation stays serial.
             await Task.yield()
+        }
+    }
+
+    /// Runs one engine step under the ticket's wired-memory limit.
+    ///
+    /// `nonisolated` on purpose: `withWiredLimit`'s body is a `sending`
+    /// parameter, and a closure formed inside an actor-isolated method
+    /// inherits the actor's isolation (making it unsendable) even when it only
+    /// `await`s. Formed here, the closure captures only `Sendable` values
+    /// (the actor reference and the handler) and re-enters the actor for the
+    /// step itself; the wired limit is a process-global GPU setting, so it
+    /// spans the hop.
+    nonisolated private func stepOnceWired(
+        _ ticket: WiredMemoryTicket,
+        onResult: (@Sendable ([BatchStepResult]) -> Void)?
+    ) async {
+        await WiredMemoryTicket.withWiredLimit(ticket) {
+            await self.stepOnce(onResult: onResult)
         }
     }
 
