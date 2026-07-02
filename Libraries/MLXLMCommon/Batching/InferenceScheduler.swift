@@ -242,7 +242,7 @@ extension InferenceScheduler {
     /// `CheckedContinuation` over a non-`Sendable` payload); the conformance
     /// itself is checked.
     final class UpgradeFlag: Sendable {
-        typealias Cont = CheckedContinuation<LiveIteratorState?, Never>
+        typealias Cont = CheckedContinuation<SendableBox<LiveIteratorState>?, Never>
 
         private struct State {
             var upgradeRequested = false
@@ -275,9 +275,9 @@ extension InferenceScheduler {
 
         /// Single-task side: deposit live state and resume the scheduler.
         ///
-        /// `state` is transferred with `sending`; the caller stops touching it
-        /// after this returns.
-        func depositLiveState(_ liveState: sending LiveIteratorState) {
+        /// The state rides a `SendableBox` (exactly-once transfer); the caller
+        /// stops touching it after this returns.
+        func depositLiveState(_ liveState: SendableBox<LiveIteratorState>) {
             let cont = state.withLockUnchecked { s -> Cont? in
                 let c = s.continuation
                 s.continuation = nil
@@ -403,14 +403,20 @@ extension InferenceScheduler {
     public func submitBatch(_ requests: sending [GenerationRequest]) async throws
         -> [AsyncStream<Generation>]
     {
+        // Box each element before routing: the region checker cannot transfer
+        // one element of an actor-held array while the rest stays reachable,
+        // so each request rides a `SendableBox` and is consumed (yielding a
+        // disconnected value) right at the `sending` boundary.
+        var boxes: [SendableBox<GenerationRequest>] = []
+        boxes.reserveCapacity(requests.count)
         var remaining = requests
-        var streams: [AsyncStream<Generation>] = []
-        streams.reserveCapacity(remaining.count)
         while !remaining.isEmpty {
-            // Within the actor the element is actor-isolated; moving it out and
-            // routing it does not cross an isolation boundary.
-            let request = remaining.removeFirst()
-            streams.append(try await submitOne(request))
+            boxes.append(SendableBox(remaining.removeFirst()))
+        }
+        var streams: [AsyncStream<Generation>] = []
+        streams.reserveCapacity(boxes.count)
+        for box in boxes {
+            streams.append(try await submitOne(box.consume()))
         }
         return streams
     }
@@ -826,7 +832,7 @@ extension InferenceScheduler {
         if case .deposit(let live) = outcome {
             // Hand the live state to the scheduler and exit, leaving the stream
             // open for the batch loop to continue.
-            upgradeFlag.depositLiveState(live)
+            upgradeFlag.depositLiveState(SendableBox(live))
             return
         }
         guard case .finished(let resolvedReason) = outcome else { return }
@@ -915,7 +921,7 @@ extension InferenceScheduler {
             return nil
         }
 
-        let driver = EngineDriver(engine: engine, promptCache: promptCache)
+        let driver = EngineDriver(engine: SendableBox(engine), promptCache: promptCache)
         if hasPendingMaxBatchSize {
             await driver.setMaxBatchSize(pendingMaxBatchSize)
         } else if let cap = configuration.maxBatchSize {
@@ -1113,17 +1119,20 @@ extension InferenceScheduler {
         // Phase 1: enter the upgrade window and request the snapshot.
         state = .upgrading
 
-        let live: LiveIteratorState? = await withCheckedContinuation { continuation in
+        let liveBox: SendableBox<LiveIteratorState>? = await withCheckedContinuation {
+            continuation in
             single.upgradeFlag.requestUpgrade(continuation: continuation)
         }
 
-        guard let live else {
+        guard let liveBox else {
             // The single task finished before it could deposit state. Its
             // stream is already (or about to be) closed by its own loop; start
             // the joining request fresh.
             await admitToBatch(joining)
             return
         }
+
+        let live = liveBox.consume()
 
         // The single task has stopped and deposited `live`; we now own it.
         // Pull out every value-typed (Sendable) field up front so that, after
@@ -1385,12 +1394,16 @@ extension InferenceScheduler {
     private func drainQueuedRequests() async {
         guard !queuedRequests.isEmpty else { return }
         // Move the held requests out of the actor's storage, then re-route them.
-        // The elements stay actor-isolated throughout (storage → local → route),
-        // so moving and routing crosses no isolation boundary.
-        var pending = queuedRequests
-        queuedRequests.removeAll()
-        while !pending.isEmpty {
-            let next = pending.removeFirst()
+        // Same boxing dance as `submitBatch`: elements of an actor-held array
+        // cannot be sent while the array stays reachable, so each request is
+        // boxed and consumed at the `sending` boundary.
+        var boxes: [SendableBox<ScheduledRequest>] = []
+        boxes.reserveCapacity(queuedRequests.count)
+        while !queuedRequests.isEmpty {
+            boxes.append(SendableBox(queuedRequests.removeFirst()))
+        }
+        for box in boxes {
+            let next = box.consume()
             // These streams are already live (returned to their callers when
             // queued), so an iterator-prefill failure during re-route cannot be
             // thrown out — close the stream so the request ends instead of

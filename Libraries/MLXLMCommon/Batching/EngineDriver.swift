@@ -131,8 +131,12 @@ actor EngineDriver {
         let stateMachine: StopSequenceMatcher?
     }
 
-    init(engine: BatchGenerationEngine, promptCache: (any PromptCaching)? = nil) {
-        self.engine = engine
+    /// The engine arrives in a `SendableBox` because it is constructed from
+    /// the scheduler actor's region (it references the shared model); the box
+    /// is the repo's established hand-off for exactly-once transfer of
+    /// non-`Sendable` values across isolation.
+    init(engine: SendableBox<BatchGenerationEngine>, promptCache: (any PromptCaching)? = nil) {
+        self.engine = engine.consume()
         self.promptCache = promptCache
     }
 
@@ -425,8 +429,12 @@ actor EngineDriver {
             if !engine.hasWork { break }
 
             if let ticket = ticketForLoop {
+                // The closure must be non-isolated to satisfy the `sending`
+                // body parameter, so it re-enters the actor with an explicit
+                // `await`; the wired limit is a process-global GPU setting, so
+                // it spans the hop.
                 await WiredMemoryTicket.withWiredLimit(ticket) {
-                    self.stepOnce(onResult: onResult)
+                    await self.stepOnce(onResult: onResult)
                 }
             } else {
                 stepOnce(onResult: onResult)
