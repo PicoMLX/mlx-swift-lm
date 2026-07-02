@@ -54,6 +54,13 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # Xcode 26.x distributes the Metal compiler as a separate downloadable
+      # component, and the hosted macos-26 image does not preinstall it for
+      # non-default Xcodes; without it mlx-swift's kernel build fails with
+      # "cannot execute tool 'metal'".
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       # -skipPackagePluginValidation / -skipMacroValidation: mlx-swift 0.31.5+
       # ships a CudaBuild build-tool plugin (and swift-syntax provides macros);
       # xcodebuild refuses unvalidated plugins/macros in non-interactive runs.
