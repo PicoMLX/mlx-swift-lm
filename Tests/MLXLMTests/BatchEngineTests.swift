@@ -113,11 +113,12 @@ struct BatchGenerationEngineTopologyTests {
 
     @Test("Rejects unsupported cache topologies")
     func rejectsUnsupportedCacheTopologies() {
-        assertEngineRejectsCache(
-            QuantizedKVCache(),
-            expectedType: "QuantizedKVCache",
-            expectedPath: "layer"
-        )
+        // QuantizedKVCache is batchable (BatchQuantizedKVCache); construction
+        // must succeed for a quantized probe.
+        let quantized = CacheTopologyLanguageModel { _ in [QuantizedKVCache()] }
+        #expect(throws: Never.self) {
+            _ = try BatchGenerationEngine(model: quantized)
+        }
         assertEngineRejectsCache(
             ChunkedKVCache(),
             expectedType: "ChunkedKVCache",
@@ -130,9 +131,11 @@ struct BatchGenerationEngineTopologyTests {
             expectedType: "RotatingKVCache",
             expectedPath: "layer"
         )
+        // SSM caches are factory-rejected, so the composite rejects at its
+        // Mamba child (the first child hit by the recursion).
         assertEngineRejectsCache(
             CacheList(MambaCache(), QuantizedKVCache()),
-            expectedType: "QuantizedKVCache",
+            expectedType: "MambaCache",
             expectedPathContains: "children"
         )
     }
