@@ -25,6 +25,7 @@ public enum LLMTypeRegistry {
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
+        "mixtral": create(MixtralConfiguration.self, MixtralModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
         "phi3": create(Phi3Configuration.self, Phi3Model.init),
@@ -78,6 +79,7 @@ public enum LLMTypeRegistry {
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba": create(JambaConfiguration.self, JambaModel.init),
+        "mamba2": create(Mamba2Configuration.self, Mamba2Model.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
         "nemotron_labs_diffusion": create(
