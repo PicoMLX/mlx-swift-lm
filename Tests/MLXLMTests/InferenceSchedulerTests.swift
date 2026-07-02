@@ -99,7 +99,7 @@ struct UpgradeFlagTests {
         let flag = InferenceScheduler.UpgradeFlag()
 
         // Scheduler side awaits the snapshot; single side deposits it.
-        async let awaited: InferenceScheduler.LiveIteratorState? =
+        async let awaited: SendableBox<InferenceScheduler.LiveIteratorState>? =
             withCheckedContinuation { continuation in
                 flag.requestUpgrade(continuation: continuation)
             }
@@ -118,9 +118,9 @@ struct UpgradeFlagTests {
             parameters: GenerateParameters(),
             generatedTokenIds: [1, 2, 3]
         )
-        flag.depositLiveState(snapshot)
+        flag.depositLiveState(SendableBox(snapshot))
 
-        let result = try #require(await awaited)
+        let result = try #require(await awaited).consume()
         #expect(result.currentToken == 7)
         #expect(result.tokenCount == 3)
         #expect(result.generatedTokenIds == [1, 2, 3])
@@ -135,7 +135,7 @@ struct UpgradeFlagTests {
 
         // A later upgrade request must resume immediately with nil so the
         // scheduler does not hang.
-        let result: InferenceScheduler.LiveIteratorState? =
+        let result: SendableBox<InferenceScheduler.LiveIteratorState>? =
             await withCheckedContinuation { continuation in
                 flag.requestUpgrade(continuation: continuation)
             }
@@ -146,7 +146,7 @@ struct UpgradeFlagTests {
     func markTaskFinishedResumesPending() async throws {
         let flag = InferenceScheduler.UpgradeFlag()
 
-        async let awaited: InferenceScheduler.LiveIteratorState? =
+        async let awaited: SendableBox<InferenceScheduler.LiveIteratorState>? =
             withCheckedContinuation { continuation in
                 flag.requestUpgrade(continuation: continuation)
             }
