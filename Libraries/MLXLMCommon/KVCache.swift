@@ -1982,26 +1982,6 @@ public func quantizedScaledDotProductAttention(
         mode: mode
     )
 
-    // The fill for masked-out score positions: the most negative finite value
-    // of the score dtype (the analogue of Python's `mx.finfo(dtype).min`), so
-    // masked positions contribute ~0 after softmax while an all-masked row
-    // still softmaxes to finite values instead of NaN. The previous
-    // `Float.leastNormalMagnitude` was a tiny *positive* value (~1e-38 ≈ 0.0),
-    // which does not suppress masked positions at all — and dominates the
-    // softmax whenever all true scores are negative.
-    func maskFill(for dtype: DType) -> MLXArray {
-        switch dtype {
-        case .float16:
-            return MLXArray(-65504.0).asType(.float16)
-        case .bfloat16:
-            // bfloat16's most negative finite value; casting Float32's
-            // -greatestFiniteMagnitude would round past it to -inf.
-            return MLXArray(-3.3895313892515355e38).asType(.bfloat16)
-        default:
-            return MLXArray(-Float.greatestFiniteMagnitude).asType(dtype)
-        }
-    }
-
     // Apply a boolean/additive mask, broadcasting batched masks over the GQA
     // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
     // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
@@ -2012,7 +1992,7 @@ public func quantizedScaledDotProductAttention(
             maskArray = expandedDimensions(maskArray, axis: -3)
         }
         if maskArray.dtype == .bool {
-            return MLX.where(maskArray, scores, maskFill(for: scores.dtype))
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
         } else {
             return scores + maskArray
         }
@@ -2026,7 +2006,7 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, maskFill(for: scores.dtype))
+        scores = MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
 
     case .array(let maskArray):
         scores = applyMask(maskArray, to: scores)
@@ -2056,6 +2036,22 @@ public func quantizedScaledDotProductAttention(
     }
 
     return output
+
+    // Apply a boolean/additive mask, broadcasting batched masks over the GQA
+    // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
+    // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
+    // 4-D mask needs an extra axis to line up `B` with the batch dimension.
+    func applyMask(_ maskArray: MLXArray, to scores: MLXArray) -> MLXArray {
+        var maskArray = maskArray
+        if nRepeats > 1 && maskArray.ndim == 4 {
+            maskArray = expandedDimensions(maskArray, axis: -3)
+        }
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+    }
 }
 
 // MARK: - Dynamic Cache Quantization
