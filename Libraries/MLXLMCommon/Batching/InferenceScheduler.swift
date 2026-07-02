@@ -209,6 +209,11 @@ extension InferenceScheduler {
         let writeBackToPromptCache: Bool
         let submitTime: TimeInterval
         let wiredMemoryTicket: WiredMemoryTicket?
+        /// Whether this request's input can be reproduced on the batch
+        /// engine (no explicit attention mask, single flat token row). A
+        /// masked single request must not upgrade: its prefill positions
+        /// came from the mask, which the engine's flat rows cannot carry.
+        let inputIsBatchable: Bool
     }
 }
 
@@ -400,6 +405,18 @@ extension InferenceScheduler {
         parameters.kvBits == nil && parameters.kvScheme == nil
             && parameters.maxKVSize == nil
     }
+
+    /// Whether a request's INPUT can run on the batch engine. The engine
+    /// consumes flat token rows; an explicit attention mask (a left-padded or
+    /// pre-batched `LMInput`) or a multi-row tensor would be silently dropped
+    /// by that flattening, prefilling different tokens/positions than the
+    /// single path (which honors the mask via `LMInput.Text.sequenceLengths`).
+    /// Such requests stay on the single path.
+    static func inputIsBatchable(_ input: LMInput) -> Bool {
+        guard input.text.mask == nil else { return false }
+        let tokens = input.text.tokens
+        return tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)
+    }
 }
 
 // MARK: - Public submit API
@@ -552,14 +569,17 @@ extension InferenceScheduler {
             try startSingle(scheduled)
 
         case .single(let single):
-            if !Self.parametersAreBatchable(scheduled.request.parameters) {
-                // The NEW request's parameters (kvBits / maxKVSize) cannot run
-                // on the shared engine; hold it behind the running single
-                // request and run it on its own iterator once the scheduler is
-                // idle again (drained by singleTaskFinished / batchLoopFinished).
+            if !Self.parametersAreBatchable(scheduled.request.parameters)
+                || !Self.inputIsBatchable(scheduled.request.input)
+            {
+                // The NEW request's parameters (kvBits / maxKVSize) or masked
+                // input cannot run on the shared engine; hold it behind the
+                // running single request and run it on its own iterator once
+                // the scheduler is idle again (drained by singleTaskFinished /
+                // batchLoopFinished).
                 queuedRequests.append(scheduled)
                 state = .pendingUpgrade(single)
-            } else if canUpgrade(parameters: single.parameters) {
+            } else if single.inputIsBatchable, canUpgrade(parameters: single.parameters) {
                 // The running request's caches can migrate single→batch; perform
                 // the handshake and join both into the batch.
                 await upgrade(from: single, joining: scheduled)
@@ -641,6 +661,10 @@ extension InferenceScheduler {
         let submitTime = Date.timeIntervalSinceReferenceDate
         let promptTokenCount = inputTokens.count
         let ticket = scheduled.request.wiredMemoryTicket
+        // Captured before the input is transferred into the iterator/task:
+        // gates the single->batch upgrade, since a masked input's prefill
+        // positions cannot be reproduced by the engine's flat token rows.
+        let batchableInput = Self.inputIsBatchable(scheduled.request.input)
 
         // Cross-request prompt-cache reuse: fetch the nearest cached prefix and
         // prefill only the remainder. The fetched cache is a deep copy owned by
@@ -735,7 +759,8 @@ extension InferenceScheduler {
             promptCacheSalt: salt,
             writeBackToPromptCache: writeBack,
             submitTime: submitTime,
-            wiredMemoryTicket: ticket
+            wiredMemoryTicket: ticket,
+            inputIsBatchable: batchableInput
         )
         state = .single(single)
     }
@@ -782,6 +807,10 @@ extension InferenceScheduler {
 
         var it = iterator
         var generated: [Int] = []
+        // When the first token came back from the iterator; splits the
+        // completion info into promptTime (queue + prefill) and
+        // generationTime (decode), matching EngineDriver.deliver.
+        var firstTokenAt: TimeInterval? = nil
         // The stop token that ended the loop, if any. Its forward pass already
         // ran (the step that returned it wrote its KV), so the prompt-cache
         // write-back key must include it even though it is never emitted.
@@ -816,6 +845,9 @@ extension InferenceScheduler {
 
                 guard let token = it.next() else {
                     break
+                }
+                if firstTokenAt == nil {
+                    firstTokenAt = Date.timeIntervalSinceReferenceDate
                 }
 
                 // Stop-token detection mirrors `runSynchronousGenerationLoop`:
@@ -871,11 +903,16 @@ extension InferenceScheduler {
 
         handler.processEndOfSequence()
         let now = Date.timeIntervalSinceReferenceDate
+        // Split at the first token, exactly like EngineDriver's completion
+        // info: promptTime covers queueing + prefill, generationTime covers
+        // decode only. The previous `now - submitTime` counted prefill in
+        // BOTH fields, deflating reported generation tokens/sec.
+        let firstToken = firstTokenAt ?? now
         let info = GenerateCompletionInfo(
             promptTokenCount: promptTokenCount,
             generationTokenCount: generated.count,
-            promptTime: it.promptPrefillTime,
-            generationTime: max(0, now - submitTime),
+            promptTime: max(0, firstToken - submitTime),
+            generationTime: max(0, now - firstToken),
             stopReason: resolvedReason
         )
         handler.yieldInfo(info)
@@ -997,11 +1034,14 @@ extension InferenceScheduler {
     /// decode loop is running. Used for 3rd+ concurrent requests and for the
     /// manual ``generateBatched(_:)`` path.
     private func admitToBatch(_ scheduled: sending ScheduledRequest) async {
-        // Topology-changing parameters (kvBits / maxKVSize) cannot run on the
-        // shared engine (see `parametersAreBatchable`). Hold such a request
-        // until the scheduler is idle again, then run it on its own single
-        // iterator — never silently drop its cache configuration.
-        guard Self.parametersAreBatchable(scheduled.request.parameters) else {
+        // Topology-changing parameters (kvBits / maxKVSize) and masked inputs
+        // (see `inputIsBatchable`) cannot run on the shared engine. Hold such
+        // a request until the scheduler is idle again, then run it on its own
+        // single iterator — never silently drop its cache configuration or
+        // attention mask.
+        guard Self.parametersAreBatchable(scheduled.request.parameters),
+            Self.inputIsBatchable(scheduled.request.input)
+        else {
             if case .idle = state {
                 startSingleIfIdle(scheduled)
             } else {
@@ -1349,12 +1389,15 @@ extension InferenceScheduler {
         // already produced, so the adopted row's budget counts it (numTokens =
         // liveTokenCount + 1) and it keeps the model's EOS stop matcher.
         //
-        // `tokens` is the FULL generated history *including* the seed
-        // (`liveCurrentToken`): `makeAdoptedBatch` drops the trailing seed and
-        // the batch's priming `step()` re-appends exactly that token, so the
-        // post-priming history equals the true sequence with no duplicate
-        // (parity with `PrefillBatch.generate`). Passing the generated-only
-        // list would make priming append the seed a second time.
+        // `tokens` is the FULL history -- prompt, generated tokens, and the
+        // seed (`liveCurrentToken`). The prompt prefix matters: the adopted
+        // row's penalty processor is seeded from this history, and the single
+        // iterator it replaces was seeded with the prompt before decoding, so
+        // omitting it would let post-handoff rows repeat prompt tokens still
+        // inside the penalty context window. `makeAdoptedBatch` drops the
+        // trailing seed and the batch's priming `step()` re-appends exactly
+        // that token, so the post-priming history equals the true sequence
+        // with no duplicate (parity with `PrefillBatch.generate`).
         await driver.adoptMigrated(
             seedToken: liveCurrentToken,
             caches: batchedCaches,
@@ -1363,7 +1406,7 @@ extension InferenceScheduler {
             stateMachine: stopMatcher,
             maxTokens: budgetLimit,
             numTokens: liveTokenCount + 1,
-            tokens: liveGeneratedTokenIds + [liveCurrentToken],
+            tokens: single.inputTokens + liveGeneratedTokenIds + [liveCurrentToken],
             record: firstRecord
         )
         // Carry the migrated request's wired-memory ticket onto the batch loop

@@ -251,6 +251,22 @@ actor EngineDriver {
         processorSource: RowProcessorSource?,
         stateMachine: StopSequenceMatcher?
     ) -> Int? {
+        // Parity with the single path for a zero token budget: TokenIterator
+        // produces no tokens and generateTask reports `.length`. The engine
+        // rejects nonpositive limits, and the generic catch below would close
+        // the stream with no completion info at all.
+        guard maxTokens > 0 else {
+            handler.yieldInfo(
+                GenerateCompletionInfo(
+                    promptTokenCount: request.inputTokens.count,
+                    generationTokenCount: 0,
+                    promptTime: 0,
+                    generationTime: 0,
+                    stopReason: .length
+                ))
+            handler.finish()
+            return nil
+        }
         let uids: [Int]
         do {
             uids = try engine.insert(
@@ -342,7 +358,13 @@ actor EngineDriver {
             numTokens: [numTokens],
             tokens: [tokens]
         )
-        guard let uid = uids.first else { return }
+        guard let uid = uids.first else {
+            // Unreachable today (makeAdoptedBatch allocates one uid per token
+            // row unconditionally), but if it ever fires the stream must be
+            // closed rather than left hanging for a caller awaiting tokens.
+            record.handler.finish()
+            return
+        }
         records[uid] = RequestRecord(
             handler: record.handler,
             cancelToken: record.cancelToken,
@@ -352,12 +374,13 @@ actor EngineDriver {
             promptCacheSalt: record.promptCacheSalt,
             submitTime: record.submitTime,
             writeBackToPromptCache: record.writeBackToPromptCache,
-            // Adopted rows carry generated-only history (the prompt was
-            // consumed by the single iterator's prefill); `makeAdoptedBatch`
-            // drops the trailing seed and priming re-appends it, so the row's
-            // `allTokens` is the full generated sequence but still excludes the
-            // prompt.
-            tokensIncludePrompt: false
+            // Adopted rows carry the FULL history (prompt + generated): the
+            // scheduler passes prompt-inclusive `tokens` so the row's penalty
+            // processor is seeded with the same context window the single
+            // iterator had (which seeded from the prompt before decoding).
+            // `makeAdoptedBatch` drops the trailing seed and priming
+            // re-appends it, so `allTokens` equals prompt + generated.
+            tokensIncludePrompt: true
         )
         engine.adoptActiveBatch(batch)
     }
@@ -430,15 +453,15 @@ actor EngineDriver {
         draining = true
         defer { draining = false }
 
-        // An explicit override wins; otherwise use the ticket captured from
-        // admitted requests so scheduler-driven drains keep the memory policy.
-        let ticketForLoop = wiredMemoryTicket ?? activeWiredMemoryTicket
-
         while true {
             admitWaitingIfPossible()
             if !engine.hasWork { break }
 
-            if let ticket = ticketForLoop {
+            // Re-read per step (not captured once before the loop): a
+            // ticketed request can join an already-running drain via
+            // `submit`, and its memory policy must govern the steps that
+            // decode it. An explicit override still wins for the whole loop.
+            if let ticket = wiredMemoryTicket ?? activeWiredMemoryTicket {
                 await stepOnceWired(ticket, onResult: onResult)
             } else {
                 stepOnce(onResult: onResult)
@@ -448,6 +471,10 @@ actor EngineDriver {
             // run between steps. Engine mutation stays serial.
             await Task.yield()
         }
+        // Drop the captured ticket once the batch is fully drained so a
+        // long-idle driver doesn't let a stale request's memory policy
+        // govern an unrelated future drain.
+        activeWiredMemoryTicket = nil
         return true
     }
 
