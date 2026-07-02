@@ -3,6 +3,8 @@
 **Date:** 2026-07-02 · **Scope:** PRs #18 (cb-1 caches), #19 (cb-2 engine), #20 (cb-3 prompt cache), #21 (cb-4 scheduler), #22 (cb-5 quantized), plus #17 (quantized-mask fix).
 **Method:** 73-agent multi-pass review of the *union tree* (main + all 5 PRs merged locally), with every new finding adversarially verified by an independent agent. 50 findings confirmed (17 major), 8 refuted, 15 pre-existing review-thread items verified still open. Reviewed on Linux (no Metal) — code-level review, not a runtime gate.
 
+> **Update (2026-07-02, decisions applied):** this branch (`claude/continuous-batching-pr-review-2w9fl3`) is now the **integration branch**: the full cb-1…cb-5 union plus three decided changes — (1) **ChatSession reverted to single-request** (no scheduler awareness; batching is reached via `ModelContainer.generate`/`generateBatched` only), which deletes the region-isolation compile failure and the open tool-call/speculative/kvcache-restore ChatSession threads outright; (2) **prompt-cache disk persistence removed** from the library (storage policy is app-level; annotated reference copy in `reviews/reference/`); (3) **the CI test filter fixed** to name real suite types and run all 19 batching suites. Sections marked ~~struck~~ or annotated "(mooted)" below reflect these decisions.
+
 ---
 
 ## 1. Verdict
@@ -80,23 +82,29 @@ let container = ModelContainer(context: context,
                                scheduler: scheduler,      // nil = historical path, byte-for-byte
                                promptCache: promptCache)  // REQUIRED for multi-turn perf (§5, M-9)
 
-// 2. Fire N concurrent chats. First runs single-stream; second triggers
-//    auto-upgrade; the rest join the batch. Consumers can't tell the difference.
+// 2. Fire N concurrent requests (e.g. one per HTTP connection). First runs
+//    single-stream; second triggers auto-upgrade; the rest join the batch.
+//    Consumers can't tell the difference. A server keeps conversation state
+//    per client and re-prepares the full message history each turn — the
+//    prompt cache makes the shared prefix cheap.
 await withTaskGroup(of: Void.self) { group in
-    for prompt in incomingPrompts {
+    for request in incomingRequests {
         group.addTask {
-            let session = ChatSession(container)
-            for try await chunk in session.streamResponse(to: prompt) { await respond(chunk) }
+            let lmInput = try await context.processor.prepare(
+                input: UserInput(chat: request.messages))
+            let stream = try await container.generate(input: lmInput,
+                parameters: GenerateParameters(maxTokens: 512, temperature: 0.7))
+            for await event in stream {
+                if let text = event.chunk { await respond(request, text) }
+            }
         }
     }
 }
+// (ChatSession is deliberately single-request-only — decision 2026-07-02: it
+//  keeps its per-session [KVCache] and never routes through the scheduler.
+//  Used alongside a scheduler container it runs unmanaged, same as pre-stack.)
 
-// 2b. Or raw, with prepared inputs:
-let stream = try await container.generate(input: lmInput,
-    parameters: GenerateParameters(maxTokens: 512, temperature: 0.7))
-for await event in stream { if let text = event.chunk { print(text, terminator: "") } }
-
-// 2c. Or an explicit batch:
+// 2b. Or an explicit batch:
 let streams = try await container.generateBatched(
     inputs.map { GenerationRequest(input: $0, parameters: .init(maxTokens: 256)) })
 
@@ -142,15 +150,15 @@ All 50 are in Appendix A with failure scenarios; the 17 major ones:
 - **M-8** `InferenceScheduler.swift:373` — `parametersAreBatchable` screens `kvBits` but not `kvScheme`: a running `kvScheme` request is **truncated mid-generation** at upgrade (failed migration → premature `.length`), and admitted ones silently lose KV quantization.
 
 **High-level API behavior:**
-- **M-9** `ModelContainer.swift:90` — scheduler **without** a `promptCache` (the default!) silently turns every multi-turn `ChatSession` into full-history re-prefill per turn — a large latency regression from enabling a feature marketed as zero-cost.
+- **M-9** `ModelContainer.swift:90` — *(mooted 2026-07-02: ChatSession no longer routes through the scheduler)* scheduler **without** a `promptCache` silently turned every multi-turn `ChatSession` into full-history re-prefill per turn. The general point survives for server callers: without a container `promptCache`, concurrent multi-turn traffic re-prefills fully.
 - **M-10** `GenerationRequest.swift:35` — the public `promptCache` field is **never used as a cache**, only as a write-back boolean; per-request caches are silently ignored (open thread, confirmed).
-- **M-11/12** `LRUPromptCache.swift:321/237` — cache namespace ignores topology (`maxKVSize` requests can fetch unbounded caches and vice-versa — attention semantics silently change), and fetch/save run **full GPU deep-copies + eval while holding the unfair lock**, stalling every concurrent request.
+- **M-11/12** `LRUPromptCache.swift:321/237` — cache namespace ignores topology (`maxKVSize` requests can fetch unbounded caches and vice-versa — attention semantics silently change), and the fetch path runs **full GPU deep-copies + eval while holding the unfair lock**, stalling every concurrent request. *(M-12's save-path half mooted 2026-07-02 — disk persistence removed; the fetch-path half still needs fixing.)*
 
 **Model-level batching hazards (admitted by the factory, unsafe when ragged):**
 - **M-13** `Mistral3Text.swift:229` — llama-4 attention scaling reads scalar `cache[0].offset` (padded max width): short rows get the long row's positional scaling on every layer.
 - **M-14** `Gemma3nText.swift:594` — sliding-window layers re-slice the batch mask with a scalar window-capped offset; past the window the mask is displaced (one gather index OOB) → wrong KV slots.
 - **M-15** `BatchQuantizedKVCache.swift:279` — `trim()` missed the min-live-row clamp its siblings got in cb-1 (`34ca30a`) — direct evidence of the stack-skew problem in §2.
-- Plus **15 pre-existing thread items verified still open** (Appendix B), led by the two critical `ChatSession` ones: the compile failure, and the tool-call restart that **replaces the whole conversation with just the tool result** on the scheduler path (total context loss; the non-scheduler path is unaffected because its KV cache carries the context).
+- Plus **15 pre-existing thread items verified still open** (Appendix B). *(Update 2026-07-02: the two critical `ChatSession` items — the region-isolation compile failure and the tool-call restart context wipe — plus the speculative-decoding and restored-kvcache threads are **mooted by the ChatSession revert**; the code no longer exists. The stop-string loss (M-3) is a `SchedulerTokenHandler` issue and remains live for the server path.)*
 
 **What held up:** the core cache mathematics. Agents hand-recomputed left-padding/rotation/extract arithmetic across the `{rotated}×{over-window}×{ragged}×{prefill/decode}` matrix and confirmed all 11 cb-1 fix commits are correct; 8 plausible-sounding claims (e.g. SSM double-advance, `fromSingle` keep>0 bypass, legacy-mask nil for t==1 in reachable models) were **refuted** with line-level evidence (Appendix C).
 
@@ -182,7 +190,7 @@ The holes are exactly where the compiler can't see: **actor reentrancy** (M-5/6/
 ≈1,500–1,700 LOC (~20%) is speculative or dead in-tree:
 
 - **`BatchQuantizedKVCache` (604 LOC)** — unreachable through every integrated path (no `newCache` returns a `QuantizedKVCache` probe; scheduler rejects `kvBits`; engine always built with `cacheParameters: nil`). Defer; keep the SDPA mask fix.
-- **`LRUPromptCache` disk persistence (~390 LOC)** + checkpoint dual-LRU (~40) — a whole crash-safe storage subsystem with no in-repo caller. Split out.
+- **`LRUPromptCache` disk persistence (~390 LOC)** + checkpoint dual-LRU (~40) — a whole crash-safe storage subsystem with no in-repo caller. *(✅ Done 2026-07-02: removed from the library; storage policy is app-level. Annotated reference copy with the six known issues: `reviews/reference/LRUPromptCache+DiskPersistence.reference.swift.txt`.)*
 - **Request-carrier proliferation**: 7 structs for one logical request (`GenerationRequest → ScheduledRequest → SingleRequest → SchedulerRequest → PendingSubmission → RequestRecord/AdoptedRecord`); folding `EngineDriver` into the scheduler (or making it a non-actor helper) deletes ~350–450 LOC and 3 concepts.
 - **Dead/degenerate machinery**: multi-state `StopSequenceMatcher` DFA used only for single-token EOS; unused `rawToken` handler mode; `PrefillBatch.extend` whose precondition makes it uncallable; dead `mismatchedRequestCounts` case; dormant `cachedKVState` fields; `.pendingUpgrade` + queue machinery that could be "run non-batchable requests concurrently" (~120 LOC).
 - **Public-surface overcommitment**: `DecodeBatch`/`PrefillBatch`/`adoptActiveBatch`/`FinishedRowCache` all `public` — lock internal seams down (or `@_spi`) before someone builds on them.
@@ -231,6 +239,8 @@ Honest summary vs. your requirement: **2 of 7 variants batch in practice** (cove
 
 *(This assumes keeping the current five PRs. §13 proposes re-cutting the stack for upstream reviewability — if you take that route, steps 3–7 below map onto the new chain instead.)*
 
+*(Update 2026-07-02: step 1 is **done** — this branch is the integration branch, the CI filter is fixed, and `ChatSession.swift:660` is resolved by reverting ChatSession to single-request rather than fixing the pattern. Step 5's "slim PR #20" is also done here. The ChatSession items in step 6 are mooted.)*
+
 1. **Unblock the process** (§2): rebase the stack onto cb-1's tip (or push the union as the integration branch), fix the CI `-only-testing` filter + add the engine/scheduler/prompt-cache suites, fix `ChatSession.swift:660`.
 2. **Merge #17** (or upstream's fix) standalone.
 3. **Land PR #18** after the two open items (serialization registration can also be documented-as-unsupported for now).
@@ -265,9 +275,10 @@ Same layers, re-cut so every PR is linear (based on the previous PR's tip), comp
 | 3 | Rotating cache | `BatchRotatingKVCache` + factory branch + tests | ~1,300 | The gnarliest math gets a PR where it is the *only* thing under review |
 | 4 | Engine | `PrefillBatch`/`DecodeBatch`/`RowSamplers`/`StopSequenceMatcher` + `BatchGenerationEngine` + `BatchModelRegressionTests` | ~1,800 | Split again into 4a (batch structs) / 4b (engine) if <1k units are wanted; parity fixes M-1..M-4 land here |
 | 5 | Scheduler | `InferenceScheduler` + `EngineDriver` + `ModelContainer.generate` routing — **no ChatSession** | ~1,500–2,000 | Reentrancy hardening (M-5..M-8) lands here; first PR where auto-upgrade is end-to-end testable |
-| 6 | ChatSession integration | Scheduler path, tool calls, history cache | ~500 | Isolates the region-isolation compile fix and the tool-restart context-loss bug |
-| 7 | Prompt cache (in-memory) | `LRUPromptCache` (no disk), `PromptCaching`, single-path fetch/write-back | ~600 | M-11/M-12 fixed here |
-| 8+ | Deferred | Disk persistence; `BatchQuantizedKVCache` (with the trim clamp); batched-path prompt-cache fetch; SSM enablement | — | Each opened only once it has a reachable consumer |
+| 6 | Prompt cache (in-memory) | `LRUPromptCache` (no disk), `PromptCaching`, single-path fetch/write-back | ~600 | M-11 + M-12's fetch half fixed here |
+| 7+ | Deferred | `BatchQuantizedKVCache` (with the trim clamp); batched-path prompt-cache fetch; SSM enablement; a ChatSession batching adapter *if ever wanted* | — | Each opened only once it has a reachable consumer |
+
+*(Update 2026-07-02: the former "PR 6 — ChatSession integration" is deleted from the chain: ChatSession stays single-request by decision, which removes the compile failure and four open threads with it. Disk persistence moved from "deferred PR" to "app-level, out of the library" — reference copy in `reviews/reference/`.)*
 
 ### Two mechanical rules that restore reviewability
 
@@ -277,6 +288,8 @@ Same layers, re-cut so every PR is linear (based on the previous PR's tip), comp
 ### Cheapest migration from the current stack
 
 The union of all five branches merges with only trivial conflicts and no semantic mis-merges (verified hunk-by-hunk, §2-1). So: push the union as an integration branch to get one honest compile/CI signal, then re-cut the linear chain from it with `git` surgery (mostly `git checkout <union> -- <paths>` per layer plus extracting PR 0b) — no code rewriting required.
+
+**Status 2026-07-02: step one is done.** `claude/continuous-batching-pr-review-2w9fl3` *is* the integration branch: union + ChatSession revert + persistence removal + fixed CI filter, pushed with the macOS workflow running all 19 batching suites. Re-cut the chain from this branch, not from the old cb-* branches (they lack the decisions and cb-1's tip fixes).
 
 ---
 
