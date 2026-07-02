@@ -282,9 +282,10 @@ public final class DecodeBatch {
         stateMachines = keep.map { stateMachines[$0] }
         matcherStates = keep.map { matcherStates[$0] }
         numTokens = keep.map { numTokens[$0] }
-        if !keep.isEmpty {
-            nextTokens = take(nextTokens, keepArr, axis: 0)
-        }
+        // Unconditional so an emptied batch does not retain stale rows in
+        // `nextTokens` while every sibling array is empty (`take` with zero
+        // indices yields the matching zero-row array).
+        nextTokens = take(nextTokens, keepArr, axis: 0)
     }
 
     /// In-place: append `other`'s rows to this batch. Per-layer caches are
@@ -299,7 +300,14 @@ public final class DecodeBatch {
         }
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
-        samplers.append(contentsOf: other.samplers)
+        if other.fallbackIsGreedy != fallbackIsGreedy {
+            // The merged batch keeps `self`'s fallback, so materialize
+            // `other`'s (different) fallback into its nil sampler slots --
+            // otherwise those rows would silently switch sampling behavior.
+            samplers.append(contentsOf: other.samplers.map { $0 ?? other.fallbackSampler })
+        } else {
+            samplers.append(contentsOf: other.samplers)
+        }
         processors.append(contentsOf: other.processors)
         maxTokens.append(contentsOf: other.maxTokens)
         stateMachines.append(contentsOf: other.stateMachines)
@@ -352,6 +360,9 @@ public final class DecodeBatch {
             // `argMax` fast path below is order-preserving and needs no cast.
             let sampleLogits =
                 stepLogits.dtype == .bfloat16 ? stepLogits.asType(.float32) : stepLogits
+            // Shared logprobs for penalty-free rows. Rows with a processor
+            // compute their own from the *processed* logits below; MLX is
+            // lazy, so this node costs nothing if no row slices it.
             let logprobs = sampleLogits - logSumExp(sampleLogits, axis: -1, keepDims: true)
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
@@ -366,10 +377,20 @@ public final class DecodeBatch {
                 // path's `process -> sample -> didSample` invariant. These are
                 // GPU-only mask writes (see `TokenRing`), so they don't force a
                 // CPU sync and preserve `asyncEval` pipelining.
-                var rowLogprobs = logprobs[i ..< (i + 1), 0...]
+                let rowLogprobs: MLXArray
                 if processors[i] != nil {
                     processors[i]?.didSample(token: currentTokens[i ..< (i + 1)])
-                    rowLogprobs = processors[i]?.process(logits: rowLogprobs) ?? rowLogprobs
+                    // Penalties must see RAW logits: the single path applies
+                    // `process()` before `logSoftmax`, and `RepetitionContext`
+                    // branches on the logit sign (divide positive, multiply
+                    // negative) -- on logprobs (all <= 0) every repeated token
+                    // would be scaled the wrong way. Normalize per row after
+                    // processing so the sampler still receives logprobs.
+                    var rowLogits = sampleLogits[i ..< (i + 1), 0...]
+                    rowLogits = processors[i]?.process(logits: rowLogits) ?? rowLogits
+                    rowLogprobs = rowLogits - logSumExp(rowLogits, axis: -1, keepDims: true)
+                } else {
+                    rowLogprobs = logprobs[i ..< (i + 1), 0...]
                 }
                 let sampler = samplers[i] ?? fallbackSampler
                 samples.append(sampler(rowLogprobs))

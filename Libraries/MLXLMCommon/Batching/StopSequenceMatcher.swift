@@ -121,22 +121,45 @@ public struct StopSequenceMatcher: Sendable {
             return (state, nil, state.currentState)
         }
 
+        func fire(_ transition: StopSequenceTrieNode.Transition) -> (
+            next: StopSequenceMatcherState,
+            matchedSequence: [Int]?,
+            currentState: String?
+        ) {
+            let nextState = transition.next
+            let nextNode = nextState.flatMap { state.allStates[$0] }
+            return (
+                StopSequenceMatcherState(
+                    currentState: nextState,
+                    trieNode: nextNode,
+                    allStates: state.allStates,
+                    pendingMatch: []
+                ),
+                transition.matchedSequence,
+                nextState
+            )
+        }
+
         var candidate = state.pendingMatch + [token]
         while !candidate.isEmpty {
             if let child = Self.findPrefix(candidate, in: root) {
                 if let transition = child.transition {
-                    let nextState = transition.next
-                    let nextNode = nextState.flatMap { state.allStates[$0] }
-                    return (
-                        StopSequenceMatcherState(
-                            currentState: nextState,
-                            trieNode: nextNode,
-                            allStates: state.allStates,
-                            pendingMatch: []
-                        ),
-                        transition.matchedSequence,
-                        nextState
-                    )
+                    return fire(transition)
+                }
+                // The full candidate is a viable (non-terminal) prefix, but a
+                // SHORTER stop may have just completed at this token and would
+                // otherwise be shadowed by the longer partial match forever
+                // (e.g. stops [[1,2,3],[2]] fed 1,2: pending [1,2] hides the
+                // completed [2]). Scan proper suffixes for a terminal hit
+                // before committing to the longer pending match.
+                var suffix = Array(candidate.dropFirst())
+                while !suffix.isEmpty {
+                    if let node = Self.findPrefix(suffix, in: root),
+                        let transition = node.transition
+                    {
+                        return fire(transition)
+                    }
+                    suffix.removeFirst()
                 }
                 return (
                     StopSequenceMatcherState(

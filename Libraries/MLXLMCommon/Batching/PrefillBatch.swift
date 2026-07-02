@@ -150,9 +150,11 @@ public final class PrefillBatch {
                 chunk,
                 cache: promptCache.map { $0 as any KVCache }
             )
-            for cache in promptCache {
-                eval(cache.innerState())
-            }
+            // One combined eval per chunk (not per cache): each cache's
+            // state is independent, and a single eval turns L GPU sync
+            // points into 1 -- mirroring the single path's `eval(cache)`
+            // over the whole layer array.
+            eval(promptCache.flatMap { $0.innerState() })
             for cache in promptCache {
                 cache.advanceBatched(n)
             }
@@ -163,10 +165,12 @@ public final class PrefillBatch {
         }
 
         if maxPadding > 0 {
+            // Queue every cache's (lazy) roll first, then force them all
+            // with one combined eval instead of one sync per cache.
             for cache in promptCache {
                 cache.finalizeBatched()
-                eval(cache.innerState())
             }
+            eval(promptCache.flatMap { $0.innerState() })
         }
     }
 

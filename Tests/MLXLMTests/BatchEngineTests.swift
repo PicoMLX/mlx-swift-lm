@@ -55,6 +55,54 @@ struct StopSequenceMatcherTests {
         #expect(result.matchedSequence == [1, 2])
         #expect(result.currentState == nil)
     }
+
+    @Test("A shorter stop completing inside a longer partial match still fires")
+    func shorterStopInsideLongerPartialMatch() {
+        // Stops [1,2,3] and [2]: after tokens 1,2 the matcher holds the
+        // viable prefix [1,2] of the longer stop -- but [2] has completed
+        // and must fire (it would otherwise be shadowed forever).
+        let machine = StopSequenceMatcher(
+            states: [
+                "normal": [
+                    (sequence: [1, 2, 3], next: nil),
+                    (sequence: [2], next: nil),
+                ]
+            ]
+        )
+        var state = machine.makeState()
+
+        var result = machine.match(state, 1)
+        #expect(result.matchedSequence == nil)
+        state = result.next
+
+        result = machine.match(state, 2)
+        #expect(result.matchedSequence == [2])
+        #expect(result.currentState == nil)
+    }
+
+    @Test("Longer stop still wins when no shorter stop completes")
+    func longerStopUnaffectedBySuffixScan() {
+        // Stops [1,2] and [2,3]: feeding 1,2 must fire [1,2] (a completed
+        // longer match beats a live shorter prefix), and the suffix scan
+        // must not misfire [2,3] on its non-terminal prefix.
+        let machine = StopSequenceMatcher(
+            states: [
+                "normal": [
+                    (sequence: [1, 2], next: nil),
+                    (sequence: [2, 3], next: nil),
+                ]
+            ]
+        )
+        var state = machine.makeState()
+
+        var result = machine.match(state, 1)
+        #expect(result.matchedSequence == nil)
+        state = result.next
+
+        result = machine.match(state, 2)
+        #expect(result.matchedSequence == [1, 2])
+        #expect(result.currentState == nil)
+    }
 }
 
 // MARK: - Row samplers
@@ -318,6 +366,35 @@ struct BatchGenerationEnginePullLoopTests {
 
         #expect(finishedUIDs == [0, 1])
     }
+
+    @Test("Penalty processors receive raw logits, not logprobs")
+    func processorsReceiveRawLogits() throws {
+        // The single `TokenIterator` applies `LogitProcessor.process` to raw
+        // logits before logSoftmax; `RepetitionContext` branches on the logit
+        // sign, so feeding it logprobs (all <= 0) penalizes repeated
+        // positive-logit tokens the wrong way. The fixture model emits a +4
+        // peak: if the processor sees a max > 1 it received raw logits, while
+        // logprobs would cap every value at <= 0.
+        let model = PositiveLogitsLanguageModel()
+        let capture = LogitCapture()
+        let factories = try makeBatchedCacheFactories(
+            for: model.newCache(parameters: nil))
+        let caches = factories.map { $0([0]) }
+
+        let batch = DecodeBatch(
+            model: model,
+            uids: [0],
+            seedTokens: MLXArray([Int32(1)]),
+            promptCache: caches,
+            tokens: [[1]],
+            maxTokens: [4],
+            processors: [CapturingProcessor(capture: capture)]
+        )
+        _ = batch.next()
+
+        #expect(!capture.maxima.isEmpty)
+        #expect(capture.maxima.allSatisfy { $0 > 1 })
+    }
 }
 
 // MARK: - Test models & helpers
@@ -388,6 +465,67 @@ private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDim
 
         return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
     }
+}
+
+/// Like ``IncrementingLanguageModel`` but with a +4 peak logit (and -10
+/// elsewhere), so tests can distinguish raw logits from logprobs (which are
+/// always <= 0) at the `LogitProcessor` boundary.
+private final class PositiveLogitsLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let vocabularySize = 16
+    var kvHeads: [Int] { [1] }
+
+    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        let batchSize = inputs.dim(0)
+        let sequenceLength = inputs.dim(1)
+
+        if let cache {
+            let keys = MLXArray.ones([batchSize, 1, sequenceLength, 1], dtype: .float32)
+            let values = keys * 2
+            for layerCache in cache {
+                _ = layerCache.update(keys: keys, values: values)
+            }
+        }
+
+        let inputTokens = inputs.asArray(UInt32.self).map { Int($0) }
+        var logits = Array(
+            repeating: Float(-10),
+            count: batchSize * sequenceLength * vocabularySize
+        )
+
+        for batchIndex in 0 ..< batchSize {
+            for tokenIndex in 0 ..< sequenceLength {
+                let inputIndex = batchIndex * sequenceLength + tokenIndex
+                let nextToken = (inputTokens[inputIndex] + 1) % vocabularySize
+                let logitIndex =
+                    (batchIndex * sequenceLength + tokenIndex) * vocabularySize + nextToken
+                logits[logitIndex] = 4
+            }
+        }
+
+        return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
+    }
+}
+
+/// Reference sink for ``CapturingProcessor`` (the processor itself must be a
+/// value type per ``LogitProcessor``'s mutating requirements).
+private final class LogitCapture {
+    var maxima: [Float] = []
+}
+
+/// Records the maximum value of every logit array it is asked to process,
+/// passing the logits through unchanged.
+private struct CapturingProcessor: LogitProcessor {
+    let capture: LogitCapture
+    mutating func prompt(_ prompt: MLXArray) {}
+    func process(logits: MLXArray) -> MLXArray {
+        capture.maxima.append(logits.max().item(Float.self))
+        return logits
+    }
+    mutating func didSample(token: MLXArray) {}
 }
 
 private final class CacheTopologyLanguageModel: Module, LanguageModel {

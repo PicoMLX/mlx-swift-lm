@@ -382,7 +382,11 @@ public final class BatchGenerationEngine {
             processors: processorSources.map { sources in
                 sources.map { $0?() }
             },
-            stateMachines: stateMachines,
+            // Default to the engine's EOS matcher, matching rows admitted
+            // through `insert` -- a nil parameter would otherwise install a
+            // never-matching matcher and adopted rows would ignore EOS.
+            stateMachines: stateMachines
+                ?? Array(repeating: defaultStateMachine, count: tokens.count),
             numTokens: numTokens
         )
         return (batch, uids)
