@@ -174,6 +174,12 @@ open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
+    /// Declared as an overridable class member (not only via the `KVCache`
+    /// extension default) so batched subclasses can override it and have the
+    /// override dispatched through the `KVCache` witness table — otherwise a
+    /// batched cache used as `KVCache` would fall back to the scalar offset.
+    open var ropeOffset: RoPEOffset { .scalar(offset) }
+
     public func innerState() -> [MLXArray] { [] }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -235,7 +241,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -250,6 +257,13 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Mask out left-padded positions per sequence (continuous batching):
+    // row `b` may attend only to positions `>= leftPadding[b]`.
+    if let leftPadding {
+        let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= lp)
     }
 
     return mask
@@ -288,11 +302,20 @@ public func makeAttentionMask(
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let t = h.dim(1)
     if t > 1 {
-        var offset = 0
         if let c = cache?.first {
-            offset = c.offset
+            // Batched caches carry per-row left padding (and prepared lengths) that
+            // a plain causal mask ignores; route through the cache's own mask so
+            // models using this legacy array overload (e.g. Gemma2) don't attend to
+            // padded KV slots under continuous batching. Single (non-batched) caches
+            // keep the original causal-mask path unchanged.
+            if c is BatchPositionedKVCache,
+                case .array(let m) = c.makeMask(n: t, windowSize: c.maxSize, returnArray: true)
+            {
+                return m
+            }
+            return createCausalMask(n: t, offset: c.offset)
         }
-        return createCausalMask(n: t, offset: offset)
+        return createCausalMask(n: t, offset: 0)
     }
     return nil
 }
@@ -797,7 +820,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
-private func resolvedKVQuantizationGroupSize(
+internal func resolvedKVQuantizationGroupSize(
     requested: Int,
     keyHeadDim: Int,
     valueHeadDim: Int
@@ -1294,6 +1317,29 @@ public class ArraysCache: BaseKVCache {
         leftPadding = nil
     }
 
+    /// Allocate an empty single-row cache of this concrete type for ``extract(_:)``.
+    ///
+    /// Subclasses (e.g. ``MambaCache``) override this so an extracted row keeps its
+    /// concrete type and `cache as? MambaCache` downcasts in hybrid/SSM model blocks
+    /// still succeed.
+    func makeEmptyExtractedRow() -> ArraysCache {
+        ArraysCache(size: cache.count)
+    }
+
+    /// Extract one row as its own single-row cache.
+    ///
+    /// The concrete subtype is preserved via ``makeEmptyExtractedRow()`` so a
+    /// ``MambaCache`` row stays a ``MambaCache`` — otherwise its recurrent/conv
+    /// state would be silently ignored once the row leaves the batch.
+    public func extract(_ idx: Int) -> ArraysCache {
+        let extracted = makeEmptyExtractedRow()
+        extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        extracted.offset = offset
+        extracted.leftPadding = leftPadding?[idx ..< (idx + 1)]
+        extracted.lengths = lengths?[idx ..< (idx + 1)]
+        return extracted
+    }
+
     public func advance(_ N: Int) {
         if let currentLengths = lengths {
             lengths = currentLengths - N
@@ -1323,16 +1369,25 @@ public class ArraysCache: BaseKVCache {
 
     internal var slotCount: Int { cache.count }
 
-    /// Create attention mask based on left padding or prepared sequence lengths
+    /// Create attention mask from left padding and/or prepared sequence lengths.
+    ///
+    /// Both are independent constraints: `leftPadding` hides leading pad
+    /// (`position >= leftPadding`) and a prepared `lengths` hides trailing
+    /// right-pad during ragged cached-prompt prefill (`position < lengths`). When
+    /// both are set they are AND-ed. Previously `leftPadding` short-circuited and a
+    /// prepared `lengths` was ignored, leaving right-padded suffix tokens visible
+    /// (with `[0, 0]` left padding the mask admitted every position).
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
+        var mask: MLXArray? = nil
         if let leftPadding {
-            return positions .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
-            return positions .< lengths[0..., .newAxis]
-        } else {
-            return nil
+            mask = positions .>= leftPadding[0..., .newAxis]
         }
+        if let lengths {
+            let rightMask = positions .< lengths[0..., .newAxis]
+            mask = mask.map { $0 & rightMask } ?? rightMask
+        }
+        return mask
     }
 
     // MARK: - Serialization
@@ -1399,6 +1454,10 @@ public class ArraysCache: BaseKVCache {
 public class MambaCache: ArraysCache {
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    override func makeEmptyExtractedRow() -> ArraysCache {
+        MambaCache()
     }
 
     public override func copy() -> any KVCache {
@@ -1923,6 +1982,42 @@ public func quantizedScaledDotProductAttention(
         mode: mode
     )
 
+    // The fill for masked-out score positions: the most negative finite value
+    // of the score dtype (the analogue of Python's `mx.finfo(dtype).min`), so
+    // masked positions contribute ~0 after softmax while an all-masked row
+    // still softmaxes to finite values instead of NaN. The previous
+    // `Float.leastNormalMagnitude` was a tiny *positive* value (~1e-38 ≈ 0.0),
+    // which does not suppress masked positions at all — and dominates the
+    // softmax whenever all true scores are negative.
+    func maskFill(for dtype: DType) -> MLXArray {
+        switch dtype {
+        case .float16:
+            return MLXArray(-65504.0).asType(.float16)
+        case .bfloat16:
+            // bfloat16's most negative finite value; casting Float32's
+            // -greatestFiniteMagnitude would round past it to -inf.
+            return MLXArray(-3.3895313892515355e38).asType(.bfloat16)
+        default:
+            return MLXArray(-Float.greatestFiniteMagnitude).asType(dtype)
+        }
+    }
+
+    // Apply a boolean/additive mask, broadcasting batched masks over the GQA
+    // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
+    // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
+    // 4-D mask needs an extra axis to line up `B` with the batch dimension.
+    func applyMask(_ maskArray: MLXArray, to scores: MLXArray) -> MLXArray {
+        var maskArray = maskArray
+        if nRepeats > 1 && maskArray.ndim == 4 {
+            maskArray = expandedDimensions(maskArray, axis: -3)
+        }
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+    }
+
     // Apply mask
     switch mask {
     case .causal:
@@ -1931,23 +2026,15 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        scores = MLX.where(causalMask, scores, maskFill(for: scores.dtype))
 
     case .array(let maskArray):
-        if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-        } else {
-            scores = scores + maskArray
-        }
+        scores = applyMask(maskArray, to: scores)
 
     case .arrays(let maskArrays):
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
-            if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else {
-                scores = scores + maskArray
-            }
+            scores = applyMask(maskArray, to: scores)
         }
 
     case .none:

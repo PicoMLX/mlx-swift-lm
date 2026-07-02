@@ -1,0 +1,71 @@
+name: Swift Build (fork)
+
+# Fork-only CI: builds the package, compiles the tests, and runs the batched-cache
+# unit tests (which need no model downloads) on every pushed commit. The macos-15
+# hosted runner has a Metal GPU, so these exercise real MLX kernels — the parity
+# gate the Linux authoring environment can't provide.
+#
+# This is intentionally a SEPARATE file from pull_request.yml (the workflow shared
+# with upstream ml-explore) for two reasons:
+#   1. Syncing from upstream never produces a merge conflict on this file.
+#   2. The job is gated to this fork via `if: github.repository == ...`, mirroring
+#      how upstream's jobs are gated to ml-explore. If this file ever reaches the
+#      upstream repo, the job is simply skipped there -- it can never run or
+#      interfere upstream.
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+# Cancel an in-progress build for a branch when a newer commit is pushed to it,
+# so rapid pushes don't pile up (macOS runner minutes are billed at 10x).
+concurrency:
+  group: swift-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Fork-only. Never runs on upstream ml-explore (kept inert if it lands there).
+    if: github.repository == 'PicoMLX/mlx-swift-lm'
+    # macOS 15 (Sequoia) hosted runner: provides Xcode + the Metal toolchain
+    # needed to produce the Metal library that `swift build` alone cannot. Unlike
+    # the macos-14 image (which tops out at Xcode 15.4 / Swift 5.10), it can run
+    # Xcode 16.3+ for the Swift 6.1 toolchain that Package.swift requires.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Package.swift declares swift-tools-version 6.1, so select the newest
+      # stable Xcode on the image (Swift 6.1+). Without this, package resolution
+      # fails: "using Swift tools version 6.1.0 but the installed version is 5.10.0".
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build for testing (Xcode, macOS)
+        run: |
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+
+      # Run only the batched-cache suite: it is self-contained (no model downloads)
+      # and exercises the Metal kernels that back rotation/extract/merge/finalize —
+      # the numerical paths that can't be verified in the Linux authoring env.
+      # Broader model-parity tests (PR2+) need the hosted-runner model-cache setup
+      # and are added with those PRs.
+      - name: Run batched-cache tests (Xcode, macOS)
+        run: |
+          xcodebuild test-without-building \
+            -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -only-testing:MLXLMTests/BatchCacheTests \
+            -only-testing:MLXLMTests/BatchQuantizedKVCacheTests \
+            -only-testing:MLXLMTests/QuantizedAttentionMaskTests
