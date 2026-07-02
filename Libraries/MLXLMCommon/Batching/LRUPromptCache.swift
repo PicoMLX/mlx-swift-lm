@@ -298,7 +298,15 @@ public final class LRUPromptCache: PromptCaching {
     }
 
     public static func isCacheCompatible(_ cache: [KVCache]) -> Bool {
-        !cache.isEmpty && cache.allSatisfy { $0 is KVCacheSimple || $0 is RotatingKVCache }
+        // Exact dynamic types on purpose: `ChunkedKVCache` subclasses
+        // `KVCacheSimple` but keeps an absolute offset over a front-trimmed
+        // buffer, which `materializedCopy`'s metaState write-back rejects
+        // with a fatal error. Match `InferenceScheduler.migrateCaches`.
+        !cache.isEmpty
+            && cache.allSatisfy {
+                Swift.type(of: $0) == KVCacheSimple.self
+                    || Swift.type(of: $0) == RotatingKVCache.self
+            }
     }
 
     static func canUsePromptCache(
@@ -307,7 +315,7 @@ public final class LRUPromptCache: PromptCaching {
         model: any LanguageModel
     ) -> Bool {
         guard input.image == nil, input.video == nil, input.audio == nil else { return false }
-        guard parameters.kvBits == nil else { return false }
+        guard parameters.kvBits == nil, parameters.kvScheme == nil else { return false }
         guard model.defaultPromptCachePolicy == .exact else { return false }
         return isCacheCompatible(model.newCache(parameters: parameters))
     }

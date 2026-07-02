@@ -266,8 +266,17 @@ public final class ModelContainer: Sendable {
     /// The context is transferred to the scheduler in a `SendableBox` — the
     /// repo's existing non-`Sendable` hand-off box; no new `@unchecked` is
     /// introduced. The scheduler shares the (already-evaluated) model weights.
-    private func attachSchedulerIfNeeded(_ scheduler: InferenceScheduler) async {
-        if await scheduler.isAttached { return }
+    private func attachSchedulerIfNeeded(_ scheduler: InferenceScheduler) async throws {
+        let owner = ObjectIdentifier(self)
+        if let current = await scheduler.currentOwner {
+            // Attached: fine if it is us, an error if the scheduler already
+            // drives another container (its requests would silently generate
+            // with the first container's model).
+            guard current == owner else {
+                throw BatchedGenerationError.schedulerAlreadyAttached
+            }
+            return
+        }
         let cache = promptCache
         let box: SendableBox<ModelContext> = await context.read { context in
             // Copy the context struct (shares the evaluated model reference) and
@@ -275,7 +284,10 @@ public final class ModelContainer: Sendable {
             let copy = context
             return SendableBox(copy)
         }
-        await scheduler.attach(context: box, promptCache: cache)
+        guard await scheduler.attach(owner: owner, context: box, promptCache: cache) else {
+            // Lost an attach race to a different container.
+            throw BatchedGenerationError.schedulerAlreadyAttached
+        }
     }
 
     /// Explicitly batched generation: submit several requests at once and get a

@@ -83,6 +83,14 @@ public actor InferenceScheduler {
     /// Optional cross-request prompt cache (shared with the driver).
     private var promptCache: (any PromptCaching)?
 
+    /// Identity of the `ModelContainer` this scheduler is attached to.
+    private var attachedOwner: ObjectIdentifier?
+
+    /// Bumped whenever new work is handed to the driver; lets
+    /// `batchLoopFinished` detect a submission that raced with its
+    /// `driver.hasWork` read instead of idling under a live batch.
+    private var batchAdmissionEpoch = 0
+
     /// Current routing state.
     private var state: SchedulerState = .idle
 
@@ -113,14 +121,30 @@ public actor InferenceScheduler {
     /// ``ModelContainer/generate(input:parameters:wiredMemoryTicket:)`` permits
     /// concurrent access to evaluated weights. No NEW `@unchecked Sendable` is
     /// introduced — `SendableBox` is pre-existing infrastructure.
-    func attach(context box: SendableBox<ModelContext>, promptCache: (any PromptCaching)?) {
+    /// Returns `false` (without consuming the box) if the scheduler is
+    /// already bound to a different owner — a scheduler drives exactly one
+    /// container's model; silently reusing the first context would generate
+    /// wrong outputs for the second container.
+    func attach(
+        owner: ObjectIdentifier,
+        context box: SendableBox<ModelContext>,
+        promptCache: (any PromptCaching)?
+    ) -> Bool {
+        if let attachedOwner, attachedOwner != owner {
+            return false
+        }
+        attachedOwner = owner
         if self.context == nil {
             self.context = box.consume()
         }
         if self.promptCache == nil {
             self.promptCache = promptCache
         }
+        return true
     }
+
+    /// The container this scheduler is bound to, if any.
+    var currentOwner: ObjectIdentifier? { attachedOwner }
 
     /// Whether the scheduler already has a bound context.
     var isAttached: Bool { context != nil }
@@ -358,9 +382,12 @@ extension InferenceScheduler {
     /// from `newCache(parameters: nil)`, so per-request parameters that change
     /// the cache *topology* cannot be honored there:
     ///
-    /// - `kvBits` — the single path rewrites caches to `QuantizedKVCache`
-    ///   mid-decode (`maybeQuantizeKVCache`); the batched engine has no
-    ///   equivalent, so the request would silently lose its quantization.
+    /// - `kvBits` / `kvScheme` — the single path rewrites caches to
+    ///   `QuantizedKVCache` mid-decode (`maybeQuantizeKVCache`; `kvScheme`
+    ///   triggers it even with `kvBits == nil`); the batched engine has no
+    ///   equivalent, so the request would silently lose its quantization —
+    ///   and a running `kvScheme` single would fail cache migration at the
+    ///   upgrade handshake and be truncated early.
     /// - `maxKVSize` — `newCache` returns `RotatingKVCache(keep: 4)` for every
     ///   layer; migrating or admitting such rows next to the engine's
     ///   `BatchKVCache` rows would trip `extendBatched`'s topology
@@ -370,7 +397,8 @@ extension InferenceScheduler {
     /// Non-batchable requests run on their own single iterator instead
     /// (correctness over batching).
     static func parametersAreBatchable(_ parameters: GenerateParameters) -> Bool {
-        parameters.kvBits == nil && parameters.maxKVSize == nil
+        parameters.kvBits == nil && parameters.kvScheme == nil
+            && parameters.maxKVSize == nil
     }
 }
 
@@ -892,6 +920,12 @@ extension InferenceScheduler {
                 ids.insert(id)
             }
         }
+        // The single-stream loop stops on the unknown token as well; include
+        // it here so batched rows (and the upgrade-handoff EOS triage) share
+        // the same stop semantics.
+        if let unknown = tokenizer.unknownTokenId {
+            ids.insert(unknown)
+        }
         return ids
     }
 }
@@ -922,12 +956,15 @@ extension InferenceScheduler {
         }
 
         let driver = EngineDriver(engine: SendableBox(engine), promptCache: promptCache)
+        // Assign BEFORE the awaits below: actor reentrancy could otherwise let
+        // a concurrent admission observe `driver == nil` while this call is
+        // suspended and construct a second engine over the same model.
+        self.driver = driver
         if hasPendingMaxBatchSize {
             await driver.setMaxBatchSize(pendingMaxBatchSize)
         } else if let cap = configuration.maxBatchSize {
             await driver.setMaxBatchSize(cap)
         }
-        self.driver = driver
         return driver
     }
 
@@ -1000,6 +1037,7 @@ extension InferenceScheduler {
             wiredMemoryTicket: scheduled.request.wiredMemoryTicket
         )
 
+        batchAdmissionEpoch += 1
         await driver.submit(
             req,
             handler: handler,
@@ -1035,8 +1073,13 @@ extension InferenceScheduler {
 
     /// Build a `RowSampler` from generation parameters: temperature / top-p /
     /// min-p / top-k, matching the single path's `TopPSampler` filter order.
-    static func rowSampler(for parameters: GenerateParameters) -> RowSampler {
-        makeRowSampler(
+    ///
+    /// Returns `nil` for greedy parameters (`temperature <= 0`): the engine's
+    /// default fallback is already greedy, and any non-nil per-row sampler
+    /// disables `DecodeBatch`'s whole-batch `argMax` fast path.
+    static func rowSampler(for parameters: GenerateParameters) -> RowSampler? {
+        guard parameters.temperature > 0 else { return nil }
+        return makeRowSampler(
             temperature: parameters.temperature,
             topP: parameters.topP,
             topK: parameters.topK,
@@ -1068,8 +1111,12 @@ extension InferenceScheduler {
     /// it captured from admitted requests (see `EngineDriver.drain`).
     private func startBatchLoop(_ driver: EngineDriver) {
         Task { [weak self] in
-            await driver.drain(onResult: nil)
-            await self?.batchLoopFinished()
+            // `drain` returns false when a loop is already running; only the
+            // call that actually owned the loop runs the completion callback,
+            // so no-op drains cannot spawn stale `batchLoopFinished` races.
+            if await driver.drain(onResult: nil) {
+                await self?.batchLoopFinished()
+            }
         }
     }
 
@@ -1081,16 +1128,28 @@ extension InferenceScheduler {
             await drainQueuedRequests()
             return
         }
+        let epochAtExit = batchAdmissionEpoch
         if await driver.hasWork {
             // More work arrived after the loop exited; restart it.
             startBatchLoop(driver)
-        } else {
-            state = .idle
-            // Requests held because their parameters could not run on the
-            // shared engine (see `parametersAreBatchable`) are drained once
-            // the batch empties, mirroring `singleTaskFinished`.
-            await drainQueuedRequests()
+            return
         }
+        // A submission that raced with the `hasWork` read above bumped the
+        // epoch while this call was suspended; restart the loop for it
+        // instead of idling underneath it.
+        guard epochAtExit == batchAdmissionEpoch else {
+            startBatchLoop(driver)
+            return
+        }
+        // Only transition out of `.batched`: a `.single`/`.upgrading` state
+        // installed by a concurrent path after the batch emptied must not be
+        // clobbered back to `.idle` (its request would become untracked).
+        guard case .batched = state else { return }
+        state = .idle
+        // Requests held because their parameters could not run on the
+        // shared engine (see `parametersAreBatchable`) are drained once
+        // the batch empties, mirroring `singleTaskFinished`.
+        await drainQueuedRequests()
     }
 }
 
@@ -1307,6 +1366,7 @@ extension InferenceScheduler {
             promptCacheSalt: joining.request.promptCacheSalt,
             wiredMemoryTicket: joining.request.wiredMemoryTicket
         )
+        batchAdmissionEpoch += 1
         await driver.submit(
             req,
             handler: joinHandler,

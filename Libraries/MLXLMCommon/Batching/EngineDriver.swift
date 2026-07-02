@@ -412,11 +412,15 @@ actor EngineDriver {
     ///
     /// Idempotent: if a loop is already running this returns immediately, since
     /// the running loop already drains all queued/admitted work.
+    /// Returns `true` if this call owned the loop (ran it to completion),
+    /// `false` if a loop was already running — callers use this to run
+    /// loop-completion logic exactly once per real drain.
+    @discardableResult
     func drain(
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         onResult: (@Sendable ([BatchStepResult]) -> Void)? = nil
-    ) async {
-        if draining { return }
+    ) async -> Bool {
+        if draining { return false }
         draining = true
         defer { draining = false }
 
@@ -438,6 +442,7 @@ actor EngineDriver {
             // run between steps. Engine mutation stays serial.
             await Task.yield()
         }
+        return true
     }
 
     /// Runs one engine step under the ticket's wired-memory limit.

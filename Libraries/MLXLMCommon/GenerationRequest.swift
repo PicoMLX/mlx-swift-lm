@@ -64,4 +64,9 @@ public enum BatchedGenerationError: Error, Equatable {
 
     /// The scheduler was busy with an incompatible workload.
     case schedulerBusy
+
+    /// The scheduler is already attached to a different `ModelContainer`.
+    /// A scheduler drives exactly one container's model; reusing it would
+    /// silently generate with the wrong model/tokenizer.
+    case schedulerAlreadyAttached
 }
