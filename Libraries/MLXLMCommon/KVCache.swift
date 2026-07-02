@@ -2144,6 +2144,23 @@ public func maybeQuantizeKVCache(
 // MLX-Swift `MLXArray` extension, but no tagged mlx-swift release provides it
 // yet, which breaks a fresh package resolution. Delete this once the resolved
 // mlx-swift ships `MLXArray.maskFill(for:)`.
+// TEMPORARY HOME (same situation as `MLXArray.maskFill` below): #17's
+// Gemma.clipResidual expects this from an MLX-Swift extension that no tagged
+// release provides yet. Delete once the resolved mlx-swift ships it.
+extension DType {
+    /// An `MLXArray` holding this dtype's greatest finite magnitude.
+    public var greatestFiniteMagnitudeArray: MLXArray {
+        switch self {
+        case .float16:
+            return MLXArray(65504.0).asType(.float16)
+        case .bfloat16:
+            return MLXArray(3.3895313892515355e38).asType(.bfloat16)
+        default:
+            return MLXArray(Float.greatestFiniteMagnitude).asType(self)
+        }
+    }
+}
+
 extension MLXArray {
     public static func maskFill(for dtype: DType) -> MLXArray {
         switch dtype {
