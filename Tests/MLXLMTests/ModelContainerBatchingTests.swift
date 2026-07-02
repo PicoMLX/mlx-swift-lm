@@ -17,9 +17,13 @@ struct ModelContainerBatchingTests {
     @Test("No scheduler installed → generateBatched throws schedulerBusy")
     func generateBatchedRequiresScheduler() async throws {
         let container = ModelContainer(context: makeContext())
-        let request = GenerationRequest(input: LMInput(tokens: MLXArray([Int32(1), 2, 3])))
 
         await #expect(throws: BatchedGenerationError.self) {
+            // Built inside the closure: GenerationRequest is non-Sendable, so
+            // capturing it from the test body cannot satisfy the async
+            // #expect closure's sendability.
+            let request = GenerationRequest(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])))
             _ = try await container.generateBatched([request])
         }
     }
