@@ -95,19 +95,15 @@ struct BatchGenerationEngineTopologyTests {
         )
 
         _ = try BatchGenerationEngine(
-            model: CacheTopologyLanguageModel { _ in [ArraysCache(size: 3)] }
-        )
-
-        _ = try BatchGenerationEngine(
-            model: CacheTopologyLanguageModel { _ in [MambaCache()] }
-        )
-
-        _ = try BatchGenerationEngine(
             model: CacheTopologyLanguageModel { _ in [RotatingKVCache(maxSize: 8, keep: 0)] }
         )
 
+        // SSM topologies (ArraysCache/MambaCache, alone or inside a
+        // CacheList) are factory-rejected until the in-repo models all
+        // thread createSSMMask; see makeBatchedCacheFactory and the
+        // "Rejects unsupported cache topologies" test below.
         _ = try BatchGenerationEngine(
-            model: CacheTopologyLanguageModel { _ in [CacheList(MambaCache(), KVCacheSimple())] }
+            model: CacheTopologyLanguageModel { _ in [QuantizedKVCache()] }
         )
     }
 
