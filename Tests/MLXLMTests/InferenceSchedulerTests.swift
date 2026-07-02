@@ -212,15 +212,25 @@ struct SchedulerValueTests {
         #expect(config.maxBatchSize == nil)
     }
 
-    @Test("RowSampler bridge is greedy at temperature 0")
+    @Test("RowSampler bridge is nil (engine greedy fallback) at temperature 0")
     func rowSamplerGreedyAtZeroTemp() {
         var params = GenerateParameters()
         params.temperature = 0
-        // A greedy sampler over a one-hot row must pick that row's argmax.
+        // Greedy parameters yield no per-row sampler so the engine's argMax
+        // fast path stays reachable; the engine's greedy fallback covers the
+        // row.
+        #expect(InferenceScheduler.rowSampler(for: params) == nil)
+
+        // Non-zero temperature yields a real sampler.
+        params.temperature = 0.7
         let sampler = InferenceScheduler.rowSampler(for: params)
-        let logits = MLXArray([Float(-1), 5, -1, -1]).reshaped([1, 4])
-        let picked = sampler(logits)
-        #expect(picked.asArray(Int32.self).first == 1)
+        #expect(sampler != nil)
+        // A strongly peaked row should still pick the dominant token.
+        let logits = MLXArray([Float(-100), 100, -100, -100]).reshaped([1, 4])
+        if let sampler {
+            let picked = sampler(logits)
+            #expect(picked.asArray(Int32.self).first == 1)
+        }
     }
 
     @Test("GenerationRequest carries the full LMInput and defaults")
