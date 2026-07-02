@@ -4,6 +4,55 @@ import Foundation
 import MLX
 import MLXNN
 
+// Lives here (the first batched-cache file in the PR chain) rather than in
+// BatchRotatingKVCache.swift: BatchKVCache.finalize and the quantized cache
+// also roll per-row, and the rotating cache stacks on top of this file.
+/// Per-element roll along a specified axis.
+///
+/// Ported from Python mlx-lm's `dynamic_roll`. Each element along the batch
+/// dimension is rolled by its own shift amount.
+///
+/// - Parameters:
+///   - x: The input array.
+///   - shifts: Per-batch shift amounts. Shape must broadcast with `x` along axes
+///     other than `axis`.
+///   - axis: The axis along which to roll.
+/// - Returns: The rolled array.
+internal func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
+    let n = x.dim(axis)
+
+    // Build index shape for broadcasting.
+    let ndim = x.ndim
+    let positiveAxis = axis >= 0 ? axis : ndim + axis
+
+    // arange indices along the roll axis
+    let indices = MLXArray(Int32(0) ..< Int32(n))
+
+    // Reshape indices so they broadcast: [1, ..., 1, n, 1, ..., 1]
+    var idxShape = [Int](repeating: 1, count: ndim)
+    idxShape[positiveAxis] = n
+    let reshapedIndices = indices.reshaped(idxShape)
+
+    // Reshape shifts to broadcast: add trailing dims after the axis
+    // shifts shape: e.g. [B, 1] → needs to become [B, 1, 1, ..., 1]
+    var shiftShape = [Int](repeating: 1, count: ndim)
+    for d in 0 ..< shifts.ndim {
+        if d < ndim {
+            shiftShape[d] = shifts.dim(d)
+        }
+    }
+    let reshapedShifts = shifts.reshaped(shiftShape)
+
+    // Compute rolled indices: (indices - shifts) mod n
+    // Use ((x % n) + n) % n to ensure non-negative result (Python-style modulo)
+    // ((x % n) + n) % n keeps the result non-negative (Python-style modulo).
+    // Using `%` avoids any overload ambiguity with Foundation/Darwin `remainder`.
+    let nArr = MLXArray(Int32(n))
+    let idx = ((reshapedIndices - reshapedShifts) % nArr + nArr) % nArr
+
+    return takeAlong(x, idx.asType(.int32), axis: positiveAxis)
+}
+
 // MARK: - BatchKVCache
 
 /// Batch-aware KV cache with left-padding strategy for continuous batching.
