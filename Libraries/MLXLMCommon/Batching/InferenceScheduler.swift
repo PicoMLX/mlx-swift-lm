@@ -1084,7 +1084,12 @@ extension InferenceScheduler {
             topP: parameters.topP,
             topK: parameters.topK,
             minP: parameters.minP,
-            seed: nil
+            // Honor the request's seed (GenerateParameters.seed, upstream
+            // #377) so batched sampling is reproducible per request. The
+            // per-row key sequence differs from the single path's sampler, so
+            // a seeded request is deterministic on each path but not bitwise
+            // identical across single vs. batched.
+            seed: parameters.seed
         )
     }
 
