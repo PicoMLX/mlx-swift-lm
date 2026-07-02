@@ -13,9 +13,8 @@ import MLX
 ///
 /// `promptCache` is typed as `(any PromptCaching)?` (a `Sendable` protocol
 /// bound) rather than the concrete `LRUPromptCache` so a future block/paged
-/// cache lands without churning this public surface. Persistence (`save`/`load`)
-/// lives on ``PersistablePromptCache``; callers that need it hold their own
-/// concrete (or `PersistablePromptCache`) reference.
+/// cache lands without churning this public surface. Disk persistence is an
+/// app-level concern and is not part of the protocol.
 ///
 /// Not `Sendable`: ``input`` carries non-`Sendable` `MLXArray` tensors. The
 /// batched API transfers requests across isolation with `sending` (the same

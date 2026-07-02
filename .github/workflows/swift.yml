@@ -56,16 +56,34 @@ jobs:
         run: |
           xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
 
-      # Run only the batched-cache suite: it is self-contained (no model downloads)
-      # and exercises the Metal kernels that back rotation/extract/merge/finalize —
+      # Run every batching suite: all are self-contained (no model downloads —
+      # the model-parity regressions use in-process random-weight models) and
+      # exercise the Metal kernels that back rotation/extract/merge/finalize —
       # the numerical paths that can't be verified in the Linux authoring env.
-      # Broader model-parity tests (PR2+) need the hosted-runner model-cache setup
-      # and are added with those PRs.
-      - name: Run batched-cache tests (Xcode, macOS)
+      # NOTE: -only-testing matches swift-testing SUITE TYPE names, not file
+      # names (a previous `BatchCacheTests` filter matched nothing and silently
+      # ran zero tests).
+      - name: Run batching tests (Xcode, macOS)
         run: |
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
-            -only-testing:MLXLMTests/BatchCacheTests \
+            -only-testing:MLXLMTests/BatchKVCacheCoverageTests \
+            -only-testing:MLXLMTests/BatchRotatingKVCacheCoverageTests \
+            -only-testing:MLXLMTests/BatchedCacheFactoryTests \
+            -only-testing:MLXLMTests/BatchedSSMCacheTests \
+            -only-testing:MLXLMTests/BatchMaskingTests \
             -only-testing:MLXLMTests/BatchQuantizedKVCacheTests \
-            -only-testing:MLXLMTests/QuantizedAttentionMaskTests
+            -only-testing:MLXLMTests/QuantizedAttentionMaskTests \
+            -only-testing:MLXLMTests/StopSequenceMatcherTests \
+            -only-testing:MLXLMTests/RowSamplerTests \
+            -only-testing:MLXLMTests/BatchGenerationEngineTopologyTests \
+            -only-testing:MLXLMTests/BatchGenerationEngineValidationTests \
+            -only-testing:MLXLMTests/BatchGenerationEnginePullLoopTests \
+            -only-testing:MLXLMTests/BatchModelRegressionTests \
+            -only-testing:MLXLMTests/SchedulerTokenHandlerTests \
+            -only-testing:MLXLMTests/UpgradeFlagTests \
+            -only-testing:MLXLMTests/CacheMigrationTests \
+            -only-testing:MLXLMTests/SchedulerValueTests \
+            -only-testing:MLXLMTests/ModelContainerBatchingTests \
+            -only-testing:MLXLMTests/PromptCacheTests

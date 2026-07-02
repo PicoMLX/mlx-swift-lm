@@ -564,89 +564,6 @@ public final class ChatSession {
         )
     }
 
-    /// Drive one or more conversation turns through the installed scheduler
-    /// (transparent batched routing). Re-tokenizes the full history each turn
-    /// and relies on ``ModelContainer/promptCache`` for prefix KV reuse; the
-    /// session keeps a `.history` cache rather than a `[KVCache]`. Restarts on
-    /// tool calls (dispatched via `toolDispatch`).
-    /// `emit` delivers one generation event to the consumer and returns
-    /// `false` if the consumer has terminated the stream (so generation should
-    /// stop). Passing a non-generic `@Sendable` closure (rather than a generic
-    /// `continuation`/`transform` pair) keeps this function non-generic, which
-    /// avoids a Swift type-checker performance cliff when it is compiled inside
-    /// the `streamMap` `Task` closure.
-    private static func streamThroughScheduler(
-        model: ModelContainer,
-        processor: any UserInputProcessor,
-        processing: UserInput.Processing,
-        tools: [ToolSpec]?,
-        toolDispatch: (@Sendable (ToolCall) async throws -> String)?,
-        additionalContext: [String: any Sendable]?,
-        generateParameters: GenerateParameters,
-        priorMessages: [Chat.Message],
-        cache: Cache,
-        newMessages: SendableBox<[Chat.Message]>,
-        emit: @Sendable (Generation) -> Bool
-    ) async throws -> Cache {
-        // Reconstruct the persisted history (prior turns minus the system
-        // prompt, which `priorMessages` already carries) from the cache.
-        var history: [Chat.Message] = []
-        switch cache {
-        case .empty, .kvcache:
-            // A prior non-scheduler [KVCache] cannot be carried into the
-            // prompt cache (its exact token sequence is unknown), so it is
-            // discarded; the conversation is re-tokenized fresh.
-            break
-        case .history(let h):
-            history = h
-        }
-
-        var messages = priorMessages
-        messages.append(contentsOf: history)
-        let incoming = newMessages.consume()
-        messages.append(contentsOf: incoming)
-        history.append(contentsOf: incoming)
-
-        var assistantText = ""
-
-        restart: while !messages.isEmpty {
-            let userInput = UserInput(
-                chat: messages, processing: processing,
-                tools: tools, additionalContext: additionalContext)
-            let lmInput = try await processor.prepare(input: userInput)
-            messages.removeAll()
-
-            let stream = try await model.generate(
-                input: SendableBox(lmInput).consume(),
-                parameters: generateParameters
-            )
-
-            for await item in stream {
-                if let toolCall = item.toolCall, let toolDispatch {
-                    // Dispatch the tool, queue its result, and restart the
-                    // outer loop so the result is fed back to the model.
-                    let toolResult = try await toolDispatch(toolCall)
-                    messages = [.tool(toolResult)]
-                    history.append(.tool(toolResult))
-                    break
-                }
-                if let chunk = item.chunk {
-                    assistantText += chunk
-                }
-                if !emit(item) {
-                    break
-                }
-            }
-            // If `messages` was repopulated with a tool result, `restart`
-            // re-runs; otherwise the while-condition ends the loop.
-        }
-
-        if !assistantText.isEmpty {
-            history.append(.assistant(assistantText))
-        }
-        return .history(history)
-    }
-
     private func streamMap<R: Sendable>(
         messages: consuming [Chat.Message],
         transform: @Sendable @escaping (Generation) -> R?
@@ -674,38 +591,6 @@ public final class ChatSession {
                     var messages: [Chat.Message] = []
                     if let instructions {
                         messages.append(.system(instructions))
-                    }
-
-                    // When a scheduler is installed, route turns through
-                    // ModelContainer.generate() for transparent batching. The
-                    // session no longer holds a [KVCache]; instead it keeps a
-                    // message history and re-tokenizes the full conversation
-                    // each turn, relying on ModelContainer.promptCache to hit
-                    // the shared prefix so only new tokens prefill. (A
-                    // session-held KV cache cannot be shared with the batched
-                    // engine, which manages its own per-request caches.)
-                    if model.usesScheduler {
-                        cache = try await Self.streamThroughScheduler(
-                            model: model,
-                            processor: processor,
-                            processing: processing,
-                            tools: tools,
-                            toolDispatch: toolDispatch,
-                            additionalContext: additionalContext,
-                            generateParameters: generateParameters,
-                            priorMessages: messages,
-                            cache: cache,
-                            newMessages: inputMessages,
-                            emit: { generation in
-                                guard let value = transform(generation) else { return true }
-                                if case .terminated = continuation.yield(value) {
-                                    return false
-                                }
-                                return true
-                            }
-                        )
-                        continuation.finish()
-                        return
                     }
 
                     // prepare the cache, if needed.  note:

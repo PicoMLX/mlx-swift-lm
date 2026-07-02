@@ -70,7 +70,8 @@ public struct PromptCacheFetchResult {
 ///
 /// `Sendable` because a prompt cache is shared across the actors that drive
 /// batched inference. Disk persistence is intentionally *not* part of this
-/// protocol — see ``PersistablePromptCache``.
+/// protocol — storage policy (where, when, and how to persist) belongs to the
+/// embedding app, built on the library's KV-cache serialization primitives.
 public protocol PromptCaching: Sendable {
     /// Fetch the nearest matching KV cache for the given token sequence.
     ///
@@ -141,20 +142,4 @@ extension PromptCaching {
             salt: 0
         )
     }
-}
-
-// MARK: - PersistablePromptCache
-
-/// A ``PromptCaching`` store that can be saved to and loaded from disk.
-///
-/// Disk persistence is a refining protocol so that in-memory-only caches are
-/// not forced to implement it. Public surfaces typed as `any PromptCaching`
-/// therefore do not expose persistence — callers that need `save`/`load` hold
-/// a `PersistablePromptCache` (or the concrete cache) reference.
-public protocol PersistablePromptCache: PromptCaching {
-    /// Persist the cache's disk-persistable entries under `directory`.
-    func save(to directory: URL, maxDiskBytes: Int?) async throws
-
-    /// Load previously persisted entries from `directory`.
-    func load(from directory: URL, allowedModels: Set<String>?) async throws
 }

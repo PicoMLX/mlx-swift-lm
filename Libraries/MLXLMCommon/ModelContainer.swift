@@ -41,9 +41,8 @@ public final class ModelContainer: Sendable {
 
     /// Optional cross-request prompt cache (prefix KV reuse), shared with the
     /// scheduler. Typed as the protocol so a future block/paged cache lands
-    /// without churning this surface; persistence lives on
-    /// ``PersistablePromptCache`` (callers needing `save`/`load` hold their own
-    /// concrete reference).
+    /// without churning this surface; disk persistence is an app-level
+    /// concern.
     public let promptCache: (any PromptCaching)?
 
     /// Whether a continuous-batching scheduler is installed. Consumers (e.g.

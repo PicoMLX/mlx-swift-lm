@@ -1,7 +1,5 @@
 // Copyright © 2024 Apple Inc.
 
-import CryptoKit
-import Dispatch
 import Foundation
 import MLX
 import os
@@ -25,8 +23,7 @@ import os
 /// - `insertCache(model:tokens:promptCache:)` — store a KV cache for a token sequence
 /// - `fetchNearestCache(model:tokens:)` — find the best matching cached prefix
 /// - `trimTo(nSequences:nBytes:)` — memory-aware eviction
-/// - `save(to:maxDiskBytes:)` / `load(from:allowedModels:)` — disk persistence
-public final class LRUPromptCache: PersistablePromptCache {
+public final class LRUPromptCache: PromptCaching {
 
     // MARK: - Types
 
@@ -140,14 +137,8 @@ public final class LRUPromptCache: PersistablePromptCache {
         var nBytes: Int = 0
         /// Every `(model, salt)` namespace this instance has ever held a live
         /// entry for, accumulated on insert and never cleared by eviction/trim.
-        ///
-        /// This is the cache's *ownership* identity on disk, distinct from the
-        /// set of currently-live keys. Disk cleanup (`removeStaleSidecars`,
-        /// `enforceDiskBudget`) is scoped to this set so a shared persistence
-        /// directory is never corrupted across `(model, salt)` namespaces, while
-        /// still letting the cache clean up — or budget-evict — its OWN prior
-        /// sidecars even when it has been trimmed back to zero live entries (at
-        /// which point the live-key set is empty).
+        /// Preserved as the cache's ownership identity for app-level
+        /// persistence layers built on top of this store.
         var managedKeys: Set<RootKey> = []
     }
 
@@ -321,407 +312,6 @@ public final class LRUPromptCache: PersistablePromptCache {
         return isCacheCompatible(model.newCache(parameters: parameters))
     }
 
-    public func save(to directory: URL, maxDiskBytes: Int? = nil) async throws {
-        try await Self.runPersistenceTask {
-            try self.saveSynchronously(to: directory, maxDiskBytes: maxDiskBytes)
-        }
-    }
-
-    public func load(from directory: URL, allowedModels: Set<String>? = nil) async throws {
-        try await Self.runPersistenceTask {
-            try self.loadSynchronously(from: directory, allowedModels: allowedModels)
-        }
-    }
-
-    private func saveSynchronously(to directory: URL, maxDiskBytes: Int? = nil) throws {
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-
-        let (snapshots, ownedKeys) = diskSnapshotsAndOwnedKeys()
-        #if DEBUG
-            let skipped = snapshots.filter { !Self.isDiskPersistable($0.promptCache) }.count
-            if skipped > 0 {
-                print(
-                    "[PromptCache] skipping disk persistence for \(skipped) non-KVCacheSimple leaves"
-                )
-            }
-        #endif
-
-        let liveStems = Set(
-            snapshots.lazy
-                .filter { Self.isDiskPersistable($0.promptCache) }
-                .map(\.fileStem)
-        )
-        // The `(model, salt)` namespaces this cache OWNS — every key it has held
-        // a live entry for, not just those live right now. Both disk-cleanup
-        // passes are scoped to this set so a shared persistence directory is
-        // never corrupted across namespaces: saving a cache that only ever held
-        // model A never deletes model B's committed entries, and — because salt
-        // is part of the cache key — one salt never deletes another salt's
-        // same-model entries. Using the owned set (rather than the live-key set)
-        // also lets the cache reclaim its OWN sidecars after it has been trimmed
-        // back to zero live entries, when the live-key set would be empty.
-        let ownedKeySet = ownedKeys.union(snapshots.map(\.key))
-
-        for snapshot in snapshots where Self.isDiskPersistable(snapshot.promptCache) {
-            let baseURL = directory.appendingPathComponent(snapshot.fileStem)
-            let tensorURL = baseURL.appendingPathExtension("safetensors")
-            let sidecarURL = baseURL.appendingPathExtension("json")
-            let tempTensorURL = directory.appendingPathComponent(
-                "\(snapshot.fileStem).\(UUID().uuidString).tmp.safetensors")
-            let tempSidecarURL = directory.appendingPathComponent(
-                "\(snapshot.fileStem).\(UUID().uuidString).tmp.json")
-            defer {
-                try? FileManager.default.removeItem(at: tempTensorURL)
-                try? FileManager.default.removeItem(at: tempSidecarURL)
-            }
-
-            try savePromptCache(
-                url: tempTensorURL,
-                cache: snapshot.promptCache,
-                metadata: [
-                    "formatVersion": String(Self.diskFormatVersion),
-                    "model": snapshot.key.model,
-                    "salt": String(snapshot.key.salt),
-                    "tokenHash": snapshot.tokenHash,
-                ]
-            )
-
-            let sidecar = DiskSidecar(
-                formatVersion: Self.diskFormatVersion,
-                model: snapshot.key.model,
-                salt: snapshot.key.salt,
-                tokens: snapshot.tokens,
-                tokenHash: snapshot.tokenHash,
-                tokenCount: snapshot.tokens.count,
-                byteCount: snapshot.nbytes,
-                lastUsed: snapshot.lastUsed
-            )
-            let data = try JSONEncoder().encode(sidecar)
-            try data.write(to: tempSidecarURL, options: .atomic)
-
-            try? FileManager.default.removeItem(at: tensorURL)
-            try FileManager.default.moveItem(at: tempTensorURL, to: tensorURL)
-
-            // The sidecar is the discoverable commit record. Moving it last makes
-            // interrupted saves load as cache misses instead of half-written entries.
-            try? FileManager.default.removeItem(at: sidecarURL)
-            try FileManager.default.moveItem(at: tempSidecarURL, to: sidecarURL)
-        }
-
-        try Self.removeStaleSidecars(
-            directory: directory, liveStems: liveStems, ownedKeys: ownedKeySet)
-
-        if let maxDiskBytes {
-            try Self.enforceDiskBudget(
-                directory: directory, maxDiskBytes: maxDiskBytes, ownedKeys: ownedKeySet)
-        }
-    }
-
-    /// Delete this cache's own committed `entry_` sidecars (and their paired
-    /// tensors) whose stem is no longer in the live snapshot set, so a later
-    /// `load` doesn't resurrect prompts that were evicted or trimmed from
-    /// memory since they were last written.
-    ///
-    /// Deletion is scoped two ways so a shared persistence directory is never
-    /// corrupted: only `entry_`-prefixed final sidecars are considered (via
-    /// ``isFinalSidecar``), and a stale sidecar is removed only when it decodes
-    /// to valid metadata whose `(model, salt)` is a namespace this cache owns
-    /// (`ownedKeys`). Scoping on the *owned* set rather than the live-key set is
-    /// what lets a cache trimmed back to zero live entries still reclaim its own
-    /// prior sidecars (an empty live set would otherwise disable cleanup exactly
-    /// when every entry has been evicted, resurrecting old files on the next
-    /// `load`). Salt is part of the cache key, so scoping on model alone would
-    /// let one salt delete another salt's same-model entries. A sidecar that
-    /// can't be decoded, or whose `(model, salt)` this cache doesn't own (for
-    /// example another cache instance or model/salt scope sharing the directory,
-    /// which `load(from:allowedModels:)` supports), is left untouched. When in
-    /// doubt, do not delete.
-    private static func removeStaleSidecars(
-        directory: URL,
-        liveStems: Set<String>,
-        ownedKeys: Set<RootKey>
-    ) throws {
-        let fileManager = FileManager.default
-        let sidecars = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        .filter { isFinalSidecar($0) }
-
-        let decoder = JSONDecoder()
-        for sidecarURL in sidecars {
-            let stem = sidecarURL.deletingPathExtension().lastPathComponent
-            guard !liveStems.contains(stem) else { continue }
-            // Only delete sidecars this cache owns: decode the metadata and
-            // require its `(model, salt)` to be one of this cache's owned
-            // namespaces. Never delete an undecodable sidecar or one belonging
-            // to another model or salt.
-            guard let data = try? Data(contentsOf: sidecarURL),
-                let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
-                ownedKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
-            else {
-                continue
-            }
-            let tensorURL = sidecarURL.deletingPathExtension()
-                .appendingPathExtension("safetensors")
-            try? fileManager.removeItem(at: sidecarURL)
-            try? fileManager.removeItem(at: tensorURL)
-        }
-    }
-
-    private func loadSynchronously(from directory: URL, allowedModels: Set<String>? = nil) throws {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: directory.path) else { return }
-
-        let sidecarURLs = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        )
-        // Only committed final sidecars written by this cache. Excluding
-        // `*.tmp.json` honors the "sidecar move is the commit record" ordering
-        // in `saveSynchronously`: a crash after writing the temp pair but before
-        // the final move must load as a miss, not a half-written entry. The
-        // `entry_` prefix also keeps us from touching unrelated `.json` files in
-        // a shared directory.
-        .filter { Self.isFinalSidecar($0) }
-
-        let decoder = JSONDecoder()
-        var decoded = [(DiskSidecar, URL)]()
-        for sidecarURL in sidecarURLs {
-            guard let data = try? Data(contentsOf: sidecarURL),
-                let sidecar = try? decoder.decode(DiskSidecar.self, from: data),
-                sidecar.formatVersion == Self.diskFormatVersion,
-                sidecar.tokenCount == sidecar.tokens.count,
-                sidecar.tokenHash == Self.tokenHashHex(sidecar.tokens),
-                allowedModels?.contains(sidecar.model) ?? true
-            else {
-                continue
-            }
-            decoded.append((sidecar, sidecarURL))
-        }
-
-        decoded.sort { $0.0.lastUsed < $1.0.lastUsed }
-
-        for (sidecar, sidecarURL) in decoded {
-            let tensorURL = sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
-            guard fileManager.fileExists(atPath: tensorURL.path),
-                let (promptCache, metadata) = try? loadPromptCache(url: tensorURL),
-                metadata["formatVersion"] == String(Self.diskFormatVersion),
-                metadata["model"] == sidecar.model,
-                metadata["salt"] == String(sidecar.salt),
-                metadata["tokenHash"] == sidecar.tokenHash,
-                Self.isDiskPersistable(promptCache)
-            else {
-                continue
-            }
-
-            let entryBytes = Self.cacheByteCount(promptCache)
-            guard entryBytes <= maxBytes else { continue }
-
-            insertCache(
-                model: sidecar.model,
-                tokens: sidecar.tokens,
-                promptCache: promptCache,
-                salt: sidecar.salt
-            )
-        }
-    }
-
-    // MARK: - Disk persistence helpers
-
-    private static let diskFormatVersion = 1
-    private static let persistenceQueue = DispatchQueue(
-        label: "org.ml-explore.mlx-swift-lm.lrucache.persistence",
-        qos: .utility
-    )
-
-    private static func runPersistenceTask(
-        _ work: @escaping @Sendable () throws -> Void
-    ) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            persistenceQueue.async {
-                do {
-                    try work()
-                    continuation.resume()
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    private struct DiskSidecar: Codable {
-        let formatVersion: Int
-        let model: String
-        let salt: UInt64
-        let tokens: [Int]
-        let tokenHash: String
-        let tokenCount: Int
-        let byteCount: Int
-        let lastUsed: TimeInterval
-    }
-
-    private struct DiskSnapshot {
-        let key: RootKey
-        let tokens: [Int]
-        let promptCache: [KVCache]
-        let nbytes: Int
-        let lastUsed: TimeInterval
-
-        var tokenHash: String { LRUPromptCache.tokenHashHex(tokens) }
-
-        var fileStem: String {
-            "entry_\(LRUPromptCache.stringHashHex(key.model))_\(String(format: "%016llx", key.salt))_\(tokens.count)_\(tokenHash)"
-        }
-    }
-
-    /// Collect deep-copied disk snapshots of every live entry together with the
-    /// set of `(model, salt)` namespaces this instance owns, in a single locked
-    /// read so the two stay consistent. The owned-key set is a superset of the
-    /// live snapshot keys (it also retains namespaces whose entries have all been
-    /// evicted/trimmed) and bounds which sidecars disk cleanup may delete.
-    private func diskSnapshotsAndOwnedKeys() -> (snapshots: [DiskSnapshot], ownedKeys: Set<RootKey>)
-    {
-        state.withLockUnchecked { state in
-            var snapshots = [DiskSnapshot]()
-            var tokens = [Int]()
-            for (key, root) in state.cache {
-                tokens.removeAll(keepingCapacity: true)
-                Self.collectDiskSnapshots(key: key, node: root, tokens: &tokens, into: &snapshots)
-            }
-            return (snapshots, state.managedKeys)
-        }
-    }
-
-    private static func collectDiskSnapshots(
-        key: RootKey,
-        node: TrieNode,
-        tokens: inout [Int],
-        into snapshots: inout [DiskSnapshot]
-    ) {
-        if let entry = node.cache {
-            // Deep-copy the cache *inside the lock* (this static helper is only
-            // reached from `diskSnapshotsAndOwnedKeys()` while
-            // `state.withLockUnchecked` is held). Handing out the trie's live,
-            // mutable `[KVCache]` would let
-            // the off-thread `savePromptCache` serialization race against
-            // concurrent mutations on another thread.
-            snapshots.append(
-                DiskSnapshot(
-                    key: key,
-                    tokens: tokens,
-                    promptCache: LRUPromptCache.deepCopy(entry.promptCache),
-                    nbytes: entry.nbytes,
-                    lastUsed: entry.lastUsed
-                )
-            )
-        }
-        for (token, child) in node.children {
-            tokens.append(Int(token))
-            collectDiskSnapshots(
-                key: key,
-                node: child,
-                tokens: &tokens,
-                into: &snapshots
-            )
-            tokens.removeLast()
-        }
-    }
-
-    private static func isDiskPersistable(_ cache: [KVCache]) -> Bool {
-        !cache.isEmpty && cache.allSatisfy { $0 is KVCacheSimple }
-    }
-
-    private static func cacheByteCount(_ cache: [KVCache]) -> Int {
-        cache.reduce(0) { total, layer in
-            total + layer.state.reduce(0) { $0 + $1.nbytes }
-        }
-    }
-
-    private static func tokenHashHex(_ tokens: [Int]) -> String {
-        var data = Data()
-        data.reserveCapacity(tokens.count * MemoryLayout<Int64>.size)
-        for token in tokens {
-            var value = Int64(token).littleEndian
-            withUnsafeBytes(of: &value) { bytes in
-                data.append(contentsOf: bytes)
-            }
-        }
-        return sha256Hex(data)
-    }
-
-    private static func stringHashHex(_ string: String) -> String {
-        sha256Hex(Data(string.utf8))
-    }
-
-    private static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func enforceDiskBudget(
-        directory: URL,
-        maxDiskBytes: Int,
-        ownedKeys: Set<RootKey>
-    ) throws {
-        let fileManager = FileManager.default
-        let sidecars = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        )
-        .filter { isFinalSidecar($0) }
-
-        // Only enforce the budget against this cache's own entries: a committed
-        // `entry_` sidecar that decodes to valid metadata AND whose `(model,
-        // salt)` is a namespace this cache owns. Scoping by owned `(model, salt)`
-        // — the same ownership model `removeStaleSidecars` uses — means saving
-        // model A under a tight budget can never evict model B's or another
-        // salt's committed entries from a shared directory. Undecodable, foreign,
-        // or unowned files are left untouched so the budget never deletes data
-        // this cache doesn't own.
-        var entries = sidecars.compactMap {
-            sidecarURL -> (sidecar: URL, tensor: URL, lastUsed: TimeInterval, bytes: Int)? in
-            guard let data = try? Data(contentsOf: sidecarURL),
-                let sidecar = try? JSONDecoder().decode(DiskSidecar.self, from: data),
-                ownedKeys.contains(RootKey(model: sidecar.model, salt: sidecar.salt))
-            else {
-                return nil
-            }
-            let tensorURL = sidecarURL.deletingPathExtension().appendingPathExtension("safetensors")
-            let bytes = fileSize(sidecarURL) + fileSize(tensorURL)
-            return (sidecarURL, tensorURL, sidecar.lastUsed, bytes)
-        }
-
-        var totalBytes = entries.reduce(0) { $0 + $1.bytes }
-        guard totalBytes > maxDiskBytes else { return }
-
-        entries.sort { $0.lastUsed < $1.lastUsed }
-        for entry in entries where totalBytes > maxDiskBytes {
-            try? fileManager.removeItem(at: entry.sidecar)
-            try? fileManager.removeItem(at: entry.tensor)
-            totalBytes -= entry.bytes
-        }
-    }
-
-    /// Whether `url` is a committed final sidecar written by this cache: an
-    /// `entry_`-prefixed `.json` file that is not an in-flight `.tmp.json`
-    /// temporary. Used by both `load` and the disk-budget cleanup to avoid
-    /// touching interrupted saves or unrelated files in a shared directory.
-    private static func isFinalSidecar(_ url: URL) -> Bool {
-        let name = url.lastPathComponent
-        return url.pathExtension == "json"
-            && name.hasPrefix("entry_")
-            && !name.hasSuffix(".tmp.json")
-    }
-
-    private static func fileSize(_ url: URL) -> Int {
-        (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-    }
 
     // MARK: - Cache materialization (immutable / static)
 
@@ -731,8 +321,8 @@ public final class LRUPromptCache: PersistablePromptCache {
     /// down to that key length: `KVCacheSimple` is sliced by `stateSnapshot`, and
     /// a `RotatingKVCache` whose restored `offset` exceeds `tokenCount` is
     /// normalized by ``normalizeRotating`` so a stored entry's covered length can
-    /// never overshoot its token key. When `tokenCount` is `nil` (the fetch /
-    /// disk-snapshot path) the copy is faithful — offsets are preserved exactly.
+    /// never overshoot its token key. When `tokenCount` is `nil` (the fetch
+    /// path) the copy is faithful — offsets are preserved exactly.
     private static func materializedCopy(_ promptCache: [KVCache], tokenCount: Int?) -> [KVCache] {
         let copy = promptCache.map { original -> KVCache in
             var copy: KVCache
@@ -1005,9 +595,8 @@ extension LRUPromptCache.State {
     ) {
         let isTrimmable = canTrimPromptCache(promptCache)
 
-        // Record namespace ownership. This survives later eviction/trim of every
-        // entry under `key`, so disk cleanup can still reclaim this instance's
-        // own sidecars once it has been trimmed back to zero live entries.
+        // Record namespace ownership (survives later eviction/trim; used by
+        // app-level persistence layers built on top of this store).
         managedKeys.insert(key)
 
         if cache[key] == nil {
