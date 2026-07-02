@@ -229,6 +229,8 @@ Honest summary vs. your requirement: **2 of 7 variants batch in practice** (cove
 
 ## 12. Recommended path to merge
 
+*(This assumes keeping the current five PRs. §13 proposes re-cutting the stack for upstream reviewability — if you take that route, steps 3–7 below map onto the new chain instead.)*
+
 1. **Unblock the process** (§2): rebase the stack onto cb-1's tip (or push the union as the integration branch), fix the CI `-only-testing` filter + add the engine/scheduler/prompt-cache suites, fix `ChatSession.swift:660`.
 2. **Merge #17** (or upstream's fix) standalone.
 3. **Land PR #18** after the two open items (serialization registration can also be documented-as-unsupported for now).
@@ -237,6 +239,44 @@ Honest summary vs. your requirement: **2 of 7 variants batch in practice** (cove
 6. **PR #21 needs a real hardening pass**: the three reentrancy races (M-5/6/7 — consider making driver creation synchronous and re-checking state after every await), the kvScheme gate, stop-string parity (reuse `TextToolTokenLoopHandler` instead of the parallel handler stack), the ChatSession tool-call restart, speculative-decoding gating, and either wiring `GenerationRequest.promptCache` or removing the field. Land last, with the missing tests from §11.
 7. **Defer PR #22** (keep its SDPA fixes); re-introduce when the engine can actually be constructed with quantized caches — with the trim clamp fix.
 8. Then the highest-value follow-up of all: **wire prompt-cache fetch into batched admission** (§6-1) — it is also your phase-2 feature.
+
+---
+
+## 13. Proposed PR re-split for reviewable upstream steps
+
+The stack's stated purpose was to make each step reviewable by human (upstream) maintainers. **The conceptual layer boundaries are right, but as currently cut the stack does not deliver that**, for five reasons:
+
+1. **It's a diamond, not a stack.** cb-2/cb-3/cb-5 are siblings on cb-1, and cb-4 = cb-2 ⊕ *all of cb-3* ⊕ its own delta. GitHub renders PR #21 against cb-2, so a reviewer of #21 re-reads the entire prompt cache inside a 4,650-line scheduler diff. Siblings also each edit the files cb-1 added (`KVCache.swift`, `BatchKVCache.swift`, shared tests), so review comments on one branch are invalidated by another and merge order changes later diffs.
+2. **Reviewers approve something other than what lands.** cb-1's tip moved 11 fix commits ahead of the siblings' base; the union of all five has never been compiled anywhere. (Concrete casualty: the quantized `trim()` clamp, M-15.)
+3. **The review contract is void without running tests.** The CI filter names a nonexistent suite (§2-2), so "CI green" executed none of the cache math; the engine/scheduler/regression suites are in no CI at all.
+4. **Each PR mixes unrelated concerns.** cb-1 bundles neutral `KVCache.swift` plumbing with two large cache classes *and* a fork-only CI workflow; cb-2 hides a single-stream **Gemma2 numerics change**; cb-4 mixes scheduler, driver, container API, ChatSession/tool calls, and VLM factory routing; cb-5 duplicates #17's mask fix.
+5. **Several PRs ship code no reviewer can evaluate.** `BatchQuantizedKVCache`, `BatchedCacheList`, and the batched SSM conformances have no reachable caller in the stack — "is this API right?" is unanswerable in-PR.
+
+### The proposed linear chain
+
+Same layers, re-cut so every PR is linear (based on the previous PR's tip), compiles standalone, and actually runs its tests in CI:
+
+| # | PR | Contents | ~Size | Review gate / notes |
+|---|---|---|---|---|
+| 0a | Quantized-SDPA mask fix | Existing **#17**, unchanged | tiny | Merge immediately; drop cb-5's duplicate |
+| 0b | Gemma2 attention change | Extracted from cb-2, with before/after pinning tests | small | Single-stream numerics change must not hide in a batching PR |
+| 1 | Neutral plumbing | `RoPEOffset`, `applyRotaryPosition`, `leftPadding:` in `createCausalMask`, `open ropeOffset`, `ArraysCache.extract` + tests | ~300–400 | The part upstream must buy into; small enough for line-by-line review |
+| 2 | Batched cache core | `BatchedCache` protocol + factory + `BatchKVCache` + tests | ~1,000 | First cache class; factory admits only `KVCacheSimple` here |
+| 3 | Rotating cache | `BatchRotatingKVCache` + factory branch + tests | ~1,300 | The gnarliest math gets a PR where it is the *only* thing under review |
+| 4 | Engine | `PrefillBatch`/`DecodeBatch`/`RowSamplers`/`StopSequenceMatcher` + `BatchGenerationEngine` + `BatchModelRegressionTests` | ~1,800 | Split again into 4a (batch structs) / 4b (engine) if <1k units are wanted; parity fixes M-1..M-4 land here |
+| 5 | Scheduler | `InferenceScheduler` + `EngineDriver` + `ModelContainer.generate` routing — **no ChatSession** | ~1,500–2,000 | Reentrancy hardening (M-5..M-8) lands here; first PR where auto-upgrade is end-to-end testable |
+| 6 | ChatSession integration | Scheduler path, tool calls, history cache | ~500 | Isolates the region-isolation compile fix and the tool-restart context-loss bug |
+| 7 | Prompt cache (in-memory) | `LRUPromptCache` (no disk), `PromptCaching`, single-path fetch/write-back | ~600 | M-11/M-12 fixed here |
+| 8+ | Deferred | Disk persistence; `BatchQuantizedKVCache` (with the trim clamp); batched-path prompt-cache fetch; SSM enablement | — | Each opened only once it has a reachable consumer |
+
+### Two mechanical rules that restore reviewability
+
+- **Linear stack only.** Each PR is based on the previous PR's tip and is rebased forward whenever a lower PR changes. Never sibling branches editing shared files.
+- **No PR advertises tests it doesn't execute.** Every PR's CI must run its own suites (they need no model downloads); fix the `-only-testing` filter first.
+
+### Cheapest migration from the current stack
+
+The union of all five branches merges with only trivial conflicts and no semantic mis-merges (verified hunk-by-hunk, §2-1). So: push the union as an integration branch to get one honest compile/CI signal, then re-cut the linear chain from it with `git` surgery (mostly `git checkout <union> -- <paths>` per layer plus extracting PR 0b) — no code rewriting required.
 
 ---
 
