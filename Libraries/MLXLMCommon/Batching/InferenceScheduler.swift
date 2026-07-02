@@ -437,9 +437,9 @@ extension InferenceScheduler {
         // disconnected value) right at the `sending` boundary.
         var boxes: [SendableBox<GenerationRequest>] = []
         boxes.reserveCapacity(requests.count)
-        var remaining = requests
+        var remaining = Array(requests.reversed())
         while !remaining.isEmpty {
-            boxes.append(SendableBox(remaining.removeFirst()))
+            boxes.append(SendableBox(remaining.removeLast()))
         }
         var streams: [AsyncStream<Generation>] = []
         streams.reserveCapacity(boxes.count)
@@ -1191,8 +1191,15 @@ extension InferenceScheduler {
         guard let liveBox else {
             // The single task finished before it could deposit state. Its
             // stream is already (or about to be) closed by its own loop; start
-            // the joining request fresh.
-            await admitToBatch(joining)
+            // the joining request fresh. It is (almost always) alone now, so
+            // prefer the zero-overhead single path; only join the engine when
+            // a third request already put live work in the driver (a single
+            // beside an active batch would decode concurrently with it).
+            if let driver, await driver.hasWork {
+                await admitToBatch(joining)
+            } else {
+                startSingleAfterUpgradeFallback(joining)
+            }
             return
         }
 
@@ -1276,7 +1283,13 @@ extension InferenceScheduler {
                 submitTime: single.submitTime,
                 reason: liveTokenIsStop ? .stop : .length
             )
-            await admitToBatch(joining)
+            // The joining request is alone unless a third request already put
+            // live work in the driver; prefer the zero-overhead single path.
+            if await driver.hasWork {
+                await admitToBatch(joining)
+            } else {
+                startSingleAfterUpgradeFallback(joining)
+            }
             return
         }
 
@@ -1297,7 +1310,12 @@ extension InferenceScheduler {
                 submitTime: single.submitTime,
                 reason: .length
             )
-            await admitToBatch(joining)
+            // Same solo-request preference as above.
+            if await driver.hasWork {
+                await admitToBatch(joining)
+            } else {
+                startSingleAfterUpgradeFallback(joining)
+            }
             return
         }
 
@@ -1464,8 +1482,10 @@ extension InferenceScheduler {
         // boxed and consumed at the `sending` boundary.
         var boxes: [SendableBox<ScheduledRequest>] = []
         boxes.reserveCapacity(queuedRequests.count)
-        while !queuedRequests.isEmpty {
-            boxes.append(SendableBox(queuedRequests.removeFirst()))
+        var pending = Array(queuedRequests.reversed())
+        queuedRequests.removeAll()
+        while !pending.isEmpty {
+            boxes.append(SendableBox(pending.removeLast()))
         }
         for box in boxes {
             let next = box.consume()
