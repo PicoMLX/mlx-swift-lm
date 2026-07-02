@@ -29,11 +29,13 @@ jobs:
   build:
     # Fork-only. Never runs on upstream ml-explore (kept inert if it lands there).
     if: github.repository == 'PicoMLX/mlx-swift-lm'
-    # macOS 15 (Sequoia) hosted runner: provides Xcode + the Metal toolchain
-    # needed to produce the Metal library that `swift build` alone cannot. Unlike
-    # the macos-14 image (which tops out at Xcode 15.4 / Swift 5.10), it can run
-    # Xcode 16.3+ for the Swift 6.1 toolchain that Package.swift requires.
-    runs-on: macos-15
+    # macOS 26 (Tahoe) hosted runner: provides Xcode 26.5+ with the Swift 6.3
+    # toolchain that mlx-swift >= 0.31.5 requires (its manifest declares
+    # swift-tools-version 6.3; the macos-15 image tops out at Xcode 26.3 /
+    # Swift 6.2.4, which cannot even resolve the dependency), plus the Metal
+    # toolchain needed to produce the Metal library that `swift build` alone
+    # cannot.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
         with:
