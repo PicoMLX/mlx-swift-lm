@@ -54,9 +54,14 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # -skipPackagePluginValidation / -skipMacroValidation: mlx-swift 0.31.5+
+      # ships a CudaBuild build-tool plugin (and swift-syntax provides macros);
+      # xcodebuild refuses unvalidated plugins/macros in non-interactive runs.
       - name: Build for testing (Xcode, macOS)
         run: |
-          xcodebuild build-for-testing -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation
 
       # Run every batching suite: all are self-contained (no model downloads —
       # the model-parity regressions use in-process random-weight models) and
@@ -70,6 +75,7 @@ jobs:
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation \
             -only-testing:MLXLMTests/BatchKVCacheCoverageTests \
             -only-testing:MLXLMTests/BatchRotatingKVCacheCoverageTests \
             -only-testing:MLXLMTests/BatchedCacheFactoryTests \
