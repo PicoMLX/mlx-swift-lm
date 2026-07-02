@@ -29,7 +29,7 @@ public final class LRUPromptCache: PromptCaching {
 
     /// Convenience alias for the protocol-neutral ``PromptCacheHitKind``.
     ///
-    /// Retained so existing call sites (and external consumers such as PicoCore)
+    /// Retained so existing call sites (and external consumers)
     /// can keep referring to `LRUPromptCache.HitKind`.
     public typealias HitKind = PromptCacheHitKind
 
@@ -154,7 +154,7 @@ public final class LRUPromptCache: PromptCaching {
     ///
     /// `OSAllocatedUnfairLock` is itself `Sendable`, so wrapping the mutable
     /// state in it makes ``LRUPromptCache`` a checked `Sendable` with no
-    /// `@unchecked Sendable` conformance on this type (replacing batching3's
+    /// `@unchecked Sendable` conformance on this type (replacing an earlier
     /// `NSLock` + `@unchecked Sendable`). The `uncheckedState:` initializer and
     /// `withLockUnchecked` accessor are required because `State` transitively
     /// holds non-`Sendable` `KVCache` values; the lock supplies the actual

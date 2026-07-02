@@ -56,14 +56,12 @@ public enum BatchedGenerationError: Error, Equatable {
     /// `generateBatched` was given fewer than the minimum supported requests.
     case batchTooSmall
 
-    /// The number of requests did not match the number of expected outputs.
-    case mismatchedRequestCounts
-
     /// One or more requests cannot be batched together (indices listed).
     case incompatibleRequests([Int])
 
-    /// The scheduler was busy with an incompatible workload.
-    case schedulerBusy
+    /// No scheduler is installed on the container, or the scheduler has no
+    /// bound model context to run requests against.
+    case schedulerUnavailable
 
     /// The scheduler is already attached to a different `ModelContainer`.
     /// A scheduler drives exactly one container's model; reusing it would

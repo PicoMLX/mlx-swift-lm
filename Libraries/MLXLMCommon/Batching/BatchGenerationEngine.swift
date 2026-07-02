@@ -289,7 +289,7 @@ public final class BatchGenerationEngine {
     // MARK: - PR4 bridge seam (single → batch upgrade)
 
     /// Splice a pre-filled, already-decoding ``DecodeBatch`` in as part of the
-    /// running set. This is the layr analogue of batching3's `setActiveBatch`,
+    /// running set. This mirrors upstream mlx-lm's `setActiveBatch` idea,
     /// used by PR4's single→batch upgrade to migrate an in-flight request
     /// (with its already-populated KV cache) into the batch **without
     /// re-prefilling** the prompt.

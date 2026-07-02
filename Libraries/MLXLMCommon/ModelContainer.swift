@@ -307,7 +307,7 @@ public final class ModelContainer: Sendable {
         _ requests: sending [GenerationRequest]
     ) async throws -> [AsyncStream<Generation>] {
         guard let scheduler else {
-            throw BatchedGenerationError.schedulerBusy
+            throw BatchedGenerationError.schedulerUnavailable
         }
         guard !requests.isEmpty else {
             throw BatchedGenerationError.batchTooSmall

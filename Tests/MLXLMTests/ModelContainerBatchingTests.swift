@@ -14,7 +14,7 @@ import Testing
 @Suite("ModelContainer batching API")
 struct ModelContainerBatchingTests {
 
-    @Test("No scheduler installed → generateBatched throws schedulerBusy")
+    @Test("No scheduler installed → generateBatched throws schedulerUnavailable")
     func generateBatchedRequiresScheduler() async throws {
         let container = ModelContainer(context: makeContext())
 

@@ -52,6 +52,12 @@ actor EngineDriver {
         /// generated-only tokens). Controls how `generationTokenCount` is
         /// derived in the completion info.
         let tokensIncludePrompt: Bool
+        /// When the row's first token reached its handler. Splits the
+        /// completion info's timing into admission-to-first-token
+        /// (reported as `promptTime`: queue wait + prefill) and pure decode
+        /// time; for adopted rows the earlier single-stream tokens predate
+        /// the driver, so this marks the first *batched* token.
+        var firstTokenAt: TimeInterval?
     }
 
     /// The number of generated tokens for a finished row, excluding prompt
@@ -398,7 +404,7 @@ actor EngineDriver {
     /// registered handlers and writing finished rows back to the prompt cache.
     ///
     /// Each step optionally runs under a wired-memory limit (the
-    /// ``layr/wiredmemory`` `drain` fold-in). `onResult` is invoked once per
+    /// the wired-memory `drain` fold-in). `onResult` is invoked once per
     /// engine step with that step's responses (used by the scheduler for
     /// state-machine transitions, e.g. detecting the batch has emptied).
     ///
@@ -483,6 +489,9 @@ actor EngineDriver {
     /// stream is flushed (tool calls), an `.info` event is emitted, and the
     /// handler is dropped.
     private func deliver(_ response: BatchStepResult) {
+        if records[response.uid]?.firstTokenAt == nil {
+            records[response.uid]?.firstTokenAt = Date.timeIntervalSinceReferenceDate
+        }
         guard let record = records[response.uid] else { return }
         let handler = record.handler
 
@@ -504,8 +513,8 @@ actor EngineDriver {
                     allTokens: response.allTokens,
                     suppressedStopToken: suppressesStopToken(record, reason: reason)
                 ),
-                promptTime: 0,
-                generationTime: max(0, now - record.submitTime),
+                promptTime: max(0, (record.firstTokenAt ?? now) - record.submitTime),
+                generationTime: max(0, now - (record.firstTokenAt ?? now)),
                 stopReason: reason
             )
             handler.yieldInfo(info)

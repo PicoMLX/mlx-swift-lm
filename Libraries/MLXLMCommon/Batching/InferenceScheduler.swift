@@ -454,7 +454,7 @@ extension InferenceScheduler {
         -> AsyncStream<Generation>
     {
         guard let context else {
-            throw BatchedGenerationError.schedulerBusy
+            throw BatchedGenerationError.schedulerUnavailable
         }
 
         let (stream, continuation) = AsyncStream.makeStream(of: Generation.self)

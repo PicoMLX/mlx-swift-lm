@@ -248,7 +248,7 @@ struct SchedulerValueTests {
         #expect(BatchedGenerationError.batchTooSmall == .batchTooSmall)
         let incompatible = BatchedGenerationError.incompatibleRequests([1, 2])
         #expect(incompatible == .incompatibleRequests([1, 2]))
-        #expect(BatchedGenerationError.batchTooSmall != .schedulerBusy)
+        #expect(BatchedGenerationError.batchTooSmall != .schedulerUnavailable)
     }
 }
 
