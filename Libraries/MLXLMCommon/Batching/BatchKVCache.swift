@@ -347,6 +347,15 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
                 self.leftPadding = concatenated([self.leftPadding, other.leftPadding], axis: 0)
                 self.batchOffsets = concatenated([self.batchOffsets, other.batchOffsets], axis: 0)
             } else if other.keys != nil {
+                // Adoption replaces this cache's row set wholesale, so the
+                // receiver must not be carrying admitted-but-unprefilled rows
+                // (metadata without keys) that would silently vanish.
+                precondition(
+                    self.batchSize == 0,
+                    "BatchKVCache.extend cannot adopt a prefilled `other` into "
+                        + "a receiver holding un-prefilled rows; prefill the "
+                        + "receiver's rows first."
+                )
                 // self empty, other populated: adopt other's state.
                 self.keys = other.keys
                 self.values = other.values

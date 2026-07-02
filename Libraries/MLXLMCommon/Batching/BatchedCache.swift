@@ -129,9 +129,22 @@ public final class BatchedCacheList: CacheList, BatchedCache {
     /// Report the attention child's offset so callers that derive masks from
     /// `cache.offset` (e.g. the array-based `createAttentionMask(h:cache:)`
     /// overload) see the batched progress rather than the inherited scalar `0`.
+    ///
+    /// The setter mirrors the getter's delegation so an external write is
+    /// visible on read-back. No pipeline code sets `offset` on a composite
+    /// (the `KVCache` protocol exposes it get-only); this is defensive
+    /// consistency for direct users of the concrete class.
     public override var offset: Int {
         get { maskingChild?.offset ?? super.offset }
-        set { super.offset = newValue }
+        set {
+            // `KVCache.offset` is get-only, so route through the concrete
+            // base class the batched caches share.
+            if let child = maskingChild as? BaseKVCache {
+                child.offset = newValue
+            } else {
+                super.offset = newValue
+            }
+        }
     }
 
     public override var maxSize: Int? {

@@ -133,19 +133,21 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// The maximum size of this cache (sliding window size).
     public override var maxSize: Int? { maxCacheSize }
 
-    /// The logical cache length, capped at `maxCacheSize`.
+    /// The absolute number of tokens processed, exactly matching single-stream
+    /// `RotatingKVCache.offset` (BaseKVCache's monotonic counter).
     ///
     /// `_idx` is the circular write pointer (reset to `keep` on wrap), so it is
     /// not a valid position to expose to generic callers: after the first
-    /// rotation it jumps backward. Paths that derive masks from `cache.offset`
-    /// rather than `makeMask` — e.g. the array-based `createAttentionMask(h:cache:)`
-    /// used by `Gemma2ModelInner` during multi-token cached prefill — would then
-    /// build masks with too small an offset. Report the monotonic logical length
-    /// (`_scalarOffset`) capped at the window, mirroring how single-stream
-    /// `RotatingKVCache.offset` reports a monotonic position rather than the ring
-    /// index. The setter drives `_scalarOffset` for symmetry.
+    /// rotation it jumps backward. And capping at `maxCacheSize` is equally
+    /// wrong: models consume `cache.offset` as an absolute position — e.g.
+    /// Gemma3n's `cachePosition` and Mistral3's llama-4 attention scaling — so
+    /// a capped value would freeze those computations once the window wraps,
+    /// diverging from the same model run single-stream. Mask math that needs
+    /// the window-capped span derives it internally (`makeMask`); paths that
+    /// derive masks from `cache.offset` route through `makeMask` via the
+    /// `BatchPositionedKVCache` branch of `createAttentionMask(h:cache:)`.
     public override var offset: Int {
-        get { min(_scalarOffset, maxCacheSize) }
+        get { _scalarOffset }
         set { _scalarOffset = newValue }
     }
 
@@ -402,7 +404,13 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
     public override var state: [MLXArray] {
         get {
-            guard let keys = self.keys, let values = self.values else { return [] }
+            // Mirror BatchKVCache: include the row metadata even when
+            // keys/values are nil (fresh cache, or emptied by
+            // filter(batchIndices: [])) so a get -> set round trip is
+            // lossless instead of trapping in the setter.
+            guard let keys = self.keys, let values = self.values else {
+                return [batchOffsets, leftPadding]
+            }
             let k: MLXArray
             let v: MLXArray
             if _scalarOffset < keys.dim(2) {
@@ -415,15 +423,25 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             return [k, v, batchOffsets, leftPadding]
         }
         set {
-            guard newValue.count == 4 else {
+            switch newValue.count {
+            case 2:
+                // Empty cache: only batchOffsets and leftPadding
+                self.keys = nil
+                self.values = nil
+                self.batchOffsets = newValue[0]
+                self.leftPadding = newValue[1]
+            case 4:
+                // Populated cache: keys, values, batchOffsets, leftPadding
+                self.keys = newValue[0]
+                self.values = newValue[1]
+                self.batchOffsets = newValue[2]
+                self.leftPadding = newValue[3]
+            default:
                 fatalError(
-                    "BatchRotatingKVCache state must have exactly 4 arrays (keys, values, offset, leftPadding)"
+                    "BatchRotatingKVCache state must have 2 arrays (batchOffsets, "
+                        + "leftPadding) or 4 arrays (keys, values, batchOffsets, leftPadding)"
                 )
             }
-            self.keys = newValue[0]
-            self.values = newValue[1]
-            self.batchOffsets = newValue[2]
-            self.leftPadding = newValue[3]
         }
     }
 
@@ -636,6 +654,17 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 + "prefilled (keys != nil) before extending; the engine prefills "
                 + "each admitted sub-batch before calling extend."
         )
+        // Rows from differently-configured windows cannot share a buffer:
+        // rotation/trim math would silently corrupt whichever side's config
+        // is ignored. The engine guarantees this (one factory per layer, and
+        // `parametersAreBatchable` rejects per-request maxKVSize overrides),
+        // so this only fires on direct misuse. Mirrors `merge`.
+        precondition(
+            other.maxCacheSize == maxCacheSize && other.keep == keep,
+            "BatchRotatingKVCache.extend requires matching maxSize/keep "
+                + "(self: \(maxCacheSize)/\(keep), other: "
+                + "\(other.maxCacheSize)/\(other.keep))"
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
@@ -643,6 +672,15 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 self.leftPadding = concatenated([self.leftPadding, other.leftPadding], axis: 0)
                 self.batchOffsets = concatenated([self.batchOffsets, other.batchOffsets], axis: 0)
             } else if other.keys != nil {
+                // Adoption replaces this cache's row set wholesale, so the
+                // receiver must not be carrying admitted-but-unprefilled rows
+                // (metadata without keys) that would silently vanish.
+                precondition(
+                    self.batchSize == 0,
+                    "BatchRotatingKVCache.extend cannot adopt a prefilled "
+                        + "`other` into a receiver holding un-prefilled rows; "
+                        + "prefill the receiver's rows first."
+                )
                 // self empty, other populated: adopt other's state.
                 self.keys = other.keys
                 self.values = other.values
@@ -1004,13 +1042,21 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         //     leftPadding 99 against a 16-col window) masks out every retained
         //     valid key. Use the physical `_idx` uncapped here.
         let spanForTrim = rotated ? min(_scalarOffset, maxCacheSize) : _idx
-        let trimSize = spanForTrim - maxCacheSize + (n > 1 ? 1 : 0)
+        // A prepared cache (`_lengths != nil`) routes even one-token updates
+        // through `updateConcat` (see `update`), which trims one slot exactly
+        // like a multi-token concat -- so the concat trim term applies to it
+        // regardless of `n`.
+        let trimSize = spanForTrim - maxCacheSize + (n > 1 || _lengths != nil ? 1 : 0)
         if trimSize > 0 {
             effectiveLeftPadding = effectiveLeftPadding - Int32(trimSize)
         }
 
-        // Check if rotated during single-token decode
-        let isRotated = n == 1 && (rotated || _idx >= maxCacheSize)
+        // Rotated single-token DECODE: the in-place update writes into the
+        // ring slot, so the mask columns must be rolled to the ring layout.
+        // A prepared (`_lengths != nil`) one-token update is NOT a decode --
+        // it takes the concat path and returns temporally ordered K/V, so
+        // rolling the mask here would misalign it against those keys.
+        let isRotated = n == 1 && _lengths == nil && (rotated || _idx >= maxCacheSize)
         if isRotated {
             effectiveLeftPadding = effectiveLeftPadding - Int32(1)
         }

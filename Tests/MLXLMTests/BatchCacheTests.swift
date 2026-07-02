@@ -261,6 +261,37 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(idx == stateWidth)
     }
 
+    @Test("offset reports the absolute processed count past the window")
+    func offsetStaysAbsolutePastWindow() {
+        // Single-stream RotatingKVCache.offset is BaseKVCache's monotonic
+        // counter; models consume it as an absolute position (Gemma3n's
+        // cachePosition, Mistral3's attention scaling). A window-capped value
+        // would freeze those computations after the first wrap.
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0], keep: 0)
+        let prefill = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
+        _ = cache.update(keys: prefill.0, values: prefill.1)
+        #expect(cache.offset == 4)
+
+        let decode = makeKV(batchSize: 1, heads: 2, seqLen: 1, headDim: 4, value: 2)
+        _ = cache.update(keys: decode.0, values: decode.1)
+        #expect(cache.offset == 5)
+    }
+
+    @Test("Empty-cache state round-trips through get/set")
+    func emptyStateRoundTrips() {
+        // A fresh (or filter-emptied) cache has no keys/values; its state is
+        // the 2-element row-metadata form, which the setter must accept
+        // instead of trapping -- mirroring BatchKVCache.
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [1, 2], keep: 0)
+        let snapshot = cache.state
+        #expect(snapshot.count == 2)
+
+        let restored = BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 0], keep: 0)
+        restored.state = snapshot
+        #expect(restored.isEmpty)
+        #expect(restored.leftPadding.asArray(Int32.self) == [1, 2])
+    }
+
     @Test("prepare/finalize preserve extractable state")
     func prepareFinalizePreserveExtractableState() {
         let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)

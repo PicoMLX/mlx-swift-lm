@@ -1305,11 +1305,23 @@ public class ArraysCache: BaseKVCache {
     }
 
     public override func prepare(lengths: [Int]?) {
-        self.lengths = lengths.map { MLXArray($0) }
+        prepare(lengths: lengths.map { MLXArray($0) })
     }
 
     public override func prepare(lengths: MLXArray?) {
-        self.lengths = lengths
+        // `lengths` arrives as a per-row COUNT of valid tokens (e.g.
+        // `LMInput.Text.sequenceLengths` = mask.sum), but every consumer --
+        // `makeMask`'s `position < lengths` and the SSM models' conv-state
+        // gathers -- treats the stored value as an absolute end position
+        // within the chunk. The two only coincide when there is no left
+        // padding, so convert count -> end here. Prepare time (not mask
+        // time) because `advance(N)` decrements both fields per chunk; a
+        // mask-time sum would double-shift after the first advance.
+        if let lengths, let leftPadding {
+            self.lengths = lengths + leftPadding
+        } else {
+            self.lengths = lengths
+        }
     }
 
     public override func finalize() {
@@ -1653,6 +1665,29 @@ public func savePromptCache(
     cache: [KVCache],
     metadata: [String: String] = [:]
 ) throws {
+    // Only cache classes registered in `cacheClassName`/`restoreCache` can
+    // round-trip. Anything else (e.g. the batched caches, whose `state` has a
+    // different arity) would silently serialize under the generic "KVCache"
+    // fallback and crash or be misread on load, so reject it up front.
+    func isSerializable(_ c: KVCache) -> Bool {
+        let t = Swift.type(of: c)
+        if t == KVCacheSimple.self || t == ChunkedKVCache.self || t == MambaCache.self
+            || t == ArraysCache.self || t == RotatingKVCache.self
+            || t == QuantizedKVCache.self
+        {
+            return true
+        }
+        if t == CacheList.self, let list = c as? CacheList {
+            return list.children.allSatisfy(isSerializable)
+        }
+        return false
+    }
+    if let unsupported = cache.first(where: { !isSerializable($0) }) {
+        throw KVCacheError(
+            message: "Cannot serialize cache of type \(type(of: unsupported)): no "
+                + "registered serialization class. Batched caches must be reduced "
+                + "to per-row caches (extractBatched/toSingle) first.")
+    }
     let cacheData = cache.map { $0.state }
     let cacheInfo = cache.map { $0.metaState }
     let cacheClasses = cache.map { cacheClassName($0) }

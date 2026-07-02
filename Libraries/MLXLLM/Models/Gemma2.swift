@@ -107,10 +107,13 @@ private func applyGemma2AttentionMask(
             maskArray = expandedDimensions(maskArray, axis: -3)
         }
         if maskArray.dtype == .bool {
-            // -1e9 saturates to the most negative representable value in
-            // reduced precision; softcapped true scores are tiny by
-            // comparison, so masked positions vanish after softmax.
-            return MLX.where(maskArray, scores, MLXArray(Float(-1e9)).asType(scores.dtype))
+            // Finite fill, NOT -1e9: casting -1e9 to float16 overflows to
+            // -inf (fp16 max finite is 65504), and an all-masked row (a
+            // fully left-padded query position) would softmax to NaN and
+            // poison every later layer's K/V. `maskFill` picks the most
+            // negative FINITE value per dtype, so masked positions still
+            // vanish after softmax while all-masked rows stay finite.
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
         } else {
             return scores + maskArray
         }
@@ -125,7 +128,7 @@ private func applyGemma2AttentionMask(
         let kIndices = MLXArray(Int32(0) ..< Int32(kL))
         let causal = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        return MLX.where(causal, scores, MLXArray(Float(-1e9)).asType(scores.dtype))
+        return MLX.where(causal, scores, MLXArray.maskFill(for: scores.dtype))
     case .array(let maskArray):
         return blend(maskArray)
     case .arrays(let maskArrays):
