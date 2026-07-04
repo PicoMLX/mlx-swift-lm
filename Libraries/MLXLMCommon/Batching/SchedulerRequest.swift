@@ -31,15 +31,6 @@ struct SchedulerRequest {
     /// Per-agent prompt-cache isolation salt.
     var promptCacheSalt: UInt64
 
-    /// A KV cache prefix recovered from the prompt cache (covering a leading
-    /// run of `inputTokens`), or `nil`. When present, only the remaining tokens
-    /// need prefilling. Carried for a future single-path cache-reuse hookup;
-    /// the batched engine prefills from scratch today.
-    var cachedKVState: [KVCache]?
-
-    /// The tokens not covered by `cachedKVState` (the prefill remainder).
-    var cachedPromptRemainder: [Int]?
-
     /// Optional wired-memory ticket.
     var wiredMemoryTicket: WiredMemoryTicket?
 
@@ -50,8 +41,6 @@ struct SchedulerRequest {
         modelName: String,
         promptCache: (any PromptCaching)? = nil,
         promptCacheSalt: UInt64 = 0,
-        cachedKVState: [KVCache]? = nil,
-        cachedPromptRemainder: [Int]? = nil,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) {
         self.input = input
@@ -60,8 +49,6 @@ struct SchedulerRequest {
         self.modelName = modelName
         self.promptCache = promptCache
         self.promptCacheSalt = promptCacheSalt
-        self.cachedKVState = cachedKVState
-        self.cachedPromptRemainder = cachedPromptRemainder
         self.wiredMemoryTicket = wiredMemoryTicket
     }
 }

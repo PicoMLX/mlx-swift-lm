@@ -101,4 +101,5 @@ jobs:
             -only-testing:MLXLMTests/CacheMigrationTests \
             -only-testing:MLXLMTests/SchedulerValueTests \
             -only-testing:MLXLMTests/ModelContainerBatchingTests \
-            -only-testing:MLXLMTests/PromptCacheTests
+            -only-testing:MLXLMTests/PromptCacheTests \
+            -only-testing:MLXLMTests/PrefixFetchTests
