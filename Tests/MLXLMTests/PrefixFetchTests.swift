@@ -21,13 +21,14 @@ struct PrefixFetchTests {
         let prompt = [1, 2, 3, 4, 5]
         let prefix = [1, 2, 3]
 
-        // Cold reference run: no prompt cache; the engine prefills the full
-        // prompt (the recorder sees a width-5 forward pass).
+        // Cold reference run: no prompt cache; the engine prefills the whole
+        // prompt EXCEPT its final token (PrefillBatch seeds the last token
+        // into the decode batch), so the recorder sees a width-(N-1) pass.
         let coldRecorder = WidthRecorder()
         let cold = try await runBatched(
             model: WidthRecordingLanguageModel(recorder: coldRecorder),
             prompt: prompt, promptCache: nil)
-        #expect(coldRecorder.widths.contains(prompt.count))
+        #expect(coldRecorder.widths.contains(prompt.count - 1))
 
         // Warm run: seed the cache with the prefix's KV, then submit the full
         // prompt. Only the remainder may be prefilled: the widest forward
