@@ -80,6 +80,12 @@ public actor InferenceScheduler {
     /// first request that needs batching.
     private var driver: EngineDriver?
 
+    /// Set by ``refreshContext(owner:context:)`` when the context was replaced
+    /// while a batch was still draining: the driver (which caches the model
+    /// and EOS set) is torn down at the next idle transition instead of
+    /// mid-flight.
+    private var driverStale = false
+
     /// Optional cross-request prompt cache (shared with the driver).
     private var promptCache: (any PromptCaching)?
 
@@ -149,6 +155,28 @@ public actor InferenceScheduler {
     /// Whether the scheduler already has a bound context.
     var isAttached: Bool { context != nil }
 
+    /// Replace the bound context after ``ModelContainer/update(_:)`` swaps a
+    /// context field (model/tokenizer/processor). Without this, scheduler-
+    /// routed generations would keep the attach-time copy forever while the
+    /// non-scheduler path re-reads the container's context per call.
+    ///
+    /// Owner-gated: a refresh from a container that is not the bound owner is
+    /// ignored. The driver caches the model and EOS set, so it is torn down —
+    /// immediately when no batch is running, otherwise deferred to
+    /// ``batchLoopFinished`` via `driverStale` (in-flight batched requests
+    /// finish on the model they started with, matching the single path, where
+    /// an in-flight iterator keeps its model reference).
+    func refreshContext(owner: ObjectIdentifier, context box: SendableBox<ModelContext>) async {
+        guard attachedOwner == owner else { return }
+        self.context = box.consume()
+        if let driver, await driver.hasWork {
+            driverStale = true
+        } else {
+            driver = nil
+            driverStale = false
+        }
+    }
+
     // MARK: - Stats
 
     /// Current number of actively decoding requests (best effort).
@@ -207,6 +235,10 @@ extension InferenceScheduler {
         let modelName: String
         let promptCacheSalt: UInt64
         let writeBackToPromptCache: Bool
+        /// The effective cache instance for this request (request-supplied,
+        /// falling back to the attach-time container cache); carried so the
+        /// upgrade path can hand it to the driver's adopted record.
+        let promptCache: (any PromptCaching)?
         let submitTime: TimeInterval
         let wiredMemoryTicket: WiredMemoryTicket?
         /// Whether this request's input can be reproduced on the batch
@@ -474,10 +506,28 @@ extension InferenceScheduler {
             throw BatchedGenerationError.schedulerUnavailable
         }
 
+        var request = request
+        // Topology-aware cache keying: fold the per-layer cache topology
+        // (concrete type + window size) into the salt before any fetch or
+        // write-back uses it, so entries created under different cache
+        // configurations (e.g. two maxKVSize values -> different rotating
+        // windows) can never collide under the same model/salt. Only done for
+        // cache-opted-in requests; the salt is unused otherwise.
+        if request.promptCache != nil {
+            request.promptCacheSalt = LRUPromptCache.topologySalt(
+                base: request.promptCacheSalt,
+                caches: context.model.newCache(parameters: request.parameters)
+            )
+        }
+
         let (stream, continuation) = AsyncStream.makeStream(of: Generation.self)
         let handler = SchedulerTokenHandler.text(
             continuation: continuation,
             tokenizer: context.tokenizer,
+            // Parity with generateTask's TextToolTokenLoopHandler: configured
+            // stop strings end generation semantically on both the single and
+            // batched paths (the handler returns `.stop` to its driver).
+            stopStrings: context.configuration.effectiveStopStrings,
             toolCallFormat: context.configuration.toolCallFormat ?? .json
         )
 
@@ -671,9 +721,15 @@ extension InferenceScheduler {
         // this request, so the stored entry is never aliased. (Batched-path
         // fetch — mixed-depth prefill in the engine — is not wired yet; engine
         // rows still prefill fully and only write back.)
+        // Honor the request's own cache instance first (GenerationRequest
+        // documents `promptCache` as the cache to use); the attach-time
+        // container cache is the fallback. The auto-routed ModelContainer
+        // path sets both to the same instance.
+        let effectivePromptCache = scheduled.request.promptCache ?? self.promptCache
+
         var iteratorCache: [KVCache]? = nil
         var iteratorInput = scheduled.request.input
-        if let promptCache, writeBack,
+        if let promptCache = effectivePromptCache, writeBack,
             LRUPromptCache.canUsePromptCache(
                 input: scheduled.request.input, parameters: parameters, model: context.model)
         {
@@ -719,7 +775,7 @@ extension InferenceScheduler {
 
         // The (Sendable) prompt cache rides into the task for write-back on
         // natural completion; nil when this request did not opt in.
-        let cacheForWriteBack = writeBack ? self.promptCache : nil
+        let cacheForWriteBack = writeBack ? effectivePromptCache : nil
 
         let task = Task<Void, Never> { [weak self] in
             let inputs = boxed.consume()
@@ -758,6 +814,7 @@ extension InferenceScheduler {
             modelName: modelName,
             promptCacheSalt: salt,
             writeBackToPromptCache: writeBack,
+            promptCache: cacheForWriteBack,
             submitTime: submitTime,
             wiredMemoryTicket: ticket,
             inputIsBatchable: batchableInput
@@ -860,8 +917,19 @@ extension InferenceScheduler {
 
                 generated.append(token)
 
-                if handler.processToken(token) == false {
+                switch handler.processToken(token) {
+                case .more:
+                    break
+                case .stop:
+                    // A configured stop string completed in the decoded text;
+                    // finish exactly like a stop token (the filter already
+                    // emitted the text ahead of the stop and suppressed the
+                    // rest).
+                    stopReason = .stop
+                case .cancelled:
                     cancelled = true
+                }
+                if stopReason != nil || cancelled {
                     break
                 }
             }
@@ -1190,6 +1258,13 @@ extension InferenceScheduler {
         // installed by a concurrent path after the batch emptied must not be
         // clobbered back to `.idle` (its request would become untracked).
         guard case .batched = state else { return }
+        // The context was replaced while this batch drained; drop the driver
+        // now that it is idle so the next batch is built from the fresh
+        // context (see `refreshContext`).
+        if driverStale {
+            self.driver = nil
+            driverStale = false
+        }
         state = .idle
         // Requests held because their parameters could not run on the
         // shared engine (see `parametersAreBatchable`) are drained once
@@ -1360,7 +1435,11 @@ extension InferenceScheduler {
         }
 
         // Deliver the live token to the original handler before adoption (the
-        // batch will seed from it but not re-emit it).
+        // batch will seed from it but not re-emit it). If this token happens
+        // to complete a configured stop string, the handler's filter latches
+        // (`.stop` is returned again for the next token), so the driver
+        // finishes the adopted row on its first batched delivery — one step
+        // late but never past the stop.
         _ = single.handler.processToken(liveCurrentToken)
 
         // Phase 2: build the adopted decode batch from migrated state. The
@@ -1381,6 +1460,7 @@ extension InferenceScheduler {
             inputTokens: single.inputTokens,
             modelName: single.modelName,
             promptCacheSalt: single.promptCacheSalt,
+            promptCache: single.promptCache,
             submitTime: single.submitTime,
             writeBackToPromptCache: single.writeBackToPromptCache
         )

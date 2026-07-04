@@ -291,4 +291,26 @@ struct PromptCacheTests {
         let afterTrim = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3], salt: 0)
         #expect(afterTrim.hitKind == .none)
     }
+
+    @Test("topologySalt separates cache topologies and is stable")
+    func topologySaltSeparatesTopologies() {
+        // Same base salt, different topologies -> different keys, so entries
+        // created under different maxKVSize windows can never collide.
+        let base: UInt64 = 7
+        let small = LRUPromptCache.topologySalt(
+            base: base, caches: [RotatingKVCache(maxSize: 8)])
+        let large = LRUPromptCache.topologySalt(
+            base: base, caches: [RotatingKVCache(maxSize: 16)])
+        let simple = LRUPromptCache.topologySalt(base: base, caches: [KVCacheSimple()])
+        let smallAgain = LRUPromptCache.topologySalt(
+            base: base, caches: [RotatingKVCache(maxSize: 8)])
+
+        #expect(small == smallAgain)
+        #expect(small != large)
+        #expect(small != simple)
+        #expect(large != simple)
+        // The user-supplied base still participates in the key.
+        #expect(
+            small != LRUPromptCache.topologySalt(base: 8, caches: [RotatingKVCache(maxSize: 8)]))
+    }
 }

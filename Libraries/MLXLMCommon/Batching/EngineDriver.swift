@@ -42,6 +42,11 @@ actor EngineDriver {
         let inputTokens: [Int]
         let modelName: String
         let promptCacheSalt: UInt64
+        /// The request's own prompt-cache instance (GenerationRequest
+        /// documents `promptCache` as the cache to use). Preferred over the
+        /// driver-level cache for this row's write-back; the auto-routed
+        /// ModelContainer path sets both to the same instance.
+        let promptCache: (any PromptCaching)?
         let submitTime: TimeInterval
         /// Whether to write this request's final KV state back to the prompt
         /// cache when it finishes.
@@ -58,6 +63,10 @@ actor EngineDriver {
         /// time; for adopted rows the earlier single-stream tokens predate
         /// the driver, so this marks the first *batched* token.
         var firstTokenAt: TimeInterval?
+        /// Tokens delivered to this row's handler so far. Used as the
+        /// generated-token count when a stop-string match finishes the row
+        /// mid-stream (no engine `allTokens` is available on that path).
+        var deliveredTokenCount: Int = 0
     }
 
     /// The number of generated tokens for a finished row, excluding prompt
@@ -295,6 +304,7 @@ actor EngineDriver {
             inputTokens: request.inputTokens,
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
+            promptCache: request.promptCache,
             submitTime: Date.timeIntervalSinceReferenceDate,
             writeBackToPromptCache: request.promptCache != nil,
             tokensIncludePrompt: true
@@ -316,6 +326,7 @@ actor EngineDriver {
         let inputTokens: [Int]
         let modelName: String
         let promptCacheSalt: UInt64
+        let promptCache: (any PromptCaching)?
         let submitTime: TimeInterval
         let writeBackToPromptCache: Bool
     }
@@ -372,6 +383,7 @@ actor EngineDriver {
             inputTokens: record.inputTokens,
             modelName: record.modelName,
             promptCacheSalt: record.promptCacheSalt,
+            promptCache: record.promptCache,
             submitTime: record.submitTime,
             writeBackToPromptCache: record.writeBackToPromptCache,
             // Adopted rows carry the FULL history (prompt + generated): the
@@ -380,7 +392,10 @@ actor EngineDriver {
             // iterator had (which seeded from the prompt before decoding).
             // `makeAdoptedBatch` drops the trailing seed and priming
             // re-appends it, so `allTokens` equals prompt + generated.
-            tokensIncludePrompt: true
+            tokensIncludePrompt: true,
+            // Seed with the tokens already emitted on the single path so a
+            // later stop-string finish reports the full generated count.
+            deliveredTokenCount: numTokens
         )
         engine.adoptActiveBatch(batch)
     }
@@ -498,7 +513,10 @@ actor EngineDriver {
 
     /// One engine step with token fan-out and prompt-cache write-back.
     private func stepOnce(onResult: (@Sendable ([BatchStepResult]) -> Void)?) {
-        let captureCaches = promptCache != nil
+        // Capture final caches when ANY destination cache exists -- the
+        // driver-level one or a per-record (per-request) instance.
+        let captureCaches =
+            promptCache != nil || records.values.contains { $0.promptCache != nil }
         let (responses, finishedCaches) = engine.next(capturingFinalCaches: captureCaches)
 
         // Write finished rows back BEFORE delivery, while their records (which
@@ -519,6 +537,7 @@ actor EngineDriver {
         if records[response.uid]?.firstTokenAt == nil {
             records[response.uid]?.firstTokenAt = Date.timeIntervalSinceReferenceDate
         }
+        records[response.uid]?.deliveredTokenCount += 1
         guard let record = records[response.uid] else { return }
         let handler = record.handler
 
@@ -548,7 +567,15 @@ actor EngineDriver {
             handler.finish()
             records.removeValue(forKey: response.uid)
         } else {
-            if handler.processToken(response.token) == false {
+            switch handler.processToken(response.token) {
+            case .more:
+                break
+            case .stop:
+                // A configured stop string completed in this row's decoded
+                // text. Finish the stream like a natural stop and drop the
+                // row from the engine.
+                finishOnSemanticStop(response.uid)
+            case .cancelled:
                 // Consumer cancelled mid-stream. Route through `cancel(uid:)` so
                 // the engine drop, stream finish, record removal, and waiting-
                 // queue admission all happen in one place.
@@ -557,13 +584,42 @@ actor EngineDriver {
         }
     }
 
+    /// Finish a row whose handler reported a semantic stop (`.stop` from
+    /// `processToken`: a configured stop string completed in the decoded
+    /// text). Mirrors the natural-finish branch of `deliver` — EOS flush,
+    /// `.info` with `.stop`, stream close — then removes the row from the
+    /// engine and admits any waiters into the freed slot.
+    private func finishOnSemanticStop(_ uid: Int) {
+        if let record = records.removeValue(forKey: uid) {
+            let handler = record.handler
+            handler.processEndOfSequence()
+            let now = Date.timeIntervalSinceReferenceDate
+            let info = GenerateCompletionInfo(
+                promptTokenCount: record.promptTokenCount,
+                // No engine `allTokens` on this path (the row is still live
+                // from the engine's perspective); the per-record delivery
+                // counter is exactly the generated-token count.
+                generationTokenCount: record.deliveredTokenCount,
+                promptTime: max(0, (record.firstTokenAt ?? now) - record.submitTime),
+                generationTime: max(0, now - (record.firstTokenAt ?? now)),
+                stopReason: .stop
+            )
+            handler.yieldInfo(info)
+            handler.finish()
+        }
+        _ = engine.cancel(uid: uid)
+        admitWaitingIfPossible()
+    }
+
     /// Write a finished row's final KV state back to the prompt cache. Runs on
     /// the driver actor (it owns the cache reference); ``FinishedRowCache`` is
     /// non-`Sendable` and never crosses a boundary.
     private func writeBack(_ finished: FinishedRowCache) {
-        guard let cache = promptCache,
-            let record = records[finished.uid],
-            record.writeBackToPromptCache
+        guard let record = records[finished.uid],
+            record.writeBackToPromptCache,
+            // The request's own cache instance wins; the driver-level cache
+            // (from attach) is the fallback for records without one.
+            let cache = record.promptCache ?? promptCache
         else { return }
 
         // Force the extracted caches to the device before storing them.

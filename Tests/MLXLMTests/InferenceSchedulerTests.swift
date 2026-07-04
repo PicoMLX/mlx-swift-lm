@@ -25,8 +25,8 @@ struct SchedulerTokenHandlerTests {
             includeStopToken: true
         )
 
-        #expect(handler.processToken(4))
-        #expect(handler.processStopToken(8))
+        #expect(handler.processToken(4) == .more)
+        #expect(handler.processStopToken(8) == .more)
         handler.yieldInfo(
             GenerateCompletionInfo(
                 promptTokenCount: 2,
@@ -53,8 +53,8 @@ struct SchedulerTokenHandlerTests {
             includeStopToken: false
         )
 
-        #expect(handler.processToken(4))
-        #expect(handler.processStopToken(8))
+        #expect(handler.processToken(4) == .more)
+        #expect(handler.processStopToken(8) == .more)
         handler.finish()
 
         let collected = await collectTokenGenerations(stream)
@@ -70,7 +70,7 @@ struct SchedulerTokenHandlerTests {
             toolCallFormat: .json
         )
 
-        #expect(handler.processToken(1))
+        #expect(handler.processToken(1) == .more)
         handler.processEndOfSequence()
         handler.yieldInfo(
             GenerateCompletionInfo(
@@ -86,6 +86,34 @@ struct SchedulerTokenHandlerTests {
         let collected = await collectGenerations(stream)
         let info = try #require(collected.info)
         #expect(info.stopReason == .length)
+    }
+
+    @Test("Text handler reports a semantic stop when a stop string completes")
+    func textHandlerStopsOnStopString() async throws {
+        let (stream, continuation) = AsyncStream<Generation>.makeStream()
+        let handler = SchedulerTokenHandler.text(
+            continuation: continuation,
+            tokenizer: TestTokenizer(vocabulary: [1: "alpha", 2: "STOP", 3: "omega"]),
+            stopStrings: ["STOP"],
+            toolCallFormat: .json
+        )
+
+        let first = handler.processToken(1)
+        _ = handler.processToken(2)
+        // Whether the detokenizer released "STOP" on its own token or held it
+        // until more text arrived, the filter has latched by now: parity with
+        // TextToolTokenLoopHandler, which stops the loop at the match.
+        let afterStop = handler.processToken(3)
+        #expect(first == .more)
+        #expect(afterStop == .stop)
+
+        handler.processEndOfSequence()
+        handler.finish()
+
+        let text = await collectGenerations(stream).chunks.joined()
+        #expect(text.contains("alpha"))
+        #expect(!text.contains("STOP"))
+        #expect(!text.contains("omega"))
     }
 }
 

@@ -163,6 +163,19 @@ public final class ModelContainer: Sendable {
         await context.update {
             action(&$0)
         }
+        // Keep an attached scheduler in sync: it holds a copy of the context
+        // boxed at attach time, which would otherwise go stale when a field
+        // (model/tokenizer/processor) is REPLACED here — scheduler-routed
+        // generations would silently keep the old one while the non-scheduler
+        // path re-reads per call. (In-place mutation of the shared model
+        // object, e.g. the LoRA flow, propagates either way.) refreshContext
+        // is owner-gated, so this is a no-op for a scheduler bound elsewhere.
+        if let scheduler, await scheduler.currentOwner == ObjectIdentifier(self) {
+            let box: SendableBox<ModelContext> = await context.read { context in
+                SendableBox(context)
+            }
+            await scheduler.refreshContext(owner: ObjectIdentifier(self), context: box)
+        }
     }
 
     // MARK: - Thread-safe convenience methods

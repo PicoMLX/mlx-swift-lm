@@ -27,15 +27,28 @@ struct SchedulerTokenHandler: Sendable {
         case rawTokens(includeStopToken: Bool)
     }
 
+    /// What the caller must do after handing the handler one token.
+    enum TokenDisposition: Sendable, Equatable {
+        /// Keep generating.
+        case more
+        /// A semantic stop completed in the decoded text (a configured stop
+        /// string fully matched). The text before the stop was already
+        /// emitted and the stop text suppressed; the caller must finish the
+        /// request with `.stop`, exactly like a stop token.
+        case stop
+        /// The consumer dropped the stream.
+        case cancelled
+    }
+
     /// Which output mode this handler serves.
     let mode: OutputMode
 
-    /// Process a generated token. Returns `false` if the consumer cancelled.
-    let processToken: @Sendable (Int) -> Bool
+    /// Process a generated token.
+    let processToken: @Sendable (Int) -> TokenDisposition
 
     /// Process a stop token. Only meaningful for `.rawTokens(includeStopToken: true)`.
-    /// Returns `false` if the consumer cancelled.
-    let processStopToken: @Sendable (Int) -> Bool
+    /// Never returns `.stop` (the caller is already finishing the request).
+    let processStopToken: @Sendable (Int) -> TokenDisposition
 
     /// Flush buffered state at end-of-sequence (e.g. pending tool calls for text mode).
     let processEndOfSequence: @Sendable () -> Void
@@ -58,6 +71,7 @@ extension SchedulerTokenHandler {
     /// `OSAllocatedUnfairLock` so this box is `Sendable` with no `@unchecked`.
     private struct TextMutableState {
         var detokenizer: NaiveStreamingDetokenizer
+        var stopStringFilter: StopStringFilter
         let toolCallProcessor: ToolCallProcessor
     }
 
@@ -73,6 +87,7 @@ extension SchedulerTokenHandler {
 
         init(
             tokenizer: Tokenizer,
+            stopStrings: Set<String>,
             toolCallFormat: ToolCallFormat,
             continuation: AsyncStream<Generation>.Continuation
         ) {
@@ -80,6 +95,7 @@ extension SchedulerTokenHandler {
             self.mutableState = OSAllocatedUnfairLock(
                 uncheckedState: TextMutableState(
                     detokenizer: NaiveStreamingDetokenizer(tokenizer: tokenizer),
+                    stopStringFilter: StopStringFilter(stopStrings: stopStrings),
                     toolCallProcessor: ToolCallProcessor(format: toolCallFormat)
                 ))
         }
@@ -90,49 +106,72 @@ extension SchedulerTokenHandler {
     }
 
     /// Create a handler that detokenizes tokens and yields `.chunk` / `.toolCall` events.
+    ///
+    /// `stopStrings` mirrors `generateTask`'s `TextToolTokenLoopHandler`: the
+    /// decoded text is run through a ``StopStringFilter`` BEFORE tool-call
+    /// parsing (text ahead of a stop is emitted, the stop text and everything
+    /// after are suppressed), and a completed stop string returns `.stop` so
+    /// the caller finishes the request like a stop token.
     static func text(
         continuation: AsyncStream<Generation>.Continuation,
         tokenizer: Tokenizer,
+        stopStrings: Set<String> = [],
         toolCallFormat: ToolCallFormat
     ) -> SchedulerTokenHandler {
         let box = TextState(
             tokenizer: tokenizer,
+            stopStrings: stopStrings,
             toolCallFormat: toolCallFormat,
             continuation: continuation
         )
 
+        // Shared emit path: route filtered text through the tool-call
+        // processor and drain any completed tool calls in FIFO order (popLast
+        // would emit only the last one, in LIFO order, and delay the rest to
+        // end-of-sequence). Returns false when the consumer cancelled.
+        @Sendable func emitText(_ text: String, _ state: inout TextMutableState) -> Bool {
+            if let textToYield = state.toolCallProcessor.processChunk(text) {
+                if case .terminated = box.continuation.yield(.chunk(textToYield)) {
+                    return false
+                }
+            }
+            if !state.toolCallProcessor.toolCalls.isEmpty {
+                let pending = state.toolCallProcessor.toolCalls
+                state.toolCallProcessor.toolCalls.removeAll()
+                for toolCall in pending {
+                    if case .terminated = box.continuation.yield(.toolCall(toolCall)) {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+
         return SchedulerTokenHandler(
             mode: .decoded,
             processToken: { token in
-                box.withMutableState { state -> Bool in
+                box.withMutableState { state -> TokenDisposition in
                     state.detokenizer.append(token: token)
-                    guard let chunk = state.detokenizer.next() else { return true }
-                    if let textToYield = state.toolCallProcessor.processChunk(chunk) {
-                        if case .terminated = box.continuation.yield(.chunk(textToYield)) {
-                            return false
-                        }
+                    guard let chunk = state.detokenizer.next() else { return .more }
+                    let result = state.stopStringFilter.process(chunk)
+                    if let text = result.text, !emitText(text, &state) {
+                        return .cancelled
                     }
-                    // Drain ALL accumulated tool calls in FIFO order (popLast
-                    // would emit only the last one, in LIFO order, and delay the
-                    // rest to end-of-sequence).
-                    if !state.toolCallProcessor.toolCalls.isEmpty {
-                        let pending = state.toolCallProcessor.toolCalls
-                        state.toolCallProcessor.toolCalls.removeAll()
-                        for toolCall in pending {
-                            if case .terminated = box.continuation.yield(.toolCall(toolCall)) {
-                                return false
-                            }
-                        }
-                    }
-                    return true
+                    return result.stopped ? .stop : .more
                 }
             },
             processStopToken: { _ in
                 // Decoded mode never emits stop tokens.
-                true
+                .more
             },
             processEndOfSequence: {
                 box.withMutableState { state in
+                    // Release text the stop-string filter held back as a
+                    // potential stop prefix that never completed — parity
+                    // with `TextToolTokenLoopHandler.onGenerationEnd`.
+                    if let held = state.stopStringFilter.finish(), !emitText(held, &state) {
+                        return
+                    }
                     // Flush any text the ToolCallProcessor buffered while
                     // deciding whether it was a tool call. Without
                     // `returnBufferedText: true` a trailing non-tool fragment
@@ -181,18 +220,21 @@ extension SchedulerTokenHandler {
     ) -> SchedulerTokenHandler {
         SchedulerTokenHandler(
             mode: .rawTokens(includeStopToken: includeStopToken),
+            // No stop-string filtering in raw mode: stop strings are a
+            // text-level concept and the historical raw-token path does not
+            // detokenize, matching `generateTokenTask`.
             processToken: { token in
                 if case .terminated = continuation.yield(.token(token)) {
-                    return false
+                    return .cancelled
                 }
-                return true
+                return .more
             },
             processStopToken: { token in
-                guard includeStopToken else { return true }
+                guard includeStopToken else { return .more }
                 if case .terminated = continuation.yield(.token(token)) {
-                    return false
+                    return .cancelled
                 }
-                return true
+                return .more
             },
             processEndOfSequence: {
                 // No-op for raw token mode.

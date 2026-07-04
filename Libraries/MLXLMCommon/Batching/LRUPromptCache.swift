@@ -309,6 +309,28 @@ public final class LRUPromptCache: PromptCaching {
             }
     }
 
+    /// Fold a stable fingerprint of a cache topology (per-layer concrete type
+    /// and window size) into a prompt-cache salt.
+    ///
+    /// Entries are keyed by (model, salt): without this, the same model and
+    /// salt used with different cache configurations — e.g. two
+    /// `GenerateParameters.maxKVSize` values producing `RotatingKVCache`s with
+    /// different windows — would collide, and a lookup could return KV state
+    /// shaped for the wrong window. Callers mix the topology in before any
+    /// fetch/insert (the scheduler does this once per request).
+    public static func topologySalt(base: UInt64, caches: [KVCache]) -> UInt64 {
+        // FNV-1a over per-layer "TypeName:maxSize;" descriptors.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for cache in caches {
+            let window = cache.maxSize.map { String($0) } ?? "-"
+            for byte in "\(Swift.type(of: cache)):\(window);".utf8 {
+                hash ^= UInt64(byte)
+                hash = hash &* 0x100_0000_01b3
+            }
+        }
+        return base ^ hash
+    }
+
     static func canUsePromptCache(
         input: LMInput,
         parameters: GenerateParameters,
@@ -396,6 +418,17 @@ public final class LRUPromptCache: PromptCaching {
         let isLinear = meta.count == 5 && Int(meta[4]) == rotating.offset
         if isLinear {
             rotating.trim(rotating.offset - tokenCount)
+            // `trim` is logical (it only decrements offset/idx); the copied
+            // backing buffers still hold the pre-trim length, while byte
+            // accounting sums the `state` getter's `..<offset` slices. Re-set
+            // the state from those slices (physically detached) so the entry
+            // retains exactly what `maxBytes` accounting measures.
+            let truncated = rotating.state.map {
+                $0 + MLXArray.zeros($0.shape, dtype: $0.dtype)
+            }
+            let meta = rotating.metaState
+            rotating.state = truncated
+            rotating.metaState = meta
             return rotating
         }
         return RotatingKVCache(maxSize: rotating.maxSize ?? 0)
