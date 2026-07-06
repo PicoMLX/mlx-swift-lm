@@ -675,7 +675,7 @@ extension InferenceScheduler {
     private struct SingleTaskInputs {
         let configuration: ModelConfiguration
         let tokenizer: Tokenizer
-        let iterator: TokenIterator
+        let iterator: any TokenIteratorProtocol
     }
 
     /// Start a request on the zero-overhead single-stream path. The task drives
@@ -841,7 +841,7 @@ extension InferenceScheduler {
         parameters: GenerateParameters,
         configuration: ModelConfiguration,
         tokenizer: Tokenizer,
-        iterator: consuming TokenIterator,
+        iterator: consuming any TokenIteratorProtocol,
         handler: SchedulerTokenHandler,
         upgradeFlag: UpgradeFlag,
         promptTokenCount: Int,
@@ -889,15 +889,24 @@ extension InferenceScheduler {
                 // this the task never touches `it`/its caches again
                 // (region-isolation invariant).
                 if upgradeFlag.upgradeRequested {
-                    return .deposit(
-                        LiveIteratorState(
-                            cache: it.cache,
-                            currentToken: it.y.tokens.item(Int.self),
-                            tokenCount: it.tokenCount,
-                            maxTokens: it.maxTokens,
-                            parameters: parameters,
-                            generatedTokenIds: generated
-                        ))
+                    if let concrete = it as? TokenIterator {
+                        return .deposit(
+                            LiveIteratorState(
+                                cache: concrete.cache,
+                                currentToken: concrete.y.tokens.item(Int.self),
+                                tokenCount: concrete.tokenCount,
+                                maxTokens: concrete.maxTokens,
+                                parameters: parameters,
+                                generatedTokenIds: generated
+                            ))
+                    }
+                    // A non-plain iterator (e.g. a future speculative one on
+                    // this path) has no batch-migratable snapshot: decline
+                    // the handshake so the scheduler falls back, and keep
+                    // decoding single. Unreachable today -- `startSingle`
+                    // only constructs plain `TokenIterator`s -- but keeps
+                    // the loop honest once other iterators arrive here.
+                    upgradeFlag.markTaskFinished()
                 }
 
                 guard let token = it.next() else {
