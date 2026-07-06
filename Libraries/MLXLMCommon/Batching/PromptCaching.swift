@@ -20,6 +20,31 @@ public enum PromptCacheHitKind: String, Sendable, Equatable {
     case longer
 }
 
+/// An opaque, immutable snapshot of per-layer KV state.
+///
+/// The storage is deliberately non-public so its representation can move from
+/// today's deep-copied `[KVCache]` to a `Sendable` materialized payload (e.g.
+/// mlx-swift's upcoming `MaterializedMLXArray`) without a source break:
+/// conformers construct snapshots from live caches, consumers materialize
+/// them back, and neither sees the representation. `Sendable` conformance is
+/// intentionally deferred to that future representation.
+public struct PromptCacheSnapshot {
+    /// Today: deep-copied, evaluated caches owned by whoever holds the
+    /// snapshot. The future materialized representation replaces this
+    /// stored property without changing the public surface.
+    private let storage: [KVCache]
+
+    /// Wrap already-detached (deep-copied, evaluated) per-layer caches.
+    public init(caches: [KVCache]) {
+        self.storage = caches
+    }
+
+    /// The live per-layer caches this snapshot carries.
+    public func materialize() -> [KVCache] {
+        storage
+    }
+}
+
 /// The result of a prompt-cache lookup.
 ///
 /// This is the protocol-neutral result type returned by
@@ -32,8 +57,12 @@ public enum PromptCacheHitKind: String, Sendable, Equatable {
 /// ``PromptCaching`` conformer is `Sendable`; results are consumed locally by
 /// the actor that performed the lookup (a freshly materialized deep copy).
 public struct PromptCacheFetchResult {
-    /// A deep copy of the matched cache, or `nil` if nothing matched.
-    public let cache: [KVCache]?
+    /// An opaque snapshot of the matched KV state, or `nil` if nothing
+    /// matched. See ``PromptCacheSnapshot`` for the representation contract.
+    public let snapshot: PromptCacheSnapshot?
+    /// The live caches from ``snapshot`` (deep copies owned by the caller),
+    /// or `nil` if nothing matched.
+    public var cache: [KVCache]? { snapshot?.materialize() }
     /// The tokens that still need processing after the cached prefix.
     public let remainder: [Int]
     /// How the lookup matched.
@@ -45,15 +74,31 @@ public struct PromptCacheFetchResult {
     public var reusedTokenCount: Int { matchedTokenCount }
 
     public init(
+        snapshot: PromptCacheSnapshot?,
+        remainder: [Int],
+        hitKind: PromptCacheHitKind,
+        matchedTokenCount: Int
+    ) {
+        self.snapshot = snapshot
+        self.remainder = remainder
+        self.hitKind = hitKind
+        self.matchedTokenCount = matchedTokenCount
+    }
+
+    /// Convenience: wrap live caches in a snapshot. The caches must already
+    /// be detached copies (every in-repo producer deep-copies at fetch).
+    public init(
         cache: [KVCache]?,
         remainder: [Int],
         hitKind: PromptCacheHitKind,
         matchedTokenCount: Int
     ) {
-        self.cache = cache
-        self.remainder = remainder
-        self.hitKind = hitKind
-        self.matchedTokenCount = matchedTokenCount
+        self.init(
+            snapshot: cache.map(PromptCacheSnapshot.init(caches:)),
+            remainder: remainder,
+            hitKind: hitKind,
+            matchedTokenCount: matchedTokenCount
+        )
     }
 }
 
