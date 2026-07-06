@@ -34,6 +34,20 @@ public protocol BatchedCache: KVCache {
 
     /// Advance chunk-local metadata after a chunked prefill step.
     func advanceBatched(_ n: Int)
+
+    /// Rewind each row's tail by the given per-row token counts (the rollback
+    /// primitive speculative decoding needs to reject draft tokens). Returns
+    /// the amounts actually trimmed per row (clamped to each row's live
+    /// length). The default implementation trims nothing and returns zeros --
+    /// cache types without per-row rewind support are simply not rollback-
+    /// capable, and callers must check the return value.
+    func trimBatched(perRow: [Int]) -> [Int]
+}
+
+extension BatchedCache {
+    public func trimBatched(perRow: [Int]) -> [Int] {
+        Array(repeating: 0, count: perRow.count)
+    }
 }
 
 // MARK: - BatchedCacheList

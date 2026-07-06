@@ -241,6 +241,40 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         return trimmed
     }
 
+    /// Rewind each row's tail by `perRow[i]` tokens, keeping every row's end
+    /// aligned at the (reduced) shared write position.
+    ///
+    /// Same mechanics as ``finalize()`` in reverse: the shared `_idx` drops by
+    /// the SMALLEST requested trim, and each row needing a larger trim is
+    /// rolled right by the difference so its retained tail lands on the new
+    /// common end column; the rolled-in garbage wraps into the row's
+    /// left-padding region, which masks it out. Per-row trims are clamped to
+    /// the row's live length; the clamped amounts are returned.
+    public func trimBatched(perRow: [Int]) -> [Int] {
+        precondition(
+            perRow.count == batchSize,
+            "trimBatched(perRow:) requires one entry per row")
+        guard keys != nil, _idx > 0 else {
+            return Array(repeating: 0, count: perRow.count)
+        }
+        let live = batchOffsets.asArray(Int32.self).map { max(0, Int($0)) }
+        let trims = zip(perRow, live).map { min(max(0, $0), $1, _idx) }
+        guard let minTrim = trims.min() else { return [] }
+        if trims.allSatisfy({ $0 == 0 }) { return trims }
+
+        // Rows trimming more than the minimum shift right to stay aligned.
+        let shifts = trims.map { Int32($0 - minTrim) }
+        if shifts.contains(where: { $0 > 0 }), let k = keys, let v = values {
+            let shiftArr = MLXArray(shifts)[0..., .newAxis]
+            keys = dynamicRoll(k, shifts: shiftArr, axis: 2)
+            values = dynamicRoll(v, shifts: shiftArr, axis: 2)
+            leftPadding = leftPadding + MLXArray(shifts)
+        }
+        _idx -= minTrim
+        batchOffsets = batchOffsets - MLXArray(trims.map { Int32($0) })
+        return trims
+    }
+
     /// The batch size (number of sequences).
     public var batchSize: Int {
         leftPadding.dim(0)

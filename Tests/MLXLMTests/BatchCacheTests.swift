@@ -161,6 +161,31 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(keys.dim(2) <= 4)
     }
 
+    @Test("trimBatched rewinds per-row tails and realigns rows")
+    func trimBatchedRewindsPerRowTails() {
+        // Two equal-length rows; rewind row 0 by 2 and row 1 by 0 (the
+        // speculative-rollback shape: rejected draft counts differ per row).
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+
+        let trimmed = cache.trimBatched(perRow: [2, 0])
+        #expect(trimmed == [2, 0])
+        // Shared write position drops by the SMALLEST trim (0 here); row 0 is
+        // rolled right by 2 and its padding grows so its retained tail stays
+        // aligned at the common end.
+        #expect(cache.batchOffsets.asArray(Int32.self) == [3, 5])
+        #expect(cache.leftPadding.asArray(Int32.self) == [2, 0])
+
+        // Clamping: requests beyond a row's live length trim only what exists.
+        let overTrim = cache.trimBatched(perRow: [10, 1])
+        #expect(overTrim == [3, 1])
+
+        // The protocol default (non-rollback-capable caches) trims nothing.
+        let mamba: any BatchedCache = MambaCache()
+        #expect(mamba.trimBatched(perRow: [1]) == [0])
+    }
+
     @Test("trim clamps to the minimum live per-row offset")
     func trimClampsToMinimumLiveRow() {
         // Ragged batch: leftPadding [4, 0], prefill 5 tokens → row offsets [1, 5].
