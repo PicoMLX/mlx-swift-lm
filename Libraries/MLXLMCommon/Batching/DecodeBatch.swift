@@ -20,10 +20,18 @@ public typealias RowSampler = @Sendable (MLXArray) -> MLXArray
 /// separately via ``FinishedRowCache`` from ``DecodeBatch/next(capturingFinalCaches:)``.
 public struct BatchStepResult: Sendable {
     public let uid: Int
-    public let token: Int
+
+    /// The tokens this row produced this step, in generation order. Exactly
+    /// one today; plural so a future speculative-decoding step (several
+    /// accepted draft tokens per row per step) is not an API break.
+    public let tokens: [Int]
+
+    /// Convenience accessor for the current one-token-per-step engine.
+    public var token: Int { tokens[tokens.startIndex] }
 
     /// `.stop`, `.length`, or nil if the row is still generating. Stop
-    /// detection happens exactly once, here in the engine.
+    /// detection happens exactly once, here in the engine, and applies to
+    /// the LAST element of ``tokens``.
     public let finishReason: GenerateStopReason?
 
     /// The matched stop sequence if a multi-token stop completed on this token.
@@ -235,7 +243,7 @@ public final class DecodeBatch {
                 responses.append(
                     BatchStepResult(
                         uid: uids[i],
-                        token: stepTokens[i],
+                        tokens: [stepTokens[i]],
                         finishReason: finishReason,
                         matchedSequence: matchedSequence,
                         currentState: currentState,
@@ -246,7 +254,7 @@ public final class DecodeBatch {
                 responses.append(
                     BatchStepResult(
                         uid: uids[i],
-                        token: stepTokens[i],
+                        tokens: [stepTokens[i]],
                         finishReason: nil,
                         matchedSequence: matchedSequence,
                         currentState: currentState,

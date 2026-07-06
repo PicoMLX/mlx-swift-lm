@@ -659,17 +659,23 @@ actor EngineDriver {
         if records[response.uid]?.firstTokenAt == nil {
             records[response.uid]?.firstTokenAt = Date.timeIntervalSinceReferenceDate
         }
-        records[response.uid]?.deliveredTokenCount += 1
+        records[response.uid]?.deliveredTokenCount += response.tokens.count
         guard let record = records[response.uid] else { return }
         let handler = record.handler
 
         if let reason = response.finishReason {
-            // Final token. For raw-token consumers a stop token may need to be
-            // surfaced before the stream closes; text consumers ignore it.
-            if reason == .stop {
-                _ = handler.processStopToken(response.token)
-            } else {
-                _ = handler.processToken(response.token)
+            // Final step: all but the last token are ordinary deliveries; the
+            // finish applies to the last (a stop token may need surfacing to
+            // raw-token consumers; text consumers ignore it).
+            for token in response.tokens.dropLast() {
+                _ = handler.processToken(token)
+            }
+            if let last = response.tokens.last {
+                if reason == .stop {
+                    _ = handler.processStopToken(last)
+                } else {
+                    _ = handler.processToken(last)
+                }
             }
             handler.processEndOfSequence()
 
@@ -689,7 +695,12 @@ actor EngineDriver {
             handler.finish()
             records.removeValue(forKey: response.uid)
         } else {
-            switch handler.processToken(response.token) {
+            var disposition = SchedulerTokenHandler.TokenDisposition.more
+            for token in response.tokens {
+                disposition = handler.processToken(token)
+                if disposition != .more { break }
+            }
+            switch disposition {
             case .more:
                 break
             case .stop:
