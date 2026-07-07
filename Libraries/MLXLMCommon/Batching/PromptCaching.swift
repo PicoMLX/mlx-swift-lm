@@ -23,11 +23,19 @@ public enum PromptCacheHitKind: String, Sendable, Equatable {
 /// An opaque, immutable snapshot of per-layer KV state.
 ///
 /// The storage is deliberately non-public so its representation can move from
-/// today's deep-copied `[KVCache]` to a `Sendable` materialized payload (e.g.
-/// mlx-swift's upcoming `MaterializedMLXArray`) without a source break:
-/// conformers construct snapshots from live caches, consumers materialize
-/// them back, and neither sees the representation. `Sendable` conformance is
-/// intentionally deferred to that future representation.
+/// today's deep-copied `[KVCache]` to a `Sendable` materialized payload
+/// without a source break: conformers construct snapshots from live caches,
+/// consumers materialize them back, and neither sees the representation.
+///
+/// > Note: **`MaterializedMLXArray` adoption plan.** mlx-swift is about to
+/// > ship `MaterializedMLXArray` (a `Sendable` carrier for evaluated
+/// > arrays). When it lands, this type's stored representation switches to
+/// > materialized per-layer state and the type gains `Sendable` conformance
+/// > — both changes are internal to this file, and none of the public
+/// > surface (`init(caches:)`, `materialize()`, `PromptCacheFetchResult`)
+/// > changes. Snapshots then cross actor boundaries directly, removing the
+/// > deep-copy round trips at the scheduler/driver cache seams. `Sendable`
+/// > conformance is intentionally deferred until then.
 public struct PromptCacheSnapshot {
     /// Today: deep-copied, evaluated caches owned by whoever holds the
     /// snapshot. The future materialized representation replaces this
