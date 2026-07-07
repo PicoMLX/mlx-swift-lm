@@ -226,7 +226,12 @@ actor EngineDriver {
         processorSource: RowProcessorSource? = nil,
         stateMachine: StopSequenceMatcher?
     ) -> Int? {
-        if freeSlots <= 0 {
+        // Queue behind existing waiters even when a slot is momentarily free:
+        // a row can finish inside a drain step before admitWaitingIfPossible
+        // runs, and a submit landing in that window would jump older waiters
+        // (FIFO violation). Waiters are drained in order by
+        // admitWaitingIfPossible at each drain iteration.
+        if freeSlots <= 0 || !waiting.isEmpty {
             waiting.append(
                 PendingSubmission(
                     request: request,
@@ -260,6 +265,11 @@ actor EngineDriver {
         processorSource: RowProcessorSource?,
         stateMachine: StopSequenceMatcher?
     ) -> Int? {
+        // Captured at entry so promptTime (firstToken - submitTime) covers
+        // ALL admission work on both paths -- including the prefix-cache
+        // fetch + remainder prefill on a cache hit, which previously started
+        // the clock only after that work completed.
+        let submitTime = Date.timeIntervalSinceReferenceDate
         // Parity with the single path for a zero token budget: TokenIterator
         // produces no tokens and generateTask reports `.length`. The engine
         // rejects nonpositive limits, and the generic catch below would close
@@ -281,7 +291,8 @@ actor EngineDriver {
         if let uid = admitViaPrefixFetch(
             request, handler: handler, cancelToken: cancelToken,
             maxTokens: maxTokens, sampler: sampler,
-            processorSource: processorSource, stateMachine: stateMachine)
+            processorSource: processorSource, stateMachine: stateMachine,
+            submitTime: submitTime)
         {
             return uid
         }
@@ -315,7 +326,7 @@ actor EngineDriver {
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
             promptCache: request.promptCache,
-            submitTime: Date.timeIntervalSinceReferenceDate,
+            submitTime: submitTime,
             writeBackToPromptCache: request.promptCache != nil,
             tokensIncludePrompt: true
         )
@@ -348,8 +359,22 @@ actor EngineDriver {
         maxTokens: Int,
         sampler: RowSampler?,
         processorSource: RowProcessorSource?,
-        stateMachine: StopSequenceMatcher?
+        stateMachine: StopSequenceMatcher?,
+        submitTime: TimeInterval
     ) -> Int? {
+        // Respect the engine's decode cap: adoption splices rows directly
+        // into the live batch, bypassing the completion-capacity queue that
+        // cold inserts go through. At capacity, fall through to `insert`,
+        // which queues under the cap (the request loses only prefix reuse).
+        guard engine.activeCount + engine.queuedCount < engine.completionBatchSize else {
+            return nil
+        }
+        // A wired-memory ticket bounds GPU memory only inside the drain
+        // loop's withWiredLimit step scopes; this path's fetch + remainder
+        // prefill would run un-ticketed inside `submit`. Keep ticketed
+        // requests on the cold path (ticketed prefill runs inside the drain
+        // loop) until hit admission is deferred into the drain loop.
+        guard request.wiredMemoryTicket == nil else { return nil }
         // Same gates as the single path (`startSingle`): the request must
         // have opted in (its own cache instance is fetched from — the
         // driver-level cache is a write-back fallback only), and the
@@ -425,7 +450,7 @@ actor EngineDriver {
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
             promptCache: request.promptCache,
-            submitTime: Date.timeIntervalSinceReferenceDate,
+            submitTime: submitTime,
             writeBackToPromptCache: true,
             tokensIncludePrompt: true
         )
@@ -451,6 +476,11 @@ actor EngineDriver {
         let promptCache: (any PromptCaching)?
         let submitTime: TimeInterval
         let writeBackToPromptCache: Bool
+        /// When the request produced its FIRST token on the single path, so
+        /// the adopted row's completion info keeps the true prompt/decode
+        /// split (stamping the first *batched* token instead would move all
+        /// pre-handoff decode time into promptTime and inflate tokens/sec).
+        let firstTokenAt: TimeInterval?
     }
 
     /// Adopt a migrated single request: build a ``DecodeBatch`` from its
@@ -515,6 +545,7 @@ actor EngineDriver {
             // `makeAdoptedBatch` drops the trailing seed and priming
             // re-appends it, so `allTokens` equals prompt + generated.
             tokensIncludePrompt: true,
+            firstTokenAt: record.firstTokenAt,
             // Seed with the tokens already emitted on the single path so a
             // later stop-string finish reports the full generated count.
             deliveredTokenCount: numTokens
@@ -670,15 +701,23 @@ actor EngineDriver {
             for token in response.tokens.dropLast() {
                 _ = handler.processToken(token)
             }
+            var lastDisposition = SchedulerTokenHandler.TokenDisposition.more
             if let last = response.tokens.last {
                 if reason == .stop {
                     _ = handler.processStopToken(last)
                 } else {
-                    _ = handler.processToken(last)
+                    lastDisposition = handler.processToken(last)
                 }
             }
             handler.processEndOfSequence()
 
+            // A token that hits maxTokens while also completing a configured
+            // stop string reports `.stop` (single-path parity: the stop check
+            // runs before the length fallback). The COUNT math still uses the
+            // engine's reason -- no engine stop token was suppressed here,
+            // and the stop-string-completing token is counted.
+            let reportedReason: GenerateStopReason =
+                lastDisposition == .stop ? .stop : reason
             let now = Date.timeIntervalSinceReferenceDate
             let info = GenerateCompletionInfo(
                 promptTokenCount: record.promptTokenCount,
@@ -689,7 +728,7 @@ actor EngineDriver {
                 ),
                 promptTime: max(0, (record.firstTokenAt ?? now) - record.submitTime),
                 generationTime: max(0, now - (record.firstTokenAt ?? now)),
-                stopReason: reason
+                stopReason: reportedReason
             )
             handler.yieldInfo(info)
             handler.finish()
@@ -723,13 +762,23 @@ actor EngineDriver {
     /// `.info` with `.stop`, stream close — then removes the row from the
     /// engine and admits any waiters into the freed slot.
     private func finishOnSemanticStop(_ uid: Int) {
+        // Extract the row's caches BEFORE dropping it so a stop-string finish
+        // writes back to the prompt cache exactly like a natural engine
+        // finish (which captures via next(capturingFinalCaches:)).
+        let wantsCapture = records[uid].map {
+            $0.writeBackToPromptCache && ($0.promptCache ?? promptCache) != nil
+        } ?? false
+        let (_, captured) = engine.cancel(uid: uid, capturingFinalCache: wantsCapture)
+        if let captured {
+            writeBack(captured)
+        }
         if let record = records.removeValue(forKey: uid) {
             let handler = record.handler
             handler.processEndOfSequence()
             let now = Date.timeIntervalSinceReferenceDate
             let info = GenerateCompletionInfo(
                 promptTokenCount: record.promptTokenCount,
-                // No engine `allTokens` on this path (the row is still live
+                // No engine `allTokens` on this path (the row was still live
                 // from the engine's perspective); the per-record delivery
                 // counter is exactly the generated-token count.
                 generationTokenCount: record.deliveredTokenCount,
@@ -740,7 +789,6 @@ actor EngineDriver {
             handler.yieldInfo(info)
             handler.finish()
         }
-        _ = engine.cancel(uid: uid)
         admitWaitingIfPossible()
     }
 

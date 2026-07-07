@@ -341,6 +341,13 @@ public final class LRUPromptCache: PromptCaching {
         model: any LanguageModel
     ) -> Bool {
         guard input.image == nil, input.video == nil, input.audio == nil else { return false }
+        // Masked / pre-batched inputs prefill at mask-derived positions that
+        // the flat cache-hit rewrite (LMInput(tokens: remainder)) cannot
+        // reproduce -- and their write-back would be keyed by flattened
+        // tokens, polluting the cache for unmasked requests.
+        guard input.text.mask == nil else { return false }
+        let tokens = input.text.tokens
+        guard tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1) else { return false }
         guard parameters.kvBits == nil, parameters.kvScheme == nil else { return false }
         guard model.defaultPromptCachePolicy == .exact else { return false }
         return isCacheCompatible(model.newCache(parameters: parameters))

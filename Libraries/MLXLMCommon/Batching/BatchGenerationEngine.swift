@@ -290,21 +290,40 @@ public final class BatchGenerationEngine {
     /// Remove a queued or active request from the engine.
     @discardableResult
     public func cancel(uid: Int) -> Bool {
+        cancel(uid: uid, capturingFinalCache: false).removed
+    }
+
+    /// Cancel variant that extracts the row's per-layer caches and token
+    /// history BEFORE dropping it, so a semantically finished row (e.g. a
+    /// stop-string match detected outside the engine) can still be written
+    /// back to a prompt cache -- mirroring what `next(capturingFinalCaches:)`
+    /// provides for engine-detected finishes.
+    public func cancel(uid: Int, capturingFinalCache: Bool) -> (
+        removed: Bool, finalCache: FinishedRowCache?
+    ) {
         if let queuedIndex = unprocessed.firstIndex(where: { $0.uid == uid }) {
             unprocessed.remove(at: queuedIndex)
-            return true
+            return (true, nil)
         }
 
         if let active = generationBatch, let row = active.uids.firstIndex(of: uid) {
+            let captured: FinishedRowCache? =
+                capturingFinalCache
+                ? FinishedRowCache(
+                    uid: uid,
+                    allTokens: active.tokens[row],
+                    finalCache: active.promptCache.map { $0.extractBatched(row) }
+                )
+                : nil
             let keep = active.uids.indices.filter { $0 != row }
             active.filter(keep: keep)
             if active.isEmpty {
                 generationBatch = nil
             }
-            return true
+            return (true, captured)
         }
 
-        return false
+        return (false, nil)
     }
 
     public func close() {

@@ -144,7 +144,8 @@ struct UpgradeFlagTests {
             tokenCount: 3,
             maxTokens: 10,
             parameters: GenerateParameters(),
-            generatedTokenIds: [1, 2, 3]
+            generatedTokenIds: [1, 2, 3],
+            firstTokenAt: nil
         )
         flag.depositLiveState(SendableBox(snapshot))
 

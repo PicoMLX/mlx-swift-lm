@@ -9,7 +9,11 @@ import Foundation
 // installed — the opt-in for continuous batching:
 //
 // ```swift
+// let downloader: any Downloader = ...           // e.g. a Hub downloader
+// let tokenizerLoader: any TokenizerLoader = ... // e.g. a Hub tokenizer loader
 // let container = try await loadModelContainer(
+//     from: downloader,
+//     using: tokenizerLoader,
 //     configuration: .init(id: "mlx-community/Qwen3-4B-4bit"),
 //     scheduler: InferenceScheduler(),
 //     promptCache: LRUPromptCache(maxBytes: 2 << 30)

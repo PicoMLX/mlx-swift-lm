@@ -51,7 +51,11 @@ public actor InferenceScheduler {
         public var completionBatchSize: Int
         /// Maximum number of prompts prefilled together per admission.
         public var prefillBatchSize: Int
-        /// Prompt prefill chunk size.
+        /// Prompt prefill chunk size. Engine-level BY DESIGN (matching
+        /// upstream mlx_lm's batch generator): batched prefill chunks the
+        /// whole ragged sub-batch uniformly, so the per-request
+        /// `GenerateParameters.prefillStepSize` honored by the single path
+        /// does not apply on the batched path.
         public var prefillStepSize: Int
         /// Optional runtime admission cap (`nil` = `completionBatchSize`).
         public var maxBatchSize: Int?
@@ -79,6 +83,13 @@ public actor InferenceScheduler {
     /// The driver that solely owns the batch engine, created lazily on the
     /// first request that needs batching.
     private var driver: EngineDriver?
+
+    /// Bumped every time ``refreshContext(owner:context:)`` replaces the
+    /// context. A running single request captures the epoch it started under;
+    /// the upgrade gate requires equality so old-model KV is never migrated
+    /// into an engine built from a newer context (real corruption otherwise:
+    /// K/V computed by the old weights decoded by the new model).
+    private var contextEpoch = 0
 
     /// Set by ``refreshContext(owner:context:)`` when the context was replaced
     /// while a batch was still draining: the driver (which caches the model
@@ -166,9 +177,14 @@ public actor InferenceScheduler {
     /// ``batchLoopFinished`` via `driverStale` (in-flight batched requests
     /// finish on the model they started with, matching the single path, where
     /// an in-flight iterator keeps its model reference).
+    /// Note: requests that JOIN a still-draining batch after a refresh also
+    /// run on the old driver's model (one batch, one model) -- coherent but
+    /// stale, same continuity rule as the in-flight rows -- and a single
+    /// request started before the refresh can no longer upgrade (epoch gate).
     func refreshContext(owner: ObjectIdentifier, context box: SendableBox<ModelContext>) async {
         guard attachedOwner == owner else { return }
         self.context = box.consume()
+        contextEpoch += 1
         if let driver, await driver.hasWork {
             driverStale = true
         } else {
@@ -246,6 +262,9 @@ extension InferenceScheduler {
         /// masked single request must not upgrade: its prefill positions
         /// came from the mask, which the engine's flat rows cannot carry.
         let inputIsBatchable: Bool
+        /// The scheduler context epoch this request started under; upgrades
+        /// require it to still be current (see `contextEpoch`).
+        let contextEpoch: Int
     }
 }
 
@@ -277,6 +296,9 @@ extension InferenceScheduler {
         let parameters: GenerateParameters
         /// All token IDs produced on the single path (for write-back keys).
         let generatedTokenIds: [Int]
+        /// When the single path produced its first token, so an adopted row's
+        /// completion info keeps the true prompt/decode timing split.
+        let firstTokenAt: TimeInterval?
     }
 }
 
@@ -507,6 +529,13 @@ extension InferenceScheduler {
         }
 
         var request = request
+        // A container-level cache applies to every scheduler request unless
+        // the request carries its own instance -- generateBatched callers
+        // (whose GenerationRequests default promptCache to nil) previously
+        // lost the attached cache silently.
+        if request.promptCache == nil {
+            request.promptCache = self.promptCache
+        }
         // Topology-aware cache keying: fold the per-layer cache topology
         // (concrete type + window size) into the salt before any fetch or
         // write-back uses it, so entries created under different cache
@@ -629,7 +658,10 @@ extension InferenceScheduler {
                 // batchLoopFinished).
                 queuedRequests.append(scheduled)
                 state = .pendingUpgrade(single)
-            } else if single.inputIsBatchable, canUpgrade(parameters: single.parameters) {
+            } else if single.inputIsBatchable,
+                single.contextEpoch == contextEpoch,
+                canUpgrade(parameters: single.parameters)
+            {
                 // The running request's caches can migrate single→batch; perform
                 // the handshake and join both into the batch.
                 await upgrade(from: single, joining: scheduled)
@@ -726,13 +758,16 @@ extension InferenceScheduler {
         // container cache is the fallback. The auto-routed ModelContainer
         // path sets both to the same instance.
         let effectivePromptCache = scheduled.request.promptCache ?? self.promptCache
+        // One eligibility decision for BOTH fetch and write-back: a request
+        // that cannot fetch (e.g. masked input, whose cache-hit rewrite would
+        // drop the mask) must not write back either -- its KV would be keyed
+        // by flattened tokens and pollute the cache for unmasked requests.
+        let cacheEligible = LRUPromptCache.canUsePromptCache(
+            input: scheduled.request.input, parameters: parameters, model: context.model)
 
         var iteratorCache: [KVCache]? = nil
         var iteratorInput = scheduled.request.input
-        if let promptCache = effectivePromptCache, writeBack,
-            LRUPromptCache.canUsePromptCache(
-                input: scheduled.request.input, parameters: parameters, model: context.model)
-        {
+        if let promptCache = effectivePromptCache, writeBack, cacheEligible {
             let fetch = promptCache.fetchNearestCacheResult(
                 model: modelName, tokens: inputTokens, salt: salt)
             if let fetched = fetch.cache {
@@ -775,7 +810,7 @@ extension InferenceScheduler {
 
         // The (Sendable) prompt cache rides into the task for write-back on
         // natural completion; nil when this request did not opt in.
-        let cacheForWriteBack = writeBack ? effectivePromptCache : nil
+        let cacheForWriteBack = (writeBack && cacheEligible) ? effectivePromptCache : nil
 
         let task = Task<Void, Never> { [weak self] in
             let inputs = boxed.consume()
@@ -817,7 +852,8 @@ extension InferenceScheduler {
             promptCache: cacheForWriteBack,
             submitTime: submitTime,
             wiredMemoryTicket: ticket,
-            inputIsBatchable: batchableInput
+            inputIsBatchable: batchableInput,
+            contextEpoch: contextEpoch
         )
         state = .single(single)
     }
@@ -897,7 +933,8 @@ extension InferenceScheduler {
                                 tokenCount: concrete.tokenCount,
                                 maxTokens: concrete.maxTokens,
                                 parameters: parameters,
-                                generatedTokenIds: generated
+                                generatedTokenIds: generated,
+                                firstTokenAt: firstTokenAt
                             ))
                     }
                     // A non-plain iterator (e.g. a future speculative one on
@@ -1339,6 +1376,7 @@ extension InferenceScheduler {
         let liveMaxTokens = live.maxTokens
         let liveParameters = live.parameters
         let liveGeneratedTokenIds = live.generatedTokenIds
+        let liveFirstTokenAt = live.firstTokenAt
 
         // `liveCurrentToken` is the token the single `TokenIterator` already
         // sampled but has not yet returned/delivered. It must be EOS-checked and
@@ -1381,6 +1419,7 @@ extension InferenceScheduler {
         guard let driver = await ensureDriver() else {
             // Cannot batch this model: deliver the last token, finalize the
             // original stream cleanly, then run the joining request fresh.
+            writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
                 handler: single.handler,
                 lastToken: liveFinalToken,
@@ -1399,6 +1438,7 @@ extension InferenceScheduler {
             // without overshooting). Finalize it cleanly (delivering the final
             // non-stop token only when one is actually undelivered) and run the
             // joining request through the batch.
+            writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
                 handler: single.handler,
                 lastToken: liveFinalToken,
@@ -1415,6 +1455,37 @@ extension InferenceScheduler {
                 startSingleAfterUpgradeFallback(joining)
             }
             return
+        }
+
+        // Deliver the live token BEFORE cache migration (the batch will seed
+        // from it but not re-emit it), so a stop-string completion can still
+        // finalize with the un-migrated caches in hand.
+        switch single.handler.processToken(liveCurrentToken) {
+        case .stop:
+            // The handoff token completed a configured stop string: finish
+            // like a semantic stop instead of adopting (adoption would decode
+            // one extra token before the latched filter caught it, over-
+            // counting the generation). The token was already delivered; its
+            // forward pass never ran, so the write-back key excludes it.
+            writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
+            finishUpgradedSingle(
+                handler: single.handler,
+                lastToken: nil,
+                promptTokenCount: single.inputTokens.count,
+                generatedCount: liveGeneratedTokenIds.count + 1,
+                submitTime: single.submitTime,
+                reason: .stop
+            )
+            if await driver.hasWork {
+                await admitToBatch(joining)
+            } else {
+                startSingleAfterUpgradeFallback(joining)
+            }
+            return
+        case .more, .cancelled:
+            // `.cancelled` is routed by the generic stream-cancellation
+            // wiring; adoption proceeds and the driver drops the row.
+            break
         }
 
         // Migrate the live caches LAST (consumes `live.cache`). After this point
@@ -1443,14 +1514,6 @@ extension InferenceScheduler {
             return
         }
 
-        // Deliver the live token to the original handler before adoption (the
-        // batch will seed from it but not re-emit it). If this token happens
-        // to complete a configured stop string, the handler's filter latches
-        // (`.stop` is returned again for the next token), so the driver
-        // finishes the adopted row on its first batched delivery — one step
-        // late but never past the stop.
-        _ = single.handler.processToken(liveCurrentToken)
-
         // Phase 2: build the adopted decode batch from migrated state. The
         // adopted row's engine UID is allocated by the engine (the single
         // source of truth for row identity) inside `adoptMigrated`, never from
@@ -1471,7 +1534,8 @@ extension InferenceScheduler {
             promptCacheSalt: single.promptCacheSalt,
             promptCache: single.promptCache,
             submitTime: single.submitTime,
-            writeBackToPromptCache: single.writeBackToPromptCache
+            writeBackToPromptCache: single.writeBackToPromptCache,
+            firstTokenAt: liveFirstTokenAt
         )
         // Build + splice the migrated batch entirely on the driver (the
         // DecodeBatch never crosses an isolation boundary). The live token was
@@ -1533,6 +1597,25 @@ extension InferenceScheduler {
         )
 
         startBatchLoop(driver)
+    }
+
+    /// Write an upgrade-finalized single's KV back to its prompt cache -- the
+    /// counterpart of `runSingle`'s natural-completion `insertCache`, which
+    /// the upgrade deposit skipped (`runSingle` returns before it). Keyed
+    /// WITHOUT the handoff token: its forward pass never ran, so the caches
+    /// do not cover it. Incompatible topologies are rejected inside
+    /// `insertCache`.
+    private func writeBackUpgradedSingle(
+        _ single: SingleRequest, cache: [KVCache], generated: [Int]
+    ) {
+        guard single.writeBackToPromptCache, let promptCache = single.promptCache else { return }
+        promptCache.insertCache(
+            model: single.modelName,
+            tokens: single.inputTokens + generated,
+            promptCache: cache,
+            checkpoint: false,
+            salt: single.promptCacheSalt
+        )
     }
 
     /// Finalize an upgraded single request's stream when it will not actually

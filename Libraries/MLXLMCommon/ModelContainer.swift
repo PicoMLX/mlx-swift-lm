@@ -45,11 +45,10 @@ public final class ModelContainer: Sendable {
     /// concern.
     public let promptCache: (any PromptCaching)?
 
-    /// Whether a continuous-batching scheduler is installed. Consumers (e.g.
-    /// ``ChatSession``) use this to decide whether to route turns through the
-    /// transparent batched ``generate(input:parameters:wiredMemoryTicket:)``
-    /// path (which reuses KV state via ``promptCache``) instead of holding a
-    /// session-local `[KVCache]`.
+    /// Whether a continuous-batching scheduler is installed. Internal test
+    /// probe; generation routing checks `scheduler` directly, and
+    /// ``ChatSession`` is deliberately NOT scheduler-aware (sessions keep
+    /// their single-request KV path).
     var usesScheduler: Bool { scheduler != nil }
 
     public var configuration: ModelConfiguration {
