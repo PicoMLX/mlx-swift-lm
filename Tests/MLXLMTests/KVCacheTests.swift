@@ -209,7 +209,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     #expect(cache.offset == 7)
     #expect(cache.leftPaddingValues == [1, 3])
-    #expect(cache.lengthsValues == [2, 4])
+    // prepare stores absolute ends (lengths + leftPadding): [7, 11] - 2
+    #expect(cache.lengthsValues == [5, 9])
 }
 
 @Test func testArraysCacheMaskUsesLengthsWhenLeftPaddingIsAbsent() throws {
@@ -291,7 +292,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     cache.advance(2)
 
     #expect(cache.leftPaddingValues == [-1, 1])
-    #expect(cache.currentLengths?.asArray(Int.self) == [2, 0])
+    // prepare stores absolute ends: [4, 2] + [1, 3] = [5, 5], advanced by 2
+    #expect(cache.currentLengths?.asArray(Int.self) == [3, 3])
 
     let mask = try #require(cache.makeMask(N: 3))
     #expect(mask.asArray(Bool.self) == [true, true, true, false, true, true])
@@ -313,7 +315,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     first.filter(batchIndices: MLXArray([1]))
     #expect(first.leftPaddingValues == [2])
-    #expect(first.currentLengths?.asArray(Int.self) == [3])
+    #expect(first.currentLengths?.asArray(Int.self) == [5])
     #expect(first[0]?.shape == [1, 2])
 
     let second = ArraysCache(size: 1, leftPadding: [1, 4])
@@ -322,7 +324,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     first.extend(other: second)
     #expect(first.leftPaddingValues == [2, 1, 4])
-    #expect(first.currentLengths?.asArray(Int.self) == [3, 6, 2])
+    #expect(first.currentLengths?.asArray(Int.self) == [5, 7, 6])
     #expect(first[0]?.shape == [3, 2])
 }
 
@@ -388,7 +390,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     nested.prepare(lengths: [4, 1])
 
-    #expect(mamba.currentLengths?.asArray(Int.self) == [4, 1])
+    #expect(mamba.currentLengths?.asArray(Int.self) == [4, 3])
     #expect(arrays.currentLengths?.asArray(Int.self) == [4, 1])
 
     nested.finalize()
@@ -407,7 +409,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     let copied = try #require(cache.copy() as? MambaCache)
 
     #expect(copied.leftPaddingValues == [2, 0])
-    #expect(copied.currentLengths?.asArray(Int.self) == [5, 3])
+    #expect(copied.currentLengths?.asArray(Int.self) == [7, 3])
     #expect(copied[0]?.shape == [2, 3, 4])
     #expect(copied[1]?.shape == [2, 1, 4, 4])
 }
@@ -420,7 +422,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     cache.filter(batchIndices: MLXArray([1]))
 
     #expect(cache.leftPaddingValues == [3])
-    #expect(cache.lengthsValues == [4])
+    #expect(cache.lengthsValues == [7])
 }
 
 @Test func testArraysCacheExtendPadsMissingSlotsAndMetadata() throws {
@@ -436,7 +438,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(first[0]?.shape == [3, 4])
     #expect(first[1]?.shape == [3, 4])
     #expect(first.leftPaddingValues == [1, 3, 0])
-    #expect(first.lengthsValues == [2, 4, 0])
+    #expect(first.lengthsValues == [3, 7, 0])
 }
 
 @Test func testArraysCacheCopyPreservesSparseSlotsAndMetadata() throws {
@@ -451,7 +453,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(copied[1] == nil)
     #expect(copied[2] != nil)
     #expect(copied.leftPaddingValues == [2])
-    #expect(copied.lengthsValues == [5])
+    #expect(copied.lengthsValues == [7])
 }
 
 // MARK: - MambaCache type preservation

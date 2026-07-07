@@ -34,6 +34,13 @@ struct TestTokenizer: MLXLMCommon.Tokenizer {
         )
     }
 
+    /// Deterministic variant for tests that assert on decoded text (the
+    /// default init randomizes every token's string).
+    init(vocabulary: [Int: String]) {
+        self.vocabularySize = vocabulary.count
+        self.vocabulary = vocabulary
+    }
+
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         (0 ..< length).map { _ in
             Int.random(in: 1 ..< vocabularySize)

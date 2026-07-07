@@ -1,0 +1,90 @@
+name: Swift Build (fork)
+
+# Fork-only CI: builds the package, compiles the tests, and runs the batched-cache
+# unit tests (which need no model downloads) on every pushed commit. The macos-15
+# hosted runner has a Metal GPU, so these exercise real MLX kernels — the parity
+# gate the Linux authoring environment can't provide.
+#
+# This is intentionally a SEPARATE file from pull_request.yml (the workflow shared
+# with upstream ml-explore) for two reasons:
+#   1. Syncing from upstream never produces a merge conflict on this file.
+#   2. The job is gated to this fork via `if: github.repository == ...`, mirroring
+#      how upstream's jobs are gated to ml-explore. If this file ever reaches the
+#      upstream repo, the job is simply skipped there -- it can never run or
+#      interfere upstream.
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+# Cancel an in-progress build for a branch when a newer commit is pushed to it,
+# so rapid pushes don't pile up (macOS runner minutes are billed at 10x).
+concurrency:
+  group: swift-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Fork-only. Never runs on upstream ml-explore (kept inert if it lands there).
+    if: github.repository == 'PicoMLX/mlx-swift-lm'
+    # macOS 26 (Tahoe) hosted runner: provides Xcode 26.5+ with the Swift 6.3
+    # toolchain that mlx-swift >= 0.31.5 requires (its manifest declares
+    # swift-tools-version 6.3; the macos-15 image tops out at Xcode 26.3 /
+    # Swift 6.2.4, which cannot even resolve the dependency), plus the Metal
+    # toolchain needed to produce the Metal library that `swift build` alone
+    # cannot.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Package.swift declares swift-tools-version 6.1, so select the newest
+      # stable Xcode on the image (Swift 6.1+). Without this, package resolution
+      # fails: "using Swift tools version 6.1.0 but the installed version is 5.10.0".
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # Xcode 26.x distributes the Metal compiler as a separate downloadable
+      # component, and the hosted macos-26 image does not preinstall it for
+      # non-default Xcodes; without it mlx-swift's kernel build fails with
+      # "cannot execute tool 'metal'".
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # -skipPackagePluginValidation / -skipMacroValidation: mlx-swift 0.31.5+
+      # ships a CudaBuild build-tool plugin (and swift-syntax provides macros);
+      # xcodebuild refuses unvalidated plugins/macros in non-interactive runs.
+      - name: Build for testing (Xcode, macOS)
+        run: |
+          xcodebuild build-for-testing -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation
+
+      # Run every batching suite — and everything else in MLXLMTests. On this
+      # integration branch the FULL bundle executes (no -only-testing filter):
+      # the whole bundle is self-contained (no model downloads; the model-parity
+      # regressions use in-process random-weight models), and an unfiltered run
+      # is the only way to execute legacy free-function tests such as
+      # KVCacheTests, which have no @Suite type name for -only-testing to match
+      # and which this stack's absolute-offset semantics touched.
+      #
+      # The chain PR branches do NOT share this step: recut_chain.py generates
+      # their swift.yml from this file only up to the comment marker above and
+      # appends a per-stage -only-testing subset, keeping the 8-branch recut
+      # pushes fast and the upstreamable PRs free of fork-only CI weight.
+      - name: Run full test bundle (Xcode, macOS)
+        run: |
+          xcodebuild test-without-building \
+            -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation
