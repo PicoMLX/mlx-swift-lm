@@ -70,36 +70,21 @@ jobs:
             -destination 'platform=macOS' \
             -skipPackagePluginValidation -skipMacroValidation
 
-      # Run every batching suite: all are self-contained (no model downloads —
-      # the model-parity regressions use in-process random-weight models) and
-      # exercise the Metal kernels that back rotation/extract/merge/finalize —
-      # the numerical paths that can't be verified in the Linux authoring env.
-      # NOTE: -only-testing matches swift-testing SUITE TYPE names, not file
-      # names (a previous `BatchCacheTests` filter matched nothing and silently
-      # ran zero tests).
-      - name: Run batching tests (Xcode, macOS)
+      # Run every batching suite — and everything else in MLXLMTests. On this
+      # integration branch the FULL bundle executes (no -only-testing filter):
+      # the whole bundle is self-contained (no model downloads; the model-parity
+      # regressions use in-process random-weight models), and an unfiltered run
+      # is the only way to execute legacy free-function tests such as
+      # KVCacheTests, which have no @Suite type name for -only-testing to match
+      # and which this stack's absolute-offset semantics touched.
+      #
+      # The chain PR branches do NOT share this step: recut_chain.py generates
+      # their swift.yml from this file only up to the comment marker above and
+      # appends a per-stage -only-testing subset, keeping the 8-branch recut
+      # pushes fast and the upstreamable PRs free of fork-only CI weight.
+      - name: Run full test bundle (Xcode, macOS)
         run: |
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
-            -skipPackagePluginValidation -skipMacroValidation \
-            -only-testing:MLXLMTests/BatchKVCacheCoverageTests \
-            -only-testing:MLXLMTests/BatchRotatingKVCacheCoverageTests \
-            -only-testing:MLXLMTests/BatchedCacheFactoryTests \
-            -only-testing:MLXLMTests/BatchedSSMCacheTests \
-            -only-testing:MLXLMTests/BatchMaskingTests \
-            -only-testing:MLXLMTests/BatchQuantizedKVCacheTests \
-            -only-testing:MLXLMTests/QuantizedAttentionMaskTests \
-            -only-testing:MLXLMTests/StopSequenceMatcherTests \
-            -only-testing:MLXLMTests/RowSamplerTests \
-            -only-testing:MLXLMTests/BatchGenerationEngineTopologyTests \
-            -only-testing:MLXLMTests/BatchGenerationEngineValidationTests \
-            -only-testing:MLXLMTests/BatchGenerationEnginePullLoopTests \
-            -only-testing:MLXLMTests/BatchModelRegressionTests \
-            -only-testing:MLXLMTests/SchedulerTokenHandlerTests \
-            -only-testing:MLXLMTests/UpgradeFlagTests \
-            -only-testing:MLXLMTests/CacheMigrationTests \
-            -only-testing:MLXLMTests/SchedulerValueTests \
-            -only-testing:MLXLMTests/ModelContainerBatchingTests \
-            -only-testing:MLXLMTests/PromptCacheTests \
-            -only-testing:MLXLMTests/PrefixFetchTests
+            -skipPackagePluginValidation -skipMacroValidation
