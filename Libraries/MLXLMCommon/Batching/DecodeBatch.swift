@@ -343,7 +343,8 @@ public final class DecodeBatch {
         let currentTokens = nextTokens
         let inputs = currentTokens[0..., .newAxis]
 
-        let logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
+        let logits = model.callAsFunction(
+            inputs, cache: promptCache.isEmpty ? nil : promptCache.map { $0 as any KVCache })
 
         // [B, 1, vocab] -> [B, vocab]
         let stepLogits = logits[.ellipsis, -1, 0...]

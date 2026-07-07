@@ -90,14 +90,40 @@ public final class BatchGenerationEngine {
         self.model = model
         self.prefillStepSize = prefillStepSize
         self.prefillBatchSize = prefillBatchSize
-        self.completionBatchSize = max(completionBatchSize, prefillBatchSize)
+        // Honor the caller's decode cap exactly: admission already bounds each
+        // prefill sub-batch by the remaining completion capacity, so a
+        // completionBatchSize below prefillBatchSize simply admits smaller
+        // sub-batches (the old silent max() raised the documented decode
+        // maximum instead).
+        self.completionBatchSize = completionBatchSize
         self.defaultMaxTokens = defaultMaxTokens
         self.defaultEosTokens = eosTokens
         self.defaultSampler = greedySampler
         self.defaultSamplerIsGreedy = true
-        self.cacheFactories = try makeBatchedCacheFactories(
-            for: model.newCache(parameters: cacheParameters)
-        )
+        // The engine never rewrites caches mid-decode, so runtime KV
+        // quantization parameters cannot be honored here (the single path
+        // quantizes via maybeQuantizeKVCache after each step). Models whose
+        // newCache builds QuantizedKVCache directly are fine -- the factory
+        // routes them -- but for default-newCache models these fields would
+        // be silently dropped. Reject loudly, mirroring the scheduler's
+        // parametersAreBatchable gate.
+        let probe = model.newCache(parameters: cacheParameters)
+        if cacheParameters?.kvBits != nil || cacheParameters?.kvScheme != nil {
+            guard probe.contains(where: { $0 is QuantizedKVCache }) else {
+                throw BatchGenerationEngineError.invalidConfiguration(
+                    field: "cacheParameters.kvBits/kvScheme", value: cacheParameters?.kvBits ?? -1)
+            }
+        }
+        // A model with no per-layer caches has nothing to batch over, and the
+        // batched forward passes would hand it a non-nil empty cache array
+        // (which models index into positionally, e.g. DeepseekV3's
+        // `cache?[i]`). The single path passes nil for empty caches; here it
+        // is a topology we cannot serve.
+        guard !probe.isEmpty else {
+            throw BatchGenerationEngineError.invalidConfiguration(
+                field: "model.newCache (no per-layer caches)", value: 0)
+        }
+        self.cacheFactories = try makeBatchedCacheFactories(for: probe)
 
         if eosTokens.isEmpty {
             self.defaultStateMachine = StopSequenceMatcher()

@@ -146,10 +146,8 @@ public final class PrefillBatch {
         while remaining.dim(1) > 0 {
             let n = min(prefillStepSize, remaining.dim(1))
             let chunk = remaining[0..., ..<n]
-            _ = model.callAsFunction(
-                chunk,
-                cache: promptCache.map { $0 as any KVCache }
-            )
+            let kv = promptCache.map { $0 as any KVCache }
+            _ = model.callAsFunction(chunk, cache: kv.isEmpty ? nil : kv)
             // One combined eval per chunk (not per cache): each cache's
             // state is independent, and a single eval turns L GPU sync
             // points into 1 -- mirroring the single path's `eval(cache)`
@@ -243,19 +241,4 @@ public final class PrefillBatch {
         stateMachines = keep.map { stateMachines[$0] }
     }
 
-    /// Append `other`'s rows. Currently restricted to merging two batches
-    /// before either has run prefill (i.e. both caches empty); merging
-    /// non-empty prefill caches is not yet implemented.
-    public func extend(_ other: PrefillBatch) {
-        precondition(
-            uids.isEmpty && other.uids.isEmpty,
-            "PrefillBatch.extend currently only supports merging two empty batches"
-        )
-        uids.append(contentsOf: other.uids)
-        tokens.append(contentsOf: other.tokens)
-        samplers.append(contentsOf: other.samplers)
-        processors.append(contentsOf: other.processors)
-        maxTokens.append(contentsOf: other.maxTokens)
-        stateMachines.append(contentsOf: other.stateMachines)
-    }
 }

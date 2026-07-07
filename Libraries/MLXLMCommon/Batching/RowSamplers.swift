@@ -200,9 +200,14 @@ final class SamplerKeyHolder: Sendable {
     func next() -> MLXArray? {
         key.withLockUnchecked { current in
             guard let value = current else { return nil }
-            let (subkey, nextKey) = MLXRandom.split(key: value)
-            current = nextKey
-            return subkey
+            // Role order matches mlx-swift's RandomState.next() (used by the
+            // single path's seeded TopPSampler): split[0] becomes the next
+            // PRNG state, split[1] is the per-draw subkey. Reversing them
+            // consumes a disjoint key chain and breaks seeded single-vs-
+            // batched parity from the first draw.
+            let (nextState, drawKey) = MLXRandom.split(key: value)
+            current = nextState
+            return drawKey
         }
     }
 }
