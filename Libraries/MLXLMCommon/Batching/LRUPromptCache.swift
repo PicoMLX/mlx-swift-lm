@@ -323,7 +323,11 @@ public final class LRUPromptCache: PromptCaching {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
         for cache in caches {
             let window = cache.maxSize.map { String($0) } ?? "-"
-            for byte in "\(Swift.type(of: cache)):\(window);".utf8 {
+            // Rotating caches with the same window but different keep-prefix
+            // sizes rotate and mask differently; metaState[0] is `keep`
+            // (layout: [keep, maxCacheSize, step, offset, idx]).
+            let keep = (cache as? RotatingKVCache).map { ":k" + ($0.metaState.first ?? "0") } ?? ""
+            for byte in "\(Swift.type(of: cache)):\(window)\(keep);".utf8 {
                 hash ^= UInt64(byte)
                 hash = hash &* 0x100_0000_01b3
             }

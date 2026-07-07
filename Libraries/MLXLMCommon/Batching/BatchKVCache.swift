@@ -449,7 +449,11 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// - Returns: A `KVCacheSimple` with the extracted sequence data.
     public func extract(idx: Int) -> KVCacheSimple {
         let cache = KVCacheSimple()
-        let padding = Int(leftPadding[idx].item(Int32.self))
+        // Clamp: a row still inside its left-padding prefix (metadata rows
+        // preserved by `filter` before their first real token) has
+        // padding > _idx, and `padding ..< _idx` would trap. Clamping yields
+        // an empty single-row cache instead.
+        let padding = min(Int(leftPadding[idx].item(Int32.self)), _idx)
 
         if let k = keys, let v = values {
             cache.keys = MLX.contiguous(k[idx ..< (idx + 1), 0..., padding ..< _idx, 0...])
@@ -488,6 +492,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         var Dk = 0
         var Dv = 0
         var dt: DType = .float16
+        var dtV: DType = .float16
 
         for c in caches {
             if let simple = c as? KVCacheSimple, let k = simple.keys {
@@ -495,6 +500,9 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
                 Dk = k.dim(3)
                 Dv = simple.values!.dim(3)
                 dt = k.dtype
+                // Track the value dtype separately -- allocating values with
+                // the key dtype would silently cast mixed-dtype KV caches.
+                dtV = simple.values!.dtype
                 break
             }
         }
@@ -505,7 +513,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         }
 
         let keysArr = MLXArray.zeros([B, H, maxLength, Dk], dtype: dt)
-        let valuesArr = MLXArray.zeros([B, H, maxLength, Dv], dtype: dt)
+        let valuesArr = MLXArray.zeros([B, H, maxLength, Dv], dtype: dtV)
 
         for (i, (p, c)) in zip(padding, caches).enumerated() {
             if let simple = c as? KVCacheSimple, let k = simple.keys, let v = simple.values {
@@ -534,6 +542,15 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// - Parameter cache: A single `KVCacheSimple` to wrap.
     /// - Returns: A new `BatchKVCache` with batch size 1.
     public class func fromSingle(_ cache: KVCacheSimple) -> BatchKVCache {
+        // ChunkedKVCache subclasses KVCacheSimple but keeps `offset` absolute
+        // while maybeTrimFront() shrinks `keys` to the retained chunk;
+        // adopting it would set `_idx` past the buffer and corrupt later
+        // slices. Mirrors the identical guard in `merge`.
+        precondition(
+            !(cache is ChunkedKVCache),
+            "BatchKVCache.fromSingle requires a non-chunked KVCacheSimple: a "
+                + "front-trimmed ChunkedKVCache's offset exceeds its buffer."
+        )
         let batchCache = BatchKVCache(leftPadding: [0])
 
         if let k = cache.keys, let v = cache.values {

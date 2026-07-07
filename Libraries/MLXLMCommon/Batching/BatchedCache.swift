@@ -50,6 +50,18 @@ extension BatchedCache {
     }
 }
 
+extension BatchedCacheList {
+    /// Composites are not rollback-capable: children clamp independently
+    /// (only `BatchKVCache` implements per-row rewind today), so delegating
+    /// blindly could rewind the attention child while an SSM sibling's state
+    /// stays ahead, silently desyncing the layer. Explicitly report zeros
+    /// (the protocol's "not supported" contract) until a per-child
+    /// max-trimmable query exists to coordinate a uniform rewind.
+    public func trimBatched(perRow: [Int]) -> [Int] {
+        Array(repeating: 0, count: perRow.count)
+    }
+}
+
 // MARK: - BatchedCacheList
 
 /// Batched wrapper for composite per-layer caches. Some hybrid models keep
@@ -118,7 +130,19 @@ public final class BatchedCacheList: CacheList, BatchedCache {
     /// `BatchPositionedKVCache`) holds the per-row `leftPadding` needed to build
     /// a correct batched attention mask; the SSM child produces no attention mask.
     private var maskingChild: (any BatchPositionedKVCache)? {
-        batchedCaches.lazy.compactMap { $0 as? any BatchPositionedKVCache }.first
+        // Recurse into nested composites: a child that is itself a
+        // BatchedCacheList is not a BatchPositionedKVCache, but may hold the
+        // attention cache one level down (the factory recurses through
+        // CacheList children, so nested composites are constructible).
+        for child in batchedCaches {
+            if let positioned = child as? any BatchPositionedKVCache {
+                return positioned
+            }
+            if let nested = child as? BatchedCacheList, let inner = nested.maskingChild {
+                return inner
+            }
+        }
+        return nil
     }
 
     /// Delegate masking to the attention child so composite caches honour per-row
@@ -206,7 +230,17 @@ extension ArraysCache: BatchedCache {
         extend(other: other)
     }
 
-    public func prepareBatched(leftPadding _: [Int]?, lengths: [Int]?, rightPadding _: [Int]?) {
+    public func prepareBatched(leftPadding: [Int]?, lengths: [Int]?, rightPadding _: [Int]?) {
+        // Honor supplied left padding: `prepare` converts count-style lengths
+        // to absolute ends (and `makeMask` hides leading pads) based on the
+        // internal `leftPadding` field, so silently discarding the parameter
+        // would leave pads visible and mask real-token tails. The engine
+        // always passes nil here (it allocates zero-padding rows), so this
+        // only affects direct API use.
+        if let leftPadding {
+            let addition = MLXArray(leftPadding.map { Int32($0) })
+            self.leftPadding = self.leftPadding.map { $0 + addition } ?? addition
+        }
         prepare(lengths: lengths)
     }
 

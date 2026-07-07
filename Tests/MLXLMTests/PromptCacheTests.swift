@@ -312,5 +312,10 @@ struct PromptCacheTests {
         // The user-supplied base still participates in the key.
         #expect(
             small != LRUPromptCache.topologySalt(base: 8, caches: [RotatingKVCache(maxSize: 8)]))
+        // Same window, different keep-prefix -> different keys (metaState[0]).
+        #expect(
+            small
+                != LRUPromptCache.topologySalt(
+                    base: base, caches: [RotatingKVCache(maxSize: 8, keep: 4)]))
     }
 }

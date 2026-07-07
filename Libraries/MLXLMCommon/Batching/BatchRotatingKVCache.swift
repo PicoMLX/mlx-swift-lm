@@ -430,12 +430,25 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 self.values = nil
                 self.batchOffsets = newValue[0]
                 self.leftPadding = newValue[1]
+                self._idx = 0
+                self._scalarOffset = 0
+                self.rotated = false
+                self._lengths = nil
             case 4:
                 // Populated cache: keys, values, batchOffsets, leftPadding
                 self.keys = newValue[0]
                 self.values = newValue[1]
                 self.batchOffsets = newValue[2]
                 self.leftPadding = newValue[3]
+                // Derive unrotated-linear defaults so a state-only restore
+                // into a fresh cache is coherent (the serialization contract
+                // is state + metaState, and a following metaState set still
+                // overwrites these; without defaults a fresh receiver kept
+                // _idx == 0 and the next update overwrote from column 0).
+                self._idx = newValue[0].dim(2)
+                self._scalarOffset = newValue[0].dim(2)
+                self.rotated = false
+                self._lengths = nil
             default:
                 fatalError(
                     "BatchRotatingKVCache state must have 2 arrays (batchOffsets, "
