@@ -591,8 +591,19 @@ class Gemma3nDecoderLayer: Module {
             )
             let updatedMask = MLX.where(slidingWindowMask, minDtype, maskArray)
 
-            let offset = max(0, (cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1)
-            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.dim(-1))) + offset
+            // Clamp the slice to the mask's actual width: a batched rotating
+            // cache reports ABSOLUTE positions while its mask is already
+            // window-sized, so the unclamped offset would gather past the
+            // mask width once pastSeenTokens reaches the sliding window (MLX
+            // gather is not bounds-checked -- silent corruption, not a trap).
+            // When the mask is exactly window-sized the clamp yields offset 0
+            // and the mask is used as-is; wider (full-sequence) masks keep
+            // the original arithmetic.
+            let width = updatedMask.dim(-1)
+            let span = min(effectiveSeqLen, width)
+            let offset = max(
+                0, min((cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1, width - span))
+            let maskIndexes = MLXArray(0 ..< span) + offset
             let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
             finalMask = .array(slicedMask)
         }
