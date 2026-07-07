@@ -102,3 +102,6 @@ pyproject.toml
 uv.lock
 main.py
 
+# Claude Code agent worktrees (transient, isolated working copies)
+.claude/worktrees/
+
