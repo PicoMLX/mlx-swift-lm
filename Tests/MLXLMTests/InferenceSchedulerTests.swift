@@ -258,6 +258,13 @@ struct SchedulerValueTests {
         // row.
         #expect(InferenceScheduler.rowSampler(for: params) == nil)
 
+        // Negative temperature is NOT greedy: single-path parity —
+        // GenerateParameters.sampler() special-cases only temperature == 0,
+        // so a negative divisor samples the inverted distribution there and
+        // must do the same when batched.
+        params.temperature = -1
+        #expect(InferenceScheduler.rowSampler(for: params) != nil)
+
         // Non-zero temperature yields a real sampler.
         params.temperature = 0.7
         let sampler = InferenceScheduler.rowSampler(for: params)
