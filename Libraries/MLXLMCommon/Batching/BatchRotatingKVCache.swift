@@ -678,6 +678,18 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 + "(self: \(maxCacheSize)/\(keep), other: "
                 + "\(other.maxCacheSize)/\(other.keep))"
         )
+        // A prepared cached-prompt prefill (`_lengths != nil`) must be
+        // finalized before the row set changes: `_lengths` is shaped
+        // `[batchSize]`, so a later `finalize()` would roll with mismatched
+        // shifts, and a prepared `other`'s pending lengths would be silently
+        // dropped. Mirrors `filter`, which reconciles `_lengths` on every
+        // row-set change. The engine never hits this (prepare/finalize are
+        // paired inside one prefill call); it guards direct API use.
+        precondition(
+            _lengths == nil && other._lengths == nil,
+            "BatchRotatingKVCache.extend requires both sides to have no "
+                + "pending prepare cycle; call finalize() first."
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
@@ -838,7 +850,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 ? min(min(seqOffset, maxCacheSize), extractedK.dim(2))
                 : extractedK.dim(2)
             cache.metaState = [
-                String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
+                String(keep), String(maxCacheSize), String(step), String(seqOffset),
+                String(cacheIdx),
             ]
         }
 
@@ -965,6 +978,12 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
         let k = Int(cache.metaState.first ?? "0") ?? 0
         let batchCache = BatchRotatingKVCache(maxSize: ms, leftPadding: [0], keep: k)
+        // Adopt the source's growth step (metaState[2] = step) so a
+        // custom-step cache round-trips through batch adoption and a later
+        // `extract` without drifting back to the default.
+        if cache.metaState.count > 2, let sourceStep = Int(cache.metaState[2]), sourceStep > 0 {
+            batchCache.step = sourceStep
+        }
 
         let temporalData = cache.temporalState
         if temporalData.count >= 2 {
