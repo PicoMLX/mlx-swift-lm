@@ -264,7 +264,10 @@ public final class BatchGenerationEngine {
 
         if let gen = generationBatch, !gen.isEmpty {
             let (responses, finishedCaches) = gen.next(capturingFinalCaches: capturingFinalCaches)
-            generatedTokens += responses.count
+            // Count actual tokens, not responses: `BatchStepResult.tokens` is
+            // plural so a future multi-token step (speculative decoding) is
+            // counted honestly.
+            generatedTokens += responses.reduce(0) { $0 + $1.tokens.count }
             if gen.isEmpty {
                 generationBatch = nil
             }
