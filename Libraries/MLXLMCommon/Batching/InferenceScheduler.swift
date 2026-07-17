@@ -324,7 +324,9 @@ extension InferenceScheduler {
     /// the batch.
     ///
     /// This is a **plain non-`Sendable` struct** (it holds non-`Sendable`
-    /// `KVCache`, `LMInput.Text`, `LogitSampler`, `LogitProcessor?`). It is
+    /// `KVCache` values; sampler/processor state is NOT carried — the batch
+    /// path rebuilds them from `parameters`, fast-forwarding a seeded
+    /// sampler's key chain past the draws already consumed). It is
     /// transferred across the actor boundary exactly once with `sending`
     /// (region-based isolation): the single task deposits it via
     /// `CheckedContinuation.resume(returning:)` (which takes `sending` per
@@ -1357,7 +1359,14 @@ extension InferenceScheduler {
     /// Returns `nil` for greedy parameters (`temperature <= 0`): the engine's
     /// default fallback is already greedy, and any non-nil per-row sampler
     /// disables `DecodeBatch`'s whole-batch `argMax` fast path.
-    static func rowSampler(for parameters: GenerateParameters) -> RowSampler? {
+    ///
+    /// `advancedBy` fast-forwards a seeded sampler past draws the request
+    /// already consumed on the single path (the single→batch upgrade); fresh
+    /// admissions — including prefix-fetch adoptions, which consumed no
+    /// draws — pass 0.
+    static func rowSampler(
+        for parameters: GenerateParameters, advancedBy priorDraws: Int = 0
+    ) -> RowSampler? {
         guard parameters.temperature > 0 else { return nil }
         return makeRowSampler(
             temperature: parameters.temperature,
@@ -1366,10 +1375,13 @@ extension InferenceScheduler {
             minP: parameters.minP,
             // Honor the request's seed (GenerateParameters.seed, upstream
             // #377) so batched sampling is reproducible per request. The
-            // per-row key sequence differs from the single path's sampler, so
-            // a seeded request is deterministic on each path but not bitwise
-            // identical across single vs. batched.
-            seed: parameters.seed
+            // per-row key chain is bit-identical to the single path's seeded
+            // sampler (same split role order — see SamplerKeyHolder.next()),
+            // so a seeded request samples the same sequence on either path;
+            // `advancedBy` lets an upgraded row CONTINUE that chain where the
+            // single iterator left off instead of replaying it.
+            seed: parameters.seed,
+            advancedBy: priorDraws
         )
     }
 
@@ -1706,7 +1718,19 @@ extension InferenceScheduler {
         // the scheduler's `nextRequestID`, so a later `insert` cannot reuse it
         // and overwrite the row's record. The scheduler-owned request id rides
         // along as `cancelToken` for stream-cancellation routing.
-        let sampler = Self.rowSampler(for: liveParameters)
+        //
+        // Seeded-PRNG continuity: the single `TokenIterator` consumed exactly
+        // one sampler draw in `prepare` (the pump) plus one per `next()` call
+        // (`liveTokenCount` of them) — the pending handoff token
+        // (`liveCurrentToken`) is the result of draw `liveTokenCount + 1`.
+        // The adopted batch's priming step (`DecodeBatch.init` → `step()`)
+        // performs the NEXT draw, so the fresh sampler is fast-forwarded by
+        // `liveTokenCount + 1` draws: its first draw is then draw
+        // `liveTokenCount + 2` of the request's chain — bitwise the token the
+        // single path would have sampled next. Without the advance, a fresh
+        // holder restarted at `MLXRandom.key(seed)` and REPLAYED the keys
+        // that produced tokens 1..N.
+        let sampler = Self.rowSampler(for: liveParameters, advancedBy: liveTokenCount + 1)
         let processorSource = Self.rowProcessorSource(for: liveParameters)
         let stopMatcher = defaultStopMatcher()
         let firstRecord = EngineDriver.AdoptedRecord(

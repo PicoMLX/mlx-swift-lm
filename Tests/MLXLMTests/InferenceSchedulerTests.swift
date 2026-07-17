@@ -281,6 +281,48 @@ struct SchedulerValueTests {
     }
 }
 
+// MARK: - Seeded sampler PRNG continuity
+
+@Suite("SamplerKeyHolder PRNG continuity")
+struct SamplerKeyHolderTests {
+
+    @Test("advance(by: n) matches a fresh holder that consumed n draws")
+    func advanceMatchesConsumedDraws() throws {
+        // The upgrade path fast-forwards a fresh holder past the draws the
+        // single iterator already consumed; draw n+1 must be bit-identical
+        // to the chain a live holder would continue.
+        let consumed = SamplerKeyHolder(seed: 42)
+        for _ in 0 ..< 5 {
+            _ = consumed.next()
+        }
+        let advanced = SamplerKeyHolder(seed: 42)
+        advanced.advance(by: 5)
+
+        let expected = try #require(consumed.next())
+        let actual = try #require(advanced.next())
+        #expect(expected.asArray(UInt32.self) == actual.asArray(UInt32.self))
+    }
+
+    @Test("advance(by: 0) leaves the chain at its first draw")
+    func advanceZeroIsIdentity() throws {
+        let fresh = SamplerKeyHolder(seed: 7)
+        let advanced = SamplerKeyHolder(seed: 7)
+        advanced.advance(by: 0)
+
+        let expected = try #require(fresh.next())
+        let actual = try #require(advanced.next())
+        #expect(expected.asArray(UInt32.self) == actual.asArray(UInt32.self))
+    }
+
+    @Test("Unseeded holder stays keyless through advance")
+    func unseededAdvanceStaysNil() {
+        let holder = SamplerKeyHolder(seed: nil)
+        holder.advance(by: 3)
+        // nil key = "use MLX's global PRNG"; advancing must not invent one.
+        #expect(holder.next() == nil)
+    }
+}
+
 // MARK: - Attach / detach lifecycle
 
 @Suite("Scheduler attach lifecycle")

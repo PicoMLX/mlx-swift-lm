@@ -67,18 +67,25 @@ public func makeRowProcessorSource(_ parameters: GenerateParameters) -> RowProce
 ///   - topK: number of top tokens to keep (0 = disabled).
 ///   - minP: min-P threshold relative to the most likely token (0 = disabled).
 ///   - seed: optional RNG seed; nil uses MLX's global PRNG.
+///   - advancedBy: number of draws the request already consumed elsewhere
+///     (the single→batch upgrade path); the seeded key chain is
+///     fast-forwarded past them so the next draw CONTINUES the sequence
+///     instead of bit-identically replaying it. 0 (a fresh request) is a
+///     no-op.
 public func makeRowSampler(
     temperature: Float = 0.0,
     topP: Float = 1.0,
     topK: Int = 0,
     minP: Float = 0.0,
-    seed: UInt64? = nil
+    seed: UInt64? = nil,
+    advancedBy priorDraws: Int = 0
 ) -> RowSampler {
     if temperature <= 0 {
         return greedySampler
     }
 
     let keyHolder = SamplerKeyHolder(seed: seed)
+    keyHolder.advance(by: priorDraws)
     let temp = temperature
     let p = topP
     let k = topK
@@ -208,6 +215,27 @@ final class SamplerKeyHolder: Sendable {
             let (nextState, drawKey) = MLXRandom.split(key: value)
             current = nextState
             return drawKey
+        }
+    }
+
+    /// Fast-forward the key chain by `draws` splits without yielding keys,
+    /// exactly as if ``next()`` had been called `draws` times. Because the
+    /// chain is bit-identical to the single path's seeded `RandomState`
+    /// (see ``next()``), the single→batch upgrade uses this to make a fresh
+    /// holder CONTINUE the sequence at the draw the single iterator would
+    /// have consumed next, instead of replaying draws 1..N. Unseeded holders
+    /// stay keyless. No-op for `draws <= 0`.
+    func advance(by draws: Int) {
+        guard draws > 0 else { return }
+        key.withLockUnchecked { current in
+            guard var value = current else { return }
+            for _ in 0 ..< draws {
+                value = MLXRandom.split(key: value).0
+            }
+            // Materialize the advanced state so the skipped splits do not
+            // accumulate as one deep lazy graph evaluated at the next draw.
+            eval(value)
+            current = value
         }
     }
 }
