@@ -313,12 +313,18 @@ private func makeBatchedCacheFactory(
         )
     }
 
-    if cache is QuantizedKVCache {
-        // Batched quantized KV caches (`BatchQuantizedKVCache`) are deferred
-        // until the engine can actually be constructed with quantized cache
-        // parameters; quantized topologies fall back to single-stream for now.
-        throw unsupported(
-            "Quantized KV caches are not supported by continuous batching yet.")
+    if let quantized = cache as? QuantizedKVCache {
+        // Probe rows allocate with the probe's quantization parameters;
+        // `BatchQuantizedKVCache` resolves an incompatible group size against
+        // the model's head dimensions on first update, exactly like
+        // `QuantizedKVCache`.
+        let groupSize = quantized.groupSize
+        let bits = quantized.bits
+        let mode = quantized.mode
+        return { leftPadding in
+            BatchQuantizedKVCache(
+                leftPadding: leftPadding, groupSize: groupSize, bits: bits, mode: mode)
+        }
     }
 
     if cache is ChunkedKVCache {
