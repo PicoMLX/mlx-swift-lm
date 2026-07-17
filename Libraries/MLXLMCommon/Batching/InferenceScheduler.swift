@@ -123,6 +123,17 @@ public actor InferenceScheduler {
     /// boundary is crossed.
     private var queuedRequests: [ScheduledRequest] = []
 
+    /// Cancels that arrived during an upgrade window (`state == .upgrading`)
+    /// for a request that was not yet registered anywhere cancellable — the
+    /// deposited single (not adopted into the driver yet) or the joining
+    /// request (not submitted yet). `cancel(requestID:)` records them here;
+    /// the upgrade path consults the set right after each request registers
+    /// (adoptMigrated / driver.submit) or settles on a fallback single, so a
+    /// consumer dropping its stream mid-handshake is never a silent no-op.
+    /// Request ids are monotonic and never reused, so a consumed entry can
+    /// never cancel a different request.
+    private var pendingCancels: Set<Int> = []
+
     public init(configuration: Configuration = .init()) {
         self.configuration = configuration
     }
@@ -636,9 +647,13 @@ extension InferenceScheduler {
     ///   waiting for batch capacity or already decoding in the engine.
     private func cancel(requestID: Int) async {
         let runningSingle: SingleRequest?
+        var upgradingWindow = false
         switch state {
         case .single(let s), .pendingUpgrade(let s):
             runningSingle = s.requestID == requestID ? s : nil
+        case .upgrading:
+            upgradingWindow = true
+            runningSingle = nil
         default:
             runningSingle = nil
         }
@@ -653,7 +668,16 @@ extension InferenceScheduler {
             return
         }
 
-        await driver?.cancel(token: requestID)
+        let removed = await driver?.cancel(token: requestID) ?? false
+        if !removed, upgradingWindow {
+            // Neither the queue nor the driver knows this request: it is one
+            // of the two mid-upgrade (the deposited single, or the joining
+            // request before its submit). `.upgrading` carries no request
+            // reference, so without this record the cancel would be a silent
+            // no-op for the whole window. The upgrade path consumes the entry
+            // as soon as the request becomes cancellable.
+            pendingCancels.insert(requestID)
+        }
     }
 
     /// Internal carrier bundling a request with its derived routing data.
@@ -1210,6 +1234,13 @@ extension InferenceScheduler {
     /// decode loop is running. Used for 3rd+ concurrent requests and for the
     /// manual ``generateBatched(_:)`` path.
     private func admitToBatch(_ scheduled: sending ScheduledRequest) async {
+        // A cancel recorded during an upgrade window (see `pendingCancels`)
+        // can target a request that is only now being admitted: honor it
+        // before the request reaches the driver or the queue.
+        if pendingCancels.remove(scheduled.requestID) != nil {
+            scheduled.handler.finish()
+            return
+        }
         // Topology-changing parameters (kvBits / maxKVSize) and masked inputs
         // (see `inputIsBatchable`) cannot run on the shared engine. Hold such
         // a request until the scheduler is idle again, then run it on its own
@@ -1263,6 +1294,12 @@ extension InferenceScheduler {
             processorSource: processorSource,
             stateMachine: nil
         )
+        // Honor a cancel recorded while this admission was in flight during
+        // an upgrade window (the driver did not know the token before the
+        // submit above landed).
+        if pendingCancels.remove(cancelToken) != nil {
+            await driver.cancel(token: cancelToken)
+        }
         // Actor mailboxes are not FIFO: a `batchLoopFinished` whose
         // `driver.hasWork` read was served BEFORE the submit above landed can
         // have passed its admission-epoch guard and idled the scheduler while
@@ -1447,15 +1484,18 @@ extension InferenceScheduler {
 
         guard let liveBox else {
             // The single task finished before it could deposit state. Its
-            // stream is already (or about to be) closed by its own loop; start
-            // the joining request fresh. It is (almost always) alone now, so
-            // prefer the zero-overhead single path; only join the engine when
-            // a third request already put live work in the driver (a single
-            // beside an active batch would decode concurrently with it).
+            // stream is already (or about to be) closed by its own loop; drop
+            // any cancel recorded for it during the window (nothing left to
+            // stop) and start the joining request fresh. It is (almost
+            // always) alone now, so prefer the zero-overhead single path;
+            // only join the engine when a third request already put live work
+            // in the driver (a single beside an active batch would decode
+            // concurrently with it).
+            pendingCancels.remove(single.requestID)
             if let driver, await driver.hasWork {
                 await admitToBatch(joining)
             } else {
-                startSingleAfterUpgradeFallback(joining)
+                await startSingleAfterUpgradeFallback(joining)
             }
             return
         }
@@ -1521,6 +1561,7 @@ extension InferenceScheduler {
         // prompt-cache write-back: see `writeBackUpgradedSingle`'s epoch gate.
         guard contextEpoch == epochAtHandshake else {
             finishUpgradedSingle(
+                requestID: single.requestID,
                 handler: single.handler,
                 lastToken: liveFinalToken,
                 promptTokenCount: single.inputTokens.count,
@@ -1528,7 +1569,7 @@ extension InferenceScheduler {
                 submitTime: single.submitTime,
                 reason: liveTokenIsStop ? .stop : .length
             )
-            startSingleAfterUpgradeFallback(joining)
+            await startSingleAfterUpgradeFallback(joining)
             return
         }
 
@@ -1537,6 +1578,7 @@ extension InferenceScheduler {
             // original stream cleanly, then run the joining request fresh.
             writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
+                requestID: single.requestID,
                 handler: single.handler,
                 lastToken: liveFinalToken,
                 promptTokenCount: single.inputTokens.count,
@@ -1544,7 +1586,7 @@ extension InferenceScheduler {
                 submitTime: single.submitTime,
                 reason: liveTokenIsStop ? .stop : .length
             )
-            startSingleAfterUpgradeFallback(joining)
+            await startSingleAfterUpgradeFallback(joining)
             return
         }
 
@@ -1556,6 +1598,7 @@ extension InferenceScheduler {
             // joining request through the batch.
             writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
+                requestID: single.requestID,
                 handler: single.handler,
                 lastToken: liveFinalToken,
                 promptTokenCount: single.inputTokens.count,
@@ -1568,7 +1611,7 @@ extension InferenceScheduler {
             if await driver.hasWork {
                 await admitToBatch(joining)
             } else {
-                startSingleAfterUpgradeFallback(joining)
+                await startSingleAfterUpgradeFallback(joining)
             }
             return
         }
@@ -1585,6 +1628,7 @@ extension InferenceScheduler {
             // forward pass never ran, so the write-back key excludes it.
             writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
+                requestID: single.requestID,
                 handler: single.handler,
                 lastToken: nil,
                 promptTokenCount: single.inputTokens.count,
@@ -1595,7 +1639,7 @@ extension InferenceScheduler {
             if await driver.hasWork {
                 await admitToBatch(joining)
             } else {
-                startSingleAfterUpgradeFallback(joining)
+                await startSingleAfterUpgradeFallback(joining)
             }
             return
         case .more, .cancelled:
@@ -1614,6 +1658,7 @@ extension InferenceScheduler {
             // TODO(PR4 auto-upgrade): extend fromSingle to SSM/composite so this
             // fallback is unreachable for those models.
             finishUpgradedSingle(
+                requestID: single.requestID,
                 handler: single.handler,
                 lastToken: liveCurrentToken,
                 promptTokenCount: single.inputTokens.count,
@@ -1625,7 +1670,7 @@ extension InferenceScheduler {
             if await driver.hasWork {
                 await admitToBatch(joining)
             } else {
-                startSingleAfterUpgradeFallback(joining)
+                await startSingleAfterUpgradeFallback(joining)
             }
             return
         }
@@ -1682,6 +1727,14 @@ extension InferenceScheduler {
         // (the adopted row bypasses `admit`, which captures fresh tickets).
         await driver.noteWiredMemoryTicket(single.wiredMemoryTicket)
 
+        // The upgraded single is now registered with the driver (its row's
+        // cancelToken is `single.requestID`): honor a cancel that arrived
+        // during the handshake window, which `cancel(requestID:)` could only
+        // record (see `pendingCancels`).
+        if pendingCancels.remove(single.requestID) != nil {
+            await driver.cancel(token: single.requestID)
+        }
+
         // Phase 3: admit the joining request and start the batch loop. Pull the
         // Sendable fields out first so the request is the sole non-Sendable
         // value handed to the driver via `sending`.
@@ -1711,6 +1764,12 @@ extension InferenceScheduler {
             processorSource: joinProcessorSource,
             stateMachine: nil
         )
+
+        // The joining request is now registered: honor a cancel recorded
+        // during the upgrade window (see `pendingCancels`).
+        if pendingCancels.remove(joinCancelToken) != nil {
+            await driver.cancel(token: joinCancelToken)
+        }
 
         // Same submit-side self-heal as `admitToBatch`: a stale
         // `batchLoopFinished` served between `.batched` above and the submit
@@ -1753,6 +1812,7 @@ extension InferenceScheduler {
     /// pending tool calls, emits completion info, and closes the stream — so the
     /// original request is never silently truncated.
     private func finishUpgradedSingle(
+        requestID: Int,
         handler: SchedulerTokenHandler,
         lastToken: Int?,
         promptTokenCount: Int,
@@ -1760,6 +1820,9 @@ extension InferenceScheduler {
         submitTime: TimeInterval,
         reason: GenerateStopReason
     ) {
+        // The stream ends here; a cancel recorded for this request during the
+        // upgrade window has nothing left to stop.
+        pendingCancels.remove(requestID)
         if let lastToken {
             _ = handler.processToken(lastToken)
         }
@@ -1781,14 +1844,22 @@ extension InferenceScheduler {
     /// single tasks are safe (no shared engine state). The joining stream is
     /// already live, so a failing iterator prefill is surfaced by closing the
     /// stream rather than thrown.
-    private func startSingleAfterUpgradeFallback(_ scheduled: sending ScheduledRequest) {
+    private func startSingleAfterUpgradeFallback(_ scheduled: sending ScheduledRequest) async {
         // Reset to idle so `startSingle` installs cleanly.
         state = .idle
+        let requestID = scheduled.requestID
         let handler = scheduled.handler
         do {
             try startSingle(scheduled)
+            // The request is now a tracked single task: honor a cancel that
+            // was recorded while the upgrade window hid it (state was
+            // `.upgrading`, so `cancel(requestID:)` found nothing to stop).
+            if pendingCancels.remove(requestID) != nil {
+                await cancel(requestID: requestID)
+            }
         } catch {
             handler.finish()
+            pendingCancels.remove(requestID)
         }
     }
 
@@ -1820,18 +1891,20 @@ extension InferenceScheduler {
     /// running request is ever interrupted.
     private func drainQueuedRequests() async {
         guard !queuedRequests.isEmpty else { return }
-        // Move the held requests out of the actor's storage, then re-route them.
-        // Same boxing dance as `submitBatch`: elements of an actor-held array
-        // cannot be sent while the array stays reachable, so each request is
-        // boxed and consumed at the `sending` boundary.
-        var boxes: [SendableBox<ScheduledRequest>] = []
-        boxes.reserveCapacity(queuedRequests.count)
-        var pending = Array(queuedRequests.reversed())
-        queuedRequests.removeAll()
-        while !pending.isEmpty {
-            boxes.append(SendableBox(pending.removeLast()))
-        }
-        for box in boxes {
+        // Pop ONE request per iteration instead of moving the whole queue
+        // into locals up front: requests still waiting stay in
+        // `queuedRequests`, where `cancel(requestID:)` can find them during
+        // the per-element `route` suspensions (an upfront removeAll made
+        // every undrained request invisible — and thus uncancellable — for
+        // the whole drain). `route` may legitimately re-append a request
+        // (e.g. behind a new non-upgradeable single); bounding the loop by
+        // the initial count preserves the no-respin property. Each element
+        // rides a `SendableBox` (same dance as `submitBatch`: an element of
+        // actor-held storage cannot be sent while reachable from the actor).
+        var remaining = queuedRequests.count
+        while remaining > 0, !queuedRequests.isEmpty {
+            remaining -= 1
+            let box = SendableBox(queuedRequests.removeFirst())
             let next = box.consume()
             // These streams are already live (returned to their callers when
             // queued), so an iterator-prefill failure during re-route cannot be
