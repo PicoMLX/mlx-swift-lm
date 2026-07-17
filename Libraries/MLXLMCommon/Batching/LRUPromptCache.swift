@@ -439,6 +439,21 @@ public final class LRUPromptCache: PromptCaching {
         parameters: GenerateParameters,
         model: any LanguageModel
     ) -> Bool {
+        inputSupportsPromptCache(input: input, parameters: parameters)
+            && modelSupportsPromptCache(model: model, parameters: parameters)
+    }
+
+    /// The input/parameters half of ``canUsePromptCache(input:parameters:model:)``.
+    ///
+    /// Kept separate from the model half so an actor can evaluate it without
+    /// passing the non-`Sendable` `LMInput` through one of its isolated
+    /// methods: a request bound for a `sending` hand-off (`EngineDriver.submit`)
+    /// must stay region-disconnected from the actor, and a plain isolated-method
+    /// parameter would merge it into the actor's region.
+    static func inputSupportsPromptCache(
+        input: LMInput,
+        parameters: GenerateParameters
+    ) -> Bool {
         guard input.image == nil, input.video == nil, input.audio == nil else { return false }
         // Masked / pre-batched inputs prefill at mask-derived positions that
         // the flat cache-hit rewrite (LMInput(tokens: remainder)) cannot
@@ -447,7 +462,15 @@ public final class LRUPromptCache: PromptCaching {
         guard input.text.mask == nil else { return false }
         let tokens = input.text.tokens
         guard tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1) else { return false }
-        guard parameters.kvBits == nil, parameters.kvScheme == nil else { return false }
+        return parameters.kvBits == nil && parameters.kvScheme == nil
+    }
+
+    /// The model half of ``canUsePromptCache(input:parameters:model:)``:
+    /// policy opt-in plus a compatibility probe of the model's cache topology.
+    static func modelSupportsPromptCache(
+        model: any LanguageModel,
+        parameters: GenerateParameters
+    ) -> Bool {
         guard model.defaultPromptCachePolicy == .exact else { return false }
         return isCacheCompatible(model.newCache(parameters: parameters))
     }

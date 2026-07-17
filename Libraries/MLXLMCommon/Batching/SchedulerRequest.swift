@@ -34,6 +34,15 @@ struct SchedulerRequest {
     /// Optional wired-memory ticket.
     var wiredMemoryTicket: WiredMemoryTicket?
 
+    /// Whether ``PromptCachePolicy`` permits prompt-cache use for this
+    /// request (`LRUPromptCache.canUsePromptCache`), decided ONCE by the
+    /// scheduler at submit and threaded through so the driver's prefix fetch
+    /// AND its write-back flags both respect policy — no path re-derives (or
+    /// silently ignores) it. Defaults to `true` for callers that construct
+    /// requests directly (tests), preserving the opt-in-by-`promptCache`
+    /// behavior; the scheduler always passes its computed decision.
+    var cacheEligible: Bool
+
     init(
         input: LMInput,
         parameters: GenerateParameters,
@@ -41,7 +50,8 @@ struct SchedulerRequest {
         modelName: String,
         promptCache: (any PromptCaching)? = nil,
         promptCacheSalt: UInt64 = 0,
-        wiredMemoryTicket: WiredMemoryTicket? = nil
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        cacheEligible: Bool = true
     ) {
         self.input = input
         self.parameters = parameters
@@ -50,5 +60,6 @@ struct SchedulerRequest {
         self.promptCache = promptCache
         self.promptCacheSalt = promptCacheSalt
         self.wiredMemoryTicket = wiredMemoryTicket
+        self.cacheEligible = cacheEligible
     }
 }
