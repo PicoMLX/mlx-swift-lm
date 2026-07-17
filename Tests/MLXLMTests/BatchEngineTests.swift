@@ -150,15 +150,19 @@ struct BatchGenerationEngineTopologyTests {
         // CacheList) are factory-rejected until the in-repo models all
         // thread createSSMMask; see makeBatchedCacheFactory and the
         // "Rejects unsupported cache topologies" test below.
+        _ = try BatchGenerationEngine(
+            model: CacheTopologyLanguageModel { _ in [QuantizedKVCache()] }
+        )
     }
 
     @Test("Rejects unsupported cache topologies")
     func rejectsUnsupportedCacheTopologies() {
-        assertEngineRejectsCache(
-            QuantizedKVCache(),
-            expectedType: "QuantizedKVCache",
-            expectedPath: "layer"
-        )
+        // QuantizedKVCache is batchable (BatchQuantizedKVCache); construction
+        // must succeed for a quantized probe.
+        let quantized = CacheTopologyLanguageModel { _ in [QuantizedKVCache()] }
+        #expect(throws: Never.self) {
+            _ = try BatchGenerationEngine(model: quantized)
+        }
         assertEngineRejectsCache(
             ChunkedKVCache(),
             expectedType: "ChunkedKVCache",
