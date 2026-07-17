@@ -17,7 +17,10 @@ import os
 /// state, which makes the type checked-`Sendable` (no `@unchecked` on this
 /// type). All mutating operations run inside `state.withLockUnchecked { ... }`
 /// (`Unchecked` because the protected state holds non-`Sendable` `KVCache`
-/// values; the lock supplies the synchronization).
+/// values; the lock supplies the synchronization). Fetches hold the lock only
+/// for the trie/LRU bookkeeping; the GPU deep copy of the matched entry is
+/// materialized after the lock is released (entries are immutable once
+/// inserted, so the copy needs no synchronization).
 ///
 /// Key operations:
 /// - `insertCache(model:tokens:promptCache:)` — store a KV cache for a token sequence
@@ -125,6 +128,26 @@ public final class LRUPromptCache: PromptCaching {
         let commonPrefix: Int
     }
 
+    /// What a locked lookup hands back for materialization outside the lock.
+    ///
+    /// `entryCaches` are the matched entry's *stored* caches, shared by
+    /// reference: entries are immutable after insert (an update replaces the
+    /// whole ``CacheEntry`` rather than mutating its caches), so reading them
+    /// after the lock is released is safe, and ARC keeps them alive even if
+    /// the entry is concurrently evicted before the copy runs.
+    fileprivate struct Lookup {
+        /// The matched entry's stored caches (not yet copied).
+        let entryCaches: [KVCache]
+        /// The tokens that still need processing after the cached prefix.
+        let remainder: [Int]
+        /// How the lookup matched.
+        let hitKind: HitKind
+        /// How many leading tokens the matched cache covers.
+        let matchedTokenCount: Int
+        /// For `.longer` hits, how many trailing tokens to trim off the copy.
+        let numToTrim: Int
+    }
+
     /// All mutable state, guarded by the lock.
     ///
     /// The trie (`cache`), the LRU tracker (`lru`), and the running byte total
@@ -225,9 +248,32 @@ public final class LRUPromptCache: PromptCaching {
         guard !tokens.isEmpty else {
             return FetchResult(cache: nil, remainder: tokens, hitKind: .none, matchedTokenCount: 0)
         }
-        return state.withLockUnchecked { state in
-            state.fetchNearestCache(key: RootKey(model: model, salt: salt), tokens: tokens)
+        // Under the lock: trie search, LRU touch, and capture of the matched
+        // entry's stored caches — pointer/metadata work only. The GPU deep
+        // copy (`materializedCopy` → `eval`) runs AFTER the lock is released:
+        // it can take seconds for long entries, and holding the lock through
+        // it would stall every concurrent fetch/insert (the lock is taken on
+        // the driver actor's decode hot path).
+        let lookup = state.withLockUnchecked { state in
+            state.lookupNearestCache(key: RootKey(model: model, salt: salt), tokens: tokens)
         }
+        guard let lookup else {
+            return FetchResult(cache: nil, remainder: tokens, hitKind: .none, matchedTokenCount: 0)
+        }
+        // Lock-free copy: stored entries are immutable after insert and ARC
+        // keeps `entryCaches` alive, so a fetch racing an eviction at worst
+        // returns a just-evicted entry — acceptable cache semantics (the
+        // caller holds an independent, valid snapshot either way).
+        let copy = Self.deepCopy(lookup.entryCaches)
+        if lookup.numToTrim > 0 {
+            trimPromptCache(copy, numTokens: lookup.numToTrim)
+        }
+        return FetchResult(
+            cache: copy,
+            remainder: lookup.remainder,
+            hitKind: lookup.hitKind,
+            matchedTokenCount: lookup.matchedTokenCount
+        )
     }
 
     /// Insert a KV cache for the given token sequence.
@@ -597,20 +643,23 @@ extension LRUPromptCache.State {
         lru.push(key: key, tokens: tokens, checkpoint: wasCheckpoint)
     }
 
-    /// Internal fetch (must be called while holding the lock).
-    func fetchNearestCache(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.FetchResult
-    {
+    /// Internal lookup (must be called while holding the lock): trie search,
+    /// LRU touch, and capture of the matched entry's stored caches.
+    /// Deliberately performs no copying and no `eval` — the caller
+    /// materializes the returned ``LRUPromptCache/Lookup`` outside the lock.
+    func lookupNearestCache(key: LRUPromptCache.RootKey, tokens: [Int]) -> LRUPromptCache.Lookup? {
         let result = search(key: key, tokens: tokens)
 
         // Exact match
         if let exact = result.exact {
             let entry = get(key: result.key, tokens: exact)
             touch(key: result.key, tokens: exact)
-            return LRUPromptCache.FetchResult(
-                cache: LRUPromptCache.deepCopy(entry.promptCache),
+            return LRUPromptCache.Lookup(
+                entryCaches: entry.promptCache,
                 remainder: [],
                 hitKind: .exact,
-                matchedTokenCount: tokens.count
+                matchedTokenCount: tokens.count,
+                numToTrim: 0
             )
         }
 
@@ -623,15 +672,13 @@ extension LRUPromptCache.State {
                 let prefix = min(tokens.count, result.commonPrefix)
                 let numToTrim = longer.count - prefix
                 if LRUPromptCache.canSafelyTrim(entry.promptCache, numTokens: numToTrim) {
-                    let copy = LRUPromptCache.deepCopy(entry.promptCache)
-                    trimPromptCache(copy, numTokens: numToTrim)
-                    let remainder = prefix < tokens.count ? Array(tokens[prefix...]) : []
                     touch(key: result.key, tokens: longer)
-                    return LRUPromptCache.FetchResult(
-                        cache: copy,
-                        remainder: remainder,
+                    return LRUPromptCache.Lookup(
+                        entryCaches: entry.promptCache,
+                        remainder: prefix < tokens.count ? Array(tokens[prefix...]) : [],
                         hitKind: .longer,
-                        matchedTokenCount: prefix
+                        matchedTokenCount: prefix,
+                        numToTrim: numToTrim
                     )
                 }
             }
@@ -641,17 +688,17 @@ extension LRUPromptCache.State {
         if shortLength > 0 {
             let entry = get(key: result.key, tokens: result.shorter!)
             touch(key: result.key, tokens: result.shorter!)
-            return LRUPromptCache.FetchResult(
-                cache: LRUPromptCache.deepCopy(entry.promptCache),
+            return LRUPromptCache.Lookup(
+                entryCaches: entry.promptCache,
                 remainder: Array(tokens[shortLength...]),
                 hitKind: .shorter,
-                matchedTokenCount: shortLength
+                matchedTokenCount: shortLength,
+                numToTrim: 0
             )
         }
 
         // No match
-        return LRUPromptCache.FetchResult(
-            cache: nil, remainder: tokens, hitKind: .none, matchedTokenCount: 0)
+        return nil
     }
 
     /// Internal insert (must be called while holding the lock).
