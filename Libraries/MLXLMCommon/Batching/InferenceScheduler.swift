@@ -705,7 +705,7 @@ extension InferenceScheduler {
             // synchronous init-error semantics. (Drain re-routes — where the
             // stream is already live — close the stream instead; see
             // `drainQueuedRequests`.)
-            try startSingle(scheduled)
+            try await startSingle(scheduled)
 
         case .single(let single):
             if !Self.parametersAreBatchable(scheduled.request.parameters)
@@ -783,9 +783,16 @@ extension InferenceScheduler {
     /// which also constructs the iterator before handing back its stream. The
     /// non-`Sendable` iterator is then transferred into the detached task via
     /// the repo's existing ``SendableBox`` (no new `@unchecked`).
-    private func startSingle(_ scheduled: sending ScheduledRequest) throws {
+    private func startSingle(_ scheduled: sending ScheduledRequest) async throws {
         guard let context else {
+            // No bound context (possible after a detach with no re-attach):
+            // close this stream, then drain anything queued behind it — with
+            // no running request left, nothing else would ever drain the
+            // queue. The recursion through `route` is bounded: each drain
+            // pass removes at least one request (a context-less re-route
+            // lands right back here and is finished).
             scheduled.handler.finish()
+            await drainQueuedRequests()
             return
         }
 
@@ -1250,7 +1257,7 @@ extension InferenceScheduler {
             Self.inputIsBatchable(scheduled.request.input)
         else {
             if case .idle = state {
-                startSingleIfIdle(scheduled)
+                await startSingleIfIdle(scheduled)
             } else {
                 queuedRequests.append(scheduled)
             }
@@ -1262,7 +1269,7 @@ extension InferenceScheduler {
         guard let driver = await ensureDriver() else {
             // Cannot batch this model — run the request on the single path
             // instead (correctness over batching).
-            startSingleIfIdle(scheduled)
+            await startSingleIfIdle(scheduled)
             return
         }
         state = .batched
@@ -1323,10 +1330,10 @@ extension InferenceScheduler {
     /// the caller, so a failing iterator prefill cannot be thrown out here — it
     /// is surfaced by closing the stream (the request simply yields nothing),
     /// matching the pre-existing best-effort handling on this path.
-    private func startSingleIfIdle(_ scheduled: sending ScheduledRequest) {
+    private func startSingleIfIdle(_ scheduled: sending ScheduledRequest) async {
         let handler = scheduled.handler
         do {
-            try startSingle(scheduled)
+            try await startSingle(scheduled)
         } catch {
             handler.finish()
             // `startSingle` throws before installing any state; make sure a
@@ -1334,6 +1341,13 @@ extension InferenceScheduler {
             // the scheduler (subsequent requests would route to the batch
             // forever even with nothing running).
             if case .upgrading = state { state = .idle }
+            // The failed request installed nothing, so if the scheduler is
+            // idle nothing else will ever drain the requests queued behind
+            // it. The recursion through `route` → `startSingleIfIdle` is
+            // bounded: each pass removes/finishes at least one request.
+            if case .idle = state {
+                await drainQueuedRequests()
+            }
         }
     }
 
@@ -1850,7 +1864,7 @@ extension InferenceScheduler {
         let requestID = scheduled.requestID
         let handler = scheduled.handler
         do {
-            try startSingle(scheduled)
+            try await startSingle(scheduled)
             // The request is now a tracked single task: honor a cancel that
             // was recorded while the upgrade window hid it (state was
             // `.upgrading`, so `cancel(requestID:)` found nothing to stop).
@@ -1860,6 +1874,10 @@ extension InferenceScheduler {
         } catch {
             handler.finish()
             pendingCancels.remove(requestID)
+            // State is `.idle` with no request installed: drain the queue
+            // here or the requests held behind the failed one would strand
+            // (bounded — each drain pass removes/finishes at least one).
+            await drainQueuedRequests()
         }
     }
 
