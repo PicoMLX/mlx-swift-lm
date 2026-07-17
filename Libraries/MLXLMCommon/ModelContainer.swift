@@ -92,6 +92,18 @@ public final class ModelContainer: Sendable {
         self.promptCache = promptCache
     }
 
+    deinit {
+        // Release the scheduler binding so a future container can attach:
+        // without an explicit detach the scheduler stays bound to this
+        // container's ObjectIdentifier forever — and a recycled identity
+        // could even pass its owner check and be served the dead container's
+        // retained context. `deinit` is nonisolated, so capture the identity
+        // and the scheduler reference before hopping to the scheduler actor.
+        guard let scheduler else { return }
+        let owner = ObjectIdentifier(self)
+        Task { await scheduler.detach(owner: owner) }
+    }
+
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
     /// `MLXArray` is not `Sendable`.
     @available(*, deprecated, message: "prefer perform(_:) that uses a ModelContext")
