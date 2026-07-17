@@ -1227,6 +1227,19 @@ extension InferenceScheduler {
             processorSource: processorSource,
             stateMachine: nil
         )
+        // Actor mailboxes are not FIFO: a `batchLoopFinished` whose
+        // `driver.hasWork` read was served BEFORE the submit above landed can
+        // have passed its admission-epoch guard and idled the scheduler while
+        // this row is now live. Self-heal on the submit side: re-assert
+        // `.batched` when a stale loop-finish idled it — but never clobber a
+        // `.single`/`.pendingUpgrade` a concurrent path installed meanwhile
+        // (the state machine still tracks that request; the driver fans this
+        // row's tokens out regardless). `startBatchLoop` below restarts the
+        // loop if needed; `drain` is ownership-idempotent
+        // (`if draining { return false }`), so a redundant start is a no-op.
+        if case .idle = state {
+            state = .batched
+        }
         startBatchLoop(driver)
     }
 
@@ -1309,7 +1322,13 @@ extension InferenceScheduler {
     /// work remains so the next lone request starts fresh on the single path.
     private func batchLoopFinished() async {
         guard let driver else {
-            state = .idle
+            // The driver was torn down while this loop-finish was in flight
+            // (context refresh). Same never-clobber rule as below: only a
+            // still-`.batched` state may be idled — a `.single`/`.upgrading`
+            // installed concurrently is tracking live work.
+            if case .batched = state {
+                state = .idle
+            }
             await drainQueuedRequests()
             return
         }
@@ -1657,6 +1676,12 @@ extension InferenceScheduler {
             stateMachine: nil
         )
 
+        // Same submit-side self-heal as `admitToBatch`: a stale
+        // `batchLoopFinished` served between `.batched` above and the submit
+        // landing may have idled the scheduler under the live batch.
+        if case .idle = state {
+            state = .batched
+        }
         startBatchLoop(driver)
     }
 
