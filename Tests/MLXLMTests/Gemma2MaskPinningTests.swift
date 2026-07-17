@@ -143,6 +143,113 @@ struct Gemma2MaskPinningTests {
         #expect(maxMagnitude > 0)
     }
 
+    // MARK: - 4. Batched (left-padded) parity, float32
+
+    @Test("Left-padded batched prefill matches single-stream prefill")
+    func batchedPrefillMatchesSingle() throws {
+        let model = try makeModel(seed: 403)
+        let prompts: [[Int32]] = [
+            [11, 12, 13, 14, 15],
+            [21, 22, 23],
+        ]
+
+        let singles = prompts.map { prefillSingle(model: model, prompt: $0) }
+        let batched = prefillBatch(model: model, prompts: prompts)
+
+        for (index, prompt) in prompts.enumerated() {
+            let pad = batched.leftPadding[index]
+            let batchValid = batched.logits[index ..< (index + 1), pad..., 0...].asType(.float32)
+            let single = singles[index].logits.asType(.float32)
+
+            #expect(batchValid.shape == single.shape)
+            #expect(
+                maxAbsDifference(batchValid, single) <= 0.01,
+                "Batched prefill diverged for prompt \(prompt)"
+            )
+        }
+    }
+
+    @Test("Left-padded batched decode matches single-stream decode")
+    func batchedDecodeMatchesSingle() throws {
+        let model = try makeModel(seed: 404)
+        let prompts: [[Int32]] = [
+            [11, 12, 13, 14, 15],
+            [21, 22, 23],
+        ]
+        let decodeTokens: [Int32] = [31, 32]
+
+        let singles = prompts.enumerated().map { index, prompt in
+            let result = prefillSingle(model: model, prompt: prompt)
+            let decodeInput = MLXArray([decodeTokens[index]])[.newAxis, .ellipsis]
+            let decodeLogits = model.callAsFunction(decodeInput, cache: result.cache)
+            materialize(arrays: [decodeLogits], cache: result.cache)
+            return decodeLogits
+        }
+
+        let batched = prefillBatch(model: model, prompts: prompts)
+        let batchedInput = MLXArray(decodeTokens, [decodeTokens.count, 1])
+        let batchedLogits = model.callAsFunction(batchedInput, cache: batched.cache)
+        materialize(arrays: [batchedLogits], cache: batched.cache)
+
+        for index in prompts.indices {
+            let batchRow = batchedLogits[index ..< (index + 1), 0..., 0...].asType(.float32)
+            let single = singles[index].asType(.float32)
+
+            #expect(batchRow.shape == single.shape)
+            // With 4 heads over 2 KV heads the scores are 5-D here, so this
+            // also pins the [B, 1, L, S] → head-group mask expansion inside
+            // applyGemma2AttentionMask.
+            #expect(
+                maxAbsDifference(batchRow, single) <= 0.01,
+                "Batched decode diverged for prompt index \(index)"
+            )
+        }
+    }
+
+    // MARK: - 5. float16 finite fill (maskFill)
+
+    @Test("float16 left-padded batched prefill stays finite and matches single")
+    func float16PaddedPrefillStaysFinite() throws {
+        let model = try makeModel(seed: 405)
+        // Match real-world deployment dtype. This is the case the finite
+        // `maskFill` exists for: a -1e9 fill cast to float16 overflows to
+        // -inf, an all-masked (fully left-padded) query row softmaxes to NaN,
+        // and the NaN poisons every later layer's K/V for that row.
+        model.apply {
+            if $0.dtype == .float32 {
+                $0.asType(.float16)
+            } else {
+                $0
+            }
+        }
+        eval(model)
+
+        let prompts: [[Int32]] = [
+            [11, 12, 13, 14, 15],
+            [21, 22, 23],
+        ]
+
+        let singles = prompts.map { prefillSingle(model: model, prompt: $0) }
+        let batched = prefillBatch(model: model, prompts: prompts)
+
+        for (index, prompt) in prompts.enumerated() {
+            let pad = batched.leftPadding[index]
+            let batchValid = batched.logits[index ..< (index + 1), pad..., 0...].asType(.float32)
+            let single = singles[index].logits.asType(.float32)
+
+            let maxMagnitude = abs(batchValid).max().item(Float.self)
+            #expect(
+                maxMagnitude.isFinite,
+                "float16 padded prefill produced non-finite logits for prompt \(prompt)"
+            )
+            #expect(batchValid.shape == single.shape)
+            #expect(
+                maxAbsDifference(batchValid, single) <= 0.05,
+                "float16 batched prefill diverged for prompt \(prompt)"
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     private func decodeConfiguration<T: Decodable>(_ json: String) throws -> T {
@@ -157,6 +264,27 @@ struct Gemma2MaskPinningTests {
         let logits = model.callAsFunction(input, cache: cache)
         materialize(arrays: [logits], cache: cache)
         return (logits, cache)
+    }
+
+    /// Left-padded ragged batch prefill over hand-built `BatchKVCache`s
+    /// (Gemma2's per-layer caches are all `KVCacheSimple`), mirroring the
+    /// batched cache factories used by the engine.
+    private func prefillBatch(
+        model: Gemma2Model, prompts: [[Int32]]
+    ) -> (logits: MLXArray, cache: [KVCache], leftPadding: [Int]) {
+        let maxLength = prompts.map(\.count).max() ?? 0
+        let leftPadding = prompts.map { maxLength - $0.count }
+
+        let flat = zip(prompts, leftPadding).flatMap { prompt, pad in
+            Array(repeating: Int32(0), count: pad) + prompt
+        }
+        let input = MLXArray(flat, [prompts.count, maxLength])
+        let cache: [KVCache] = model.newCache(parameters: nil).map { _ in
+            BatchKVCache(leftPadding: leftPadding)
+        }
+        let logits = model.callAsFunction(input, cache: cache)
+        materialize(arrays: [logits], cache: cache)
+        return (logits, cache, leftPadding)
     }
 
     private func materialize(arrays: [MLXArray], cache: [KVCache]) {
