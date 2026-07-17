@@ -276,7 +276,17 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(_idx, n)
+        // `_idx` is the padded maximum width across rows; `batchOffsets[i]` is the
+        // live (post-padding) token count of row `i` (it starts at `-leftPadding`
+        // and advances by the number of tokens written). Trimming the full `n` from
+        // every row would drive a shorter row's offset negative, leaving its
+        // `leftPadding` larger than the new `_idx`. A later `extract` then slices
+        // `padding ..< _idx` with an invalid range and decode sees invalid RoPE
+        // positions. Clamp the trim to the minimum live per-row length so no row can
+        // underflow, and return the clamped amount. Same as `BatchKVCache.trim`.
+        guard _idx > 0 else { return 0 }
+        let minLiveRow = max(0, Int(batchOffsets.min().item(Int32.self)))
+        let trimmed = min(n, _idx, minLiveRow)
         _idx -= trimmed
         batchOffsets = batchOffsets - Int32(trimmed)
         return trimmed
