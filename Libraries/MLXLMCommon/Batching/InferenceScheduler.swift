@@ -127,9 +127,10 @@ public actor InferenceScheduler {
         self.configuration = configuration
     }
 
-    /// Bind the model context the scheduler drives. Idempotent; the context is
-    /// captured on first attach. Called by ``ModelContainer`` when the
-    /// scheduler is first used.
+    /// Bind the model context the scheduler drives. Idempotent for the same
+    /// owner (the context is captured on its first attach); a new owner
+    /// attaching after a ``detach(owner:)`` replaces the retained context.
+    /// Called by ``ModelContainer`` when the scheduler is first used.
     ///
     /// The context is transferred inside a `SendableBox` (the repo's existing
     /// non-`Sendable` hand-off box, also used by `generateTask`): ``ModelContext``
@@ -150,9 +151,23 @@ public actor InferenceScheduler {
         if let attachedOwner, attachedOwner != owner {
             return false
         }
+        let newOwner = attachedOwner == nil
         attachedOwner = owner
         if self.context == nil {
             self.context = box.consume()
+        } else if newOwner {
+            // A NEW owner is attaching after a `detach(owner:)`: the retained
+            // context (and cache) belong to the departed container — the old
+            // keep-first behavior would silently generate every request with
+            // the previous container's model. Replace them and invalidate
+            // epoch-gated state so nothing built from the old context (a
+            // driver, or an in-flight single's upgrade) can be reused.
+            self.context = box.consume()
+            self.promptCache = promptCache
+            contextEpoch += 1
+            if driver != nil {
+                driverStale = true
+            }
         }
         if self.promptCache == nil {
             self.promptCache = promptCache
@@ -160,11 +175,32 @@ public actor InferenceScheduler {
         return true
     }
 
+    /// Release the binding for `owner` (called from ``ModelContainer``'s
+    /// `deinit`). Without this, the scheduler stays `schedulerAlreadyAttached`
+    /// forever after its container dies — and worse, an `ObjectIdentifier`
+    /// recycled onto a NEW container could pass the `attachedOwner` equality
+    /// check and silently serve requests with the dead container's retained
+    /// context. The context itself is kept for any still-running requests,
+    /// but the epoch is bumped and the driver marked stale so nothing built
+    /// from it survives past the next attach/idle transition.
+    func detach(owner: ObjectIdentifier) {
+        guard attachedOwner == owner else { return }
+        attachedOwner = nil
+        contextEpoch += 1
+        if driver != nil {
+            driverStale = true
+        }
+    }
+
     /// The container this scheduler is bound to, if any.
     var currentOwner: ObjectIdentifier? { attachedOwner }
 
     /// Whether the scheduler already has a bound context.
     var isAttached: Bool { context != nil }
+
+    /// Internal test probe: the configuration name of the bound context
+    /// (`nil` when no context is bound).
+    var attachedModelName: String? { context?.configuration.name }
 
     /// Replace the bound context after ``ModelContainer/update(_:)`` swaps a
     /// context field (model/tokenizer/processor). Without this, scheduler-

@@ -281,6 +281,95 @@ struct SchedulerValueTests {
     }
 }
 
+// MARK: - Attach / detach lifecycle
+
+@Suite("Scheduler attach lifecycle")
+struct SchedulerAttachLifecycleTests {
+
+    /// Stand-in for a `ModelContainer`: attach/detach key purely on
+    /// `ObjectIdentifier`, so any class instance works as an owner.
+    private final class Owner {}
+
+    private func makeContext(name: String) -> ModelContext {
+        ModelContext(
+            configuration: ModelConfiguration(id: name),
+            model: UnusedLanguageModel(),
+            processor: StandInUserInputProcessor(),
+            tokenizer: TestTokenizer(vocabularySize: 16)
+        )
+    }
+
+    @Test("Detach releases the owner; a new owner attaches and replaces the context")
+    func detachThenReattachReplacesContext() async throws {
+        let scheduler = InferenceScheduler()
+        // Keep both owners alive for the whole test so their identities can
+        // never alias through address reuse.
+        let a = Owner()
+        let b = Owner()
+        let ownerA = ObjectIdentifier(a)
+        let ownerB = ObjectIdentifier(b)
+
+        let attachedA = await scheduler.attach(
+            owner: ownerA,
+            context: SendableBox(makeContext(name: "test/model-a")),
+            promptCache: nil
+        )
+        #expect(attachedA)
+        #expect(await scheduler.currentOwner == ownerA)
+        #expect(await scheduler.attachedModelName == "test/model-a")
+
+        // A different container cannot steal the binding while A owns it.
+        let stolen = await scheduler.attach(
+            owner: ownerB,
+            context: SendableBox(makeContext(name: "test/model-b")),
+            promptCache: nil
+        )
+        #expect(stolen == false)
+
+        // Detach from the wrong owner is a no-op.
+        await scheduler.detach(owner: ownerB)
+        #expect(await scheduler.currentOwner == ownerA)
+
+        // Detach from the bound owner releases the binding; the context is
+        // retained only for in-flight work.
+        await scheduler.detach(owner: ownerA)
+        #expect(await scheduler.currentOwner == nil)
+
+        // A new owner now attaches — and REPLACES the retained context, so
+        // its requests never run on the dead container's model.
+        let attachedB = await scheduler.attach(
+            owner: ownerB,
+            context: SendableBox(makeContext(name: "test/model-b")),
+            promptCache: nil
+        )
+        #expect(attachedB)
+        #expect(await scheduler.currentOwner == ownerB)
+        #expect(await scheduler.attachedModelName == "test/model-b")
+    }
+
+    @Test("Same-owner re-attach keeps the first context")
+    func sameOwnerReattachIsIdempotent() async throws {
+        let scheduler = InferenceScheduler()
+        let a = Owner()
+        let ownerA = ObjectIdentifier(a)
+
+        #expect(
+            await scheduler.attach(
+                owner: ownerA,
+                context: SendableBox(makeContext(name: "test/model-a")),
+                promptCache: nil
+            ))
+        #expect(
+            await scheduler.attach(
+                owner: ownerA,
+                context: SendableBox(makeContext(name: "test/model-a2")),
+                promptCache: nil
+            ))
+        // The first-bound context stays (the second box is not consumed).
+        #expect(await scheduler.attachedModelName == "test/model-a")
+    }
+}
+
 // MARK: - Helpers
 
 private struct CollectedGeneration {
@@ -318,4 +407,20 @@ private func collectTokenGenerations(_ stream: AsyncStream<TokenGeneration>) asy
         }
     }
     return CollectedTokenGeneration(tokens: tokens, info: info)
+}
+
+/// A structurally-conforming `LanguageModel` for lifecycle tests that never
+/// run a decode. `callAsFunction` traps to make accidental use obvious
+/// (mirrors `NoopLanguageModel` in the ModelContainer batching tests).
+private final class UnusedLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let vocabularySize = 16
+    var kvHeads: [Int] { [1] }
+
+    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        fatalError("UnusedLanguageModel must not be run by lifecycle tests")
+    }
 }
