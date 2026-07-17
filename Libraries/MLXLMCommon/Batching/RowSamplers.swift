@@ -46,8 +46,11 @@ public func makeRowProcessorSource(_ parameters: GenerateParameters) -> RowProce
 ///
 /// Behavior, matching the single-request `TopPSampler` in `Evaluate.swift`
 /// (which mirrors `mlx_lm.sample_utils.make_sampler`):
-///   - `temperature <= 0`: return `greedySampler` (no RNG, deterministic).
-///   - `temperature > 0`: optionally mask the unscaled logprobs to top-P
+///   - `temperature == 0`: return `greedySampler` (no RNG, deterministic).
+///     ONLY exact zero is greedy — `GenerateParameters.sampler()` treats a
+///     negative temperature as a real divisor (sampling the inverted
+///     distribution), so the batched path must too.
+///   - otherwise: optionally mask the unscaled logprobs to top-P
 ///     then min-P then top-K, scale by `1/temperature`, and sample
 ///     categorically. The order (filter first, temperature at the draw)
 ///     means one batched row reproduces single-stream sampling for the
@@ -80,7 +83,7 @@ public func makeRowSampler(
     seed: UInt64? = nil,
     advancedBy priorDraws: Int = 0
 ) -> RowSampler {
-    if temperature <= 0 {
+    if temperature == 0 {
         return greedySampler
     }
 

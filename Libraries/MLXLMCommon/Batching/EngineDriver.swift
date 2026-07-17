@@ -39,7 +39,6 @@ actor EngineDriver {
         /// stream cancellation) without the caller knowing the engine UID.
         let cancelToken: Int
         let promptTokenCount: Int
-        let inputTokens: [Int]
         let modelName: String
         let promptCacheSalt: UInt64
         /// The request's own prompt-cache instance (GenerationRequest
@@ -51,12 +50,6 @@ actor EngineDriver {
         /// Whether to write this request's final KV state back to the prompt
         /// cache when it finishes.
         let writeBackToPromptCache: Bool
-        /// Whether the engine's `allTokens` for this row includes the prompt
-        /// (true for freshly-prefilled rows, where `PrefillBatch` appends the
-        /// prompt; false for adopted/upgraded rows, whose history is seeded with
-        /// generated-only tokens). Controls how `generationTokenCount` is
-        /// derived in the completion info.
-        let tokensIncludePrompt: Bool
         /// When the row's first token reached its handler. Splits the
         /// completion info's timing into admission-to-first-token
         /// (reported as `promptTime`: queue wait + prefill) and pure decode
@@ -69,18 +62,17 @@ actor EngineDriver {
         var deliveredTokenCount: Int = 0
     }
 
-    /// The number of generated tokens for a finished row, excluding prompt
-    /// tokens when the engine's history includes them and excluding a final
-    /// stop token that was appended to the history but suppressed from the
-    /// stream (the single-stream loop checks EOS before counting, so it never
-    /// counts the stop token — this keeps the batched path consistent).
+    /// The number of generated tokens for a finished row: the engine's
+    /// history always includes the prompt (all three creation paths — cold
+    /// insert, prefix-fetch admission, and single→batch adoption — seed
+    /// prompt-inclusive histories), so the prompt is subtracted, as is a
+    /// final stop token that was appended to the history but suppressed from
+    /// the stream (the single-stream loop checks EOS before counting, so it
+    /// never counts the stop token — this keeps the batched path consistent).
     private func generationCount(
         _ record: RequestRecord, allTokens: [Int]?, suppressedStopToken: Bool
     ) -> Int {
-        var total = allTokens?.count ?? 0
-        if record.tokensIncludePrompt {
-            total -= record.promptTokenCount
-        }
+        var total = (allTokens?.count ?? 0) - record.promptTokenCount
         if suppressedStopToken {
             total -= 1
         }
@@ -184,11 +176,11 @@ actor EngineDriver {
         }
     }
 
-    /// Set the runtime admission cap. Modeled on Layr's `setMaxNumSeqs(_:)`:
-    /// values `< 1` are clamped to `1` so a zero/negative cap cannot deadlock
-    /// admission. Lowering the cap below the live row count does not evict
-    /// running rows; it just stops new admissions until rows finish. Raising it
-    /// immediately admits any waiting requests it now has room for.
+    /// Set the runtime admission cap. Values `< 1` are clamped to `1` so a
+    /// zero/negative cap cannot deadlock admission. Lowering the cap below
+    /// the live row count does not evict running rows; it just stops new
+    /// admissions until rows finish. Raising it immediately admits any
+    /// waiting requests it now has room for.
     func setMaxBatchSize(_ size: Int?) {
         if let size {
             maxBatchSize = max(1, size)
@@ -326,7 +318,6 @@ actor EngineDriver {
             handler: handler,
             cancelToken: cancelToken,
             promptTokenCount: request.inputTokens.count,
-            inputTokens: request.inputTokens,
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
             promptCache: request.promptCache,
@@ -335,8 +326,7 @@ actor EngineDriver {
             // one-shot PromptCachePolicy decision, so an ineligible request
             // (e.g. a model whose policy is not `.exact`) neither fetches
             // nor writes back on the batched path.
-            writeBackToPromptCache: request.promptCache != nil && request.cacheEligible,
-            tokensIncludePrompt: true
+            writeBackToPromptCache: request.promptCache != nil && request.cacheEligible
         )
         return uid
     }
@@ -456,13 +446,12 @@ actor EngineDriver {
             handler: handler,
             cancelToken: cancelToken,
             promptTokenCount: request.inputTokens.count,
-            inputTokens: request.inputTokens,
             modelName: request.modelName,
             promptCacheSalt: request.promptCacheSalt,
             promptCache: request.promptCache,
             submitTime: submitTime,
-            writeBackToPromptCache: true,
-            tokensIncludePrompt: true
+            // Opt-in and eligibility were both guarded above.
+            writeBackToPromptCache: true
         )
         return uid
     }
@@ -480,7 +469,6 @@ actor EngineDriver {
         /// cancelled by token if its consumer drops the stream.
         let cancelToken: Int
         let promptTokenCount: Int
-        let inputTokens: [Int]
         let modelName: String
         let promptCacheSalt: UInt64
         let promptCache: (any PromptCaching)?
@@ -542,19 +530,18 @@ actor EngineDriver {
             handler: record.handler,
             cancelToken: record.cancelToken,
             promptTokenCount: record.promptTokenCount,
-            inputTokens: record.inputTokens,
             modelName: record.modelName,
             promptCacheSalt: record.promptCacheSalt,
             promptCache: record.promptCache,
             submitTime: record.submitTime,
             writeBackToPromptCache: record.writeBackToPromptCache,
-            // Adopted rows carry the FULL history (prompt + generated): the
-            // scheduler passes prompt-inclusive `tokens` so the row's penalty
-            // processor is seeded with the same context window the single
-            // iterator had (which seeded from the prompt before decoding).
-            // `makeAdoptedBatch` drops the trailing seed and priming
-            // re-appends it, so `allTokens` equals prompt + generated.
-            tokensIncludePrompt: true,
+            // Adopted rows carry the FULL history (prompt + generated), like
+            // every other row: the scheduler passes prompt-inclusive `tokens`
+            // so the row's penalty processor is seeded with the same context
+            // window the single iterator had (which seeded from the prompt
+            // before decoding). `makeAdoptedBatch` drops the trailing seed
+            // and priming re-appends it, so `allTokens` equals
+            // prompt + generated.
             firstTokenAt: record.firstTokenAt,
             // Seed with the tokens already emitted on the single path so a
             // later stop-string finish reports the full generated count.
@@ -839,22 +826,13 @@ actor EngineDriver {
         }
 
         // The prompt-cache key must be the FULL token history the stored KV
-        // state actually covers (prompt + generated). Freshly-prefilled rows
-        // already carry the prompt in `allTokens`. Adopted (upgraded) rows do
-        // not: their history was seeded generated-only, while the migrated
-        // caches still hold the original prompt's KV. Keying such a row by the
-        // generated-only suffix would file prompt-bearing KV under an unrelated
-        // key, so a later lookup for that suffix could reuse positions/content
-        // from a different prompt. Reconstruct the full key from the prompt.
-        let keyTokens: [Int]
-        if record.tokensIncludePrompt {
-            keyTokens = finished.allTokens
-        } else {
-            keyTokens = record.inputTokens + finished.allTokens
-        }
+        // state actually covers, and every row's `allTokens` is exactly that:
+        // all three creation paths (cold insert via `PrefillBatch`,
+        // prefix-fetch admission, and single→batch adoption) seed
+        // prompt-inclusive histories.
         cache.insertCache(
             model: record.modelName,
-            tokens: keyTokens,
+            tokens: finished.allTokens,
             promptCache: finished.finalCache,
             salt: record.promptCacheSalt
         )

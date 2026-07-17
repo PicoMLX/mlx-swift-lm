@@ -851,9 +851,9 @@ extension InferenceScheduler {
 
         // Cross-request prompt-cache reuse: fetch the nearest cached prefix and
         // prefill only the remainder. The fetched cache is a deep copy owned by
-        // this request, so the stored entry is never aliased. (Batched-path
-        // fetch — mixed-depth prefill in the engine — is not wired yet; engine
-        // rows still prefill fully and only write back.)
+        // this request, so the stored entry is never aliased. (The batched
+        // path fetches too — `EngineDriver.admitViaPrefixFetch` prefills only
+        // the remainder on batch-1 caches at admission.)
         // Honor the request's own cache instance first (GenerationRequest
         // documents `promptCache` as the cache to use); the attach-time
         // container cache is the fallback. The auto-routed ModelContainer
@@ -1397,9 +1397,12 @@ extension InferenceScheduler {
     /// Build a `RowSampler` from generation parameters: temperature / top-p /
     /// min-p / top-k, matching the single path's `TopPSampler` filter order.
     ///
-    /// Returns `nil` for greedy parameters (`temperature <= 0`): the engine's
-    /// default fallback is already greedy, and any non-nil per-row sampler
-    /// disables `DecodeBatch`'s whole-batch `argMax` fast path.
+    /// Returns `nil` for greedy parameters (`temperature == 0` — exactly
+    /// zero, matching `GenerateParameters.sampler()`, where a NEGATIVE
+    /// temperature is a real divisor sampling the inverted distribution):
+    /// the engine's default fallback is already greedy, and any non-nil
+    /// per-row sampler disables `DecodeBatch`'s whole-batch `argMax` fast
+    /// path.
     ///
     /// `advancedBy` fast-forwards a seeded sampler past draws the request
     /// already consumed on the single path (the single→batch upgrade); fresh
@@ -1408,7 +1411,7 @@ extension InferenceScheduler {
     static func rowSampler(
         for parameters: GenerateParameters, advancedBy priorDraws: Int = 0
     ) -> RowSampler? {
-        guard parameters.temperature > 0 else { return nil }
+        guard parameters.temperature != 0 else { return nil }
         return makeRowSampler(
             temperature: parameters.temperature,
             topP: parameters.topP,
@@ -1780,7 +1783,6 @@ extension InferenceScheduler {
             // stream cancellation routes through `cancel(requestID:)` to it.
             cancelToken: single.requestID,
             promptTokenCount: single.inputTokens.count,
-            inputTokens: single.inputTokens,
             modelName: single.modelName,
             promptCacheSalt: single.promptCacheSalt,
             promptCache: single.promptCache,
