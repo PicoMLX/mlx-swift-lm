@@ -308,13 +308,19 @@ public final class DecodeBatch {
         }
         uids.append(contentsOf: other.uids)
         tokens.append(contentsOf: other.tokens)
-        if other.fallbackIsGreedy != fallbackIsGreedy {
-            // The merged batch keeps `self`'s fallback, so materialize
-            // `other`'s (different) fallback into its nil sampler slots --
-            // otherwise those rows would silently switch sampling behavior.
-            samplers.append(contentsOf: other.samplers.map { $0 ?? other.fallbackSampler })
-        } else {
+        if fallbackIsGreedy && other.fallbackIsGreedy {
+            // Both fallbacks are argMax -- semantically identical -- so nil
+            // slots stay nil and the merged batch keeps the whole-batch
+            // greedy fast path.
             samplers.append(contentsOf: other.samplers)
+        } else {
+            // The merged batch keeps `self`'s fallback, so materialize
+            // `other`'s fallback into its nil sampler slots. This must happen
+            // whenever either side samples: closures are not comparable, and
+            // two non-greedy fallbacks can still differ (e.g. different
+            // temperatures), which would silently switch those rows' sampling
+            // behavior to the receiver's fallback.
+            samplers.append(contentsOf: other.samplers.map { $0 ?? other.fallbackSampler })
         }
         processors.append(contentsOf: other.processors)
         maxTokens.append(contentsOf: other.maxTokens)
