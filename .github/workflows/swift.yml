@@ -1,9 +1,9 @@
 name: Swift Build (fork)
 
-# Fork-only CI: builds the package, compiles the tests, and runs the batched-cache
-# unit tests (which need no model downloads) on every pushed commit. The macos-15
-# hosted runner has a Metal GPU, so these exercise real MLX kernels — the parity
-# gate the Linux authoring environment can't provide.
+# Fork-only CI: builds the package, compiles the tests, and runs the full
+# MLXLMTests bundle (which needs no model downloads) on every pushed commit.
+# The macOS hosted runner has a Metal GPU, so these exercise real MLX kernels —
+# the parity gate the Linux authoring environment can't provide.
 #
 # This is intentionally a SEPARATE file from pull_request.yml (the workflow shared
 # with upstream ml-explore) for two reasons:
@@ -69,3 +69,30 @@ jobs:
           xcodebuild build-for-testing -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
             -skipPackagePluginValidation -skipMacroValidation
+
+      # Run the FULL MLXLMTests bundle (no -only-testing filter) on every
+      # branch of the stack, integration and chain PRs alike. The bundle is
+      # self-contained at every point in the chain (no model downloads; the
+      # model-parity regressions use in-process random-weight models), and an
+      # unfiltered run is the only way to execute legacy free-function tests
+      # such as KVCacheTests, which have no @Suite type name for -only-testing
+      # to match and which this stack's absolute-offset semantics touched.
+      # Per-branch filters were dropped deliberately: they previously hid a
+      # KVCacheTests regression on every chain branch.
+      - name: Run full test bundle (Xcode, macOS)
+        run: |
+          xcodebuild test-without-building \
+            -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation
+
+      # On failure, ship the .xcresult bundles (crash reports included) so a
+      # test-runner death that prints nothing to stdout — a wedged process, a
+      # stack overflow, a GPU fault — is still diagnosable from the run page.
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ~/Library/Developer/Xcode/DerivedData/**/Logs/Test/*.xcresult
+          retention-days: 7
