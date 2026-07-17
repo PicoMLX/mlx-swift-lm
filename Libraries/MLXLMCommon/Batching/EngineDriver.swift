@@ -279,7 +279,11 @@ actor EngineDriver {
                 GenerateCompletionInfo(
                     promptTokenCount: request.inputTokens.count,
                     generationTokenCount: 0,
-                    promptTime: 0,
+                    // No prefill/decode ran, but the request still spent real
+                    // time reaching admission (e.g. waiting for a batch
+                    // slot); report elapsed-since-submit as prompt time
+                    // rather than a hardcoded 0.
+                    promptTime: max(0, Date.timeIntervalSinceReferenceDate - submitTime),
                     generationTime: 0,
                     stopReason: .length
                 ))

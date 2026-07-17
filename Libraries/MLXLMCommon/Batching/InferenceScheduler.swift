@@ -1581,6 +1581,7 @@ extension InferenceScheduler {
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count,
                 submitTime: single.submitTime,
+                firstTokenAt: liveFirstTokenAt,
                 reason: liveTokenIsStop ? .stop : .length
             )
             await startSingleAfterUpgradeFallback(joining)
@@ -1598,6 +1599,7 @@ extension InferenceScheduler {
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count,
                 submitTime: single.submitTime,
+                firstTokenAt: liveFirstTokenAt,
                 reason: liveTokenIsStop ? .stop : .length
             )
             await startSingleAfterUpgradeFallback(joining)
@@ -1618,6 +1620,7 @@ extension InferenceScheduler {
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count,
                 submitTime: single.submitTime,
+                firstTokenAt: liveFirstTokenAt,
                 reason: liveTokenIsStop ? .stop : .length
             )
             // The joining request is alone unless a third request already put
@@ -1648,6 +1651,7 @@ extension InferenceScheduler {
                 promptTokenCount: single.inputTokens.count,
                 generatedCount: liveGeneratedTokenIds.count + 1,
                 submitTime: single.submitTime,
+                firstTokenAt: liveFirstTokenAt,
                 reason: .stop
             )
             if await driver.hasWork {
@@ -1662,22 +1666,29 @@ extension InferenceScheduler {
             break
         }
 
-        // Migrate the live caches LAST (consumes `live.cache`). After this point
-        // `live` must not be read.
+        // Migrate the live caches LAST (consumes `live.cache`). After a
+        // SUCCESSFUL migration `live` must not be read; on failure `fromSingle`
+        // only READ the source caches, so the fallback below may still use
+        // them for write-back.
         guard let batchedCaches = Self.migrateCaches(live.cache) else {
             // Migration unsupported for this cache topology. The original's KV
-            // cannot be carried into the batch, so finalize it cleanly
-            // (delivering its last token + completion info — never truncate
-            // silently) and run the joining request fresh.
+            // cannot be carried into the batch, so finalize it cleanly — the
+            // live token was already delivered at the handshake above (pass
+            // `lastToken: nil`, but count it), and the un-migrated caches are
+            // written back like every other finalize site (keyed without the
+            // handoff token, whose forward pass never ran) — and run the
+            // joining request fresh.
             // TODO(PR4 auto-upgrade): extend fromSingle to SSM/composite so this
             // fallback is unreachable for those models.
+            writeBackUpgradedSingle(single, cache: live.cache, generated: liveGeneratedTokenIds)
             finishUpgradedSingle(
                 requestID: single.requestID,
                 handler: single.handler,
-                lastToken: liveCurrentToken,
+                lastToken: nil,
                 promptTokenCount: single.inputTokens.count,
-                generatedCount: liveGeneratedTokenIds.count,
+                generatedCount: liveGeneratedTokenIds.count + 1,
                 submitTime: single.submitTime,
+                firstTokenAt: liveFirstTokenAt,
                 reason: .length
             )
             // Same solo-request preference as above.
@@ -1821,10 +1832,10 @@ extension InferenceScheduler {
     }
 
     /// Finalize an upgraded single request's stream when it will not actually
-    /// join the batch (EOS reached at the hand-off, no budget, or unsupported
-    /// cache migration). Delivers a final non-stop token (if any), flushes
-    /// pending tool calls, emits completion info, and closes the stream — so the
-    /// original request is never silently truncated.
+    /// join the batch (EOS reached at the hand-off, no budget, stale context
+    /// epoch, or unsupported cache migration). Delivers a final non-stop token
+    /// (if any), flushes pending tool calls, emits completion info, and closes
+    /// the stream — so the original request is never silently truncated.
     private func finishUpgradedSingle(
         requestID: Int,
         handler: SchedulerTokenHandler,
@@ -1832,22 +1843,38 @@ extension InferenceScheduler {
         promptTokenCount: Int,
         generatedCount: Int,
         submitTime: TimeInterval,
+        firstTokenAt: TimeInterval?,
         reason: GenerateStopReason
     ) {
         // The stream ends here; a cancel recorded for this request during the
         // upgrade window has nothing left to stop.
         pendingCancels.remove(requestID)
+        var reportedReason = reason
         if let lastToken {
-            _ = handler.processToken(lastToken)
+            // Mirror EngineDriver.deliver's `reportedReason`: a final token
+            // that completes a configured stop string reports `.stop` even
+            // when the budget also ran out (single-path parity — the stop
+            // check runs before the length fallback). The token stays
+            // counted: its text ahead of the stop was delivered.
+            if handler.processToken(lastToken) == .stop {
+                reportedReason = .stop
+            }
         }
         handler.processEndOfSequence()
         let now = Date.timeIntervalSinceReferenceDate
+        // Split at the single path's real first token, exactly like
+        // `runSingle`/`EngineDriver.deliver`: promptTime covers queueing +
+        // prefill, generationTime covers decode only (a hardcoded
+        // promptTime of 0 folded prefill into decode and deflated
+        // tokens/sec). With no token ever produced, all elapsed time is
+        // prompt time.
+        let firstToken = firstTokenAt ?? now
         let info = GenerateCompletionInfo(
             promptTokenCount: promptTokenCount,
             generationTokenCount: generatedCount + (lastToken == nil ? 0 : 1),
-            promptTime: 0,
-            generationTime: max(0, now - submitTime),
-            stopReason: reason
+            promptTime: max(0, firstToken - submitTime),
+            generationTime: max(0, now - firstToken),
+            stopReason: reportedReason
         )
         handler.yieldInfo(info)
         handler.finish()
