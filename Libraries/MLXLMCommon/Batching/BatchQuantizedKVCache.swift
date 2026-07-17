@@ -488,7 +488,12 @@ public class BatchQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol,
     /// the left-padding stripped.
     public func extract(idx: Int) -> QuantizedKVCache {
         let cache = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
-        let padding = Int(leftPadding[idx].item(Int32.self))
+        // Clamp: a row still inside its left-padding prefix (metadata rows
+        // preserved by `filter` before their first real token) has
+        // padding > _idx, and `padding ..< _idx` would trap. Clamping yields
+        // an empty single-row cache instead (the metaState offset below is
+        // then `_idx - padding == 0`). Same as `BatchKVCache.extract`.
+        let padding = min(Int(leftPadding[idx].item(Int32.self)), _idx)
 
         if let k = keys, let v = values {
             let slice: (MLXArray) -> MLXArray = {
