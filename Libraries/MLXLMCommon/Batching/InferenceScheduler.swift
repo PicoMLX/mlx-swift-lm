@@ -754,6 +754,16 @@ extension InferenceScheduler {
                 state = .pendingUpgrade(single)
             } else if single.inputIsBatchable,
                 single.contextEpoch == contextEpoch,
+                // Never INITIATE an upgrade while the driver is stale: a
+                // stale-but-draining driver caches the PREVIOUS context's
+                // model, and adopting this single's caches (computed under
+                // the CURRENT context — its epoch matched above) into it
+                // would decode them with the old weights. Queue behind the
+                // single instead (the drain after it finishes re-routes,
+                // by which time ensureDriver/batchLoopFinished has rebuilt).
+                // A driver that turns stale mid-handshake always comes with
+                // an epoch bump, which upgrade()'s re-validation catches.
+                !driverStale,
                 canUpgrade(parameters: single.parameters)
             {
                 // The running request's caches can migrate single→batch; perform
