@@ -266,8 +266,16 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         let shifts = trims.map { Int32($0 - minTrim) }
         if shifts.contains(where: { $0 > 0 }), let k = keys, let v = values {
             let shiftArr = MLXArray(shifts)[0..., .newAxis]
-            keys = dynamicRoll(k, shifts: shiftArr, axis: 2)
-            values = dynamicRoll(v, shifts: shiftArr, axis: 2)
+            // Roll only the populated `[0, _idx)` span, mirroring `finalize()`:
+            // the buffer is allocated in `step`-sized blocks, so rolling the
+            // full width would gather over the zero-filled spare tail (up to
+            // ~stepx wasted work for small batches) and park the relocated
+            // dead-draft garbage there instead of dropping it. The head slice
+            // also shrinks the buffer to `_idx`; the next `update` re-grows it.
+            let kHead = k[.ellipsis, ..<_idx, 0...]
+            let vHead = v[.ellipsis, ..<_idx, 0...]
+            keys = dynamicRoll(kHead, shifts: shiftArr, axis: 2)
+            values = dynamicRoll(vHead, shifts: shiftArr, axis: 2)
             leftPadding = leftPadding + MLXArray(shifts)
         }
         _idx -= minTrim
@@ -373,6 +381,21 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
             "BatchKVCache.extend requires a non-empty `other` to be prefilled "
                 + "(keys != nil) before extending; the engine prefills each "
                 + "admitted sub-batch before calling extend."
+        )
+        // A pending `prepare(rightPadding:)` cycle must be finalized before the
+        // row set changes: `_rightPadding` is shaped `[batchSize]`, so growing
+        // the batch here would make a later `finalize()` roll with mismatched
+        // shifts (a broadcast shape error -- or, for a batch-1 receiver, a
+        // silent mis-roll of every appended row), and a prepared `other`'s
+        // pending padding would be dropped with its right-pad columns left
+        // permanently unmasked. Mirrors `filter`, which reconciles
+        // `_rightPadding` on every row-set change. The engine never hits this
+        // (`PrefillBatch.prompt` pairs prepare/finalize in one call); it guards
+        // direct API use.
+        precondition(
+            _rightPadding == nil && other._rightPadding == nil,
+            "BatchKVCache.extend requires both sides to have no pending "
+                + "prepare(rightPadding:) cycle; call finalize() first."
         )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
