@@ -521,11 +521,16 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
     var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { get }
+    /// The per-layer KV caches whose state covers every token this iterator
+    /// has evaluated, for prompt-cache write-back. Defaults to empty
+    /// (no write-back possible) for iterators that do not expose one.
+    var cache: [KVCache] { get }
     mutating func discardGeneratedToken()
 }
 
 extension TokenIteratorProtocol {
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
+    public var cache: [KVCache] { [] }
     public mutating func discardGeneratedToken() {}
 }
 
@@ -557,7 +562,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     var state: LMOutput.State?
 
     var y: LMInput.Text
-    var cache: [KVCache]
+    public internal(set) var cache: [KVCache]
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
