@@ -298,13 +298,20 @@ class Gemma3nAttention: Module {
 
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
+            var maskArray = maskArray
             let keysSeqLen = keys.shape[keys.shape.count - 2]
             if maskArray.dim(-1) != keysSeqLen {
-                let slicedMask = maskArray[.ellipsis, 0 ..< keysSeqLen].asType(queries.dtype)
-                adjustedMask = .array(slicedMask)
-            } else {
-                adjustedMask = .array(maskArray.asType(queries.dtype))
+                maskArray = maskArray[.ellipsis, 0 ..< keysSeqLen]
             }
+            // SDPA array masks are either BOOLEAN (false = masked out) or
+            // float ADDITIVE (added to the scores). Casting a bool mask to
+            // the query dtype would turn true/false into an additive +1/+0
+            // -- masking nothing -- so bool masks pass through unchanged and
+            // only float masks are aligned to the query dtype.
+            if maskArray.dtype != .bool && maskArray.dtype != queries.dtype {
+                maskArray = maskArray.asType(queries.dtype)
+            }
+            adjustedMask = .array(maskArray)
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -583,18 +590,64 @@ class Gemma3nDecoderLayer: Module {
         var finalMask = mask
         if isSliding, case .array(let maskArray) = mask {
             let effectiveSeqLen = max(cachePosition?.dim(0) ?? 0, slidingWindow)
-            let minDtype = MLXArray.maskFill(for: maskArray.dtype)
+            // The masked-out fill depends on the mask's kind. Cache-built
+            // masks are BOOLEAN select masks (BatchKVCache and
+            // BatchRotatingKVCache always, RotatingKVCache once the prompt
+            // overflows the window), where `false` means masked out.
+            // `maskFill` is only defined for the float ADDITIVE masks a
+            // caller may pass in (most negative finite value of the dtype)
+            // and traps on non-float dtypes.
+            let maskedFill =
+                maskArray.dtype == .bool
+                ? MLXArray(false)
+                : MLXArray.maskFill(for: maskArray.dtype)
 
             let slidingWindowMask = tril(
                 MLXArray.ones(maskArray.shape, dtype: .bool),
                 k: -slidingWindow
             )
-            let updatedMask = MLX.where(slidingWindowMask, minDtype, maskArray)
+            let updatedMask = MLX.where(slidingWindowMask, maskedFill, maskArray)
 
-            let offset = max(0, (cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1)
-            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.dim(-1))) + offset
-            let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
-            finalMask = .array(slicedMask)
+            // Only slice masks that are genuinely WIDER than the keys this
+            // layer will attend to after its cache update. The sliding caches
+            // build masks that already match the post-update key width
+            // exactly, mirroring RotatingKVCache/BatchRotatingKVCache
+            // arithmetic (`updateConcat` trims an overflowing buffer to
+            // `maxSize - 1 + n` and `makeMask` caps its offset the same way):
+            //
+            //   post-update keys width = min(maxSize - 1, offset) + n
+            //
+            // Worked cases for window W = 512:
+            //   - prefill chunk 1, n = 512, offset 0:   width 512  == 0   + 512
+            //   - prefill chunk 2, n = 512, offset 512: width 1023 == 511 + 512
+            //   - decode, n = 1 past the window:        width 512  == 511 + 1
+            //   - under-window prefill:                 width == offset + n
+            //
+            // Slicing those to `max(n, W)` columns (as this block previously
+            // did unconditionally) truncated the chunk-2+ prefill mask
+            // against `maxSize - 1 + n` keys -- an SDPA shape mismatch. Only
+            // a wider mask (e.g. a full-sequence mask supplied by a VLM
+            // caller) still needs the gather; its slice offset stays clamped
+            // to the mask width because the cache reports ABSOLUTE positions
+            // and MLX gather is not bounds-checked (silent corruption, not a
+            // trap). KV-shared layers see their cache offset already advanced
+            // by n, which only raises the expected width -- their reused mask
+            // is never wider than it, so they keep the unsliced path too.
+            let width = updatedMask.dim(-1)
+            let n = cachePosition?.dim(0) ?? x.dim(-2)
+            let maxSize = cache.flatMap { $0.maxSize } ?? slidingWindow
+            let postUpdateKeysWidth = min(maxSize - 1, cache?.offset ?? 0) + n
+            if width > postUpdateKeysWidth {
+                let span = min(effectiveSeqLen, width)
+                let offset = max(
+                    0,
+                    min((cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1, width - span))
+                let maskIndexes = MLXArray(0 ..< span) + offset
+                let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
+                finalMask = .array(slicedMask)
+            } else {
+                finalMask = .array(updatedMask)
+            }
         }
 
         let predictions = altup.predict(x)
