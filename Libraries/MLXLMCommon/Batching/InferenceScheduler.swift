@@ -538,6 +538,27 @@ extension InferenceScheduler {
         let tokens = input.text.tokens
         return tokens.ndim == 1 || (tokens.ndim == 2 && tokens.dim(0) == 1)
     }
+
+    /// The ONE `PromptCachePolicy` decision for a request
+    /// (`LRUPromptCache.canUsePromptCache` against the bound model), made at
+    /// submit time and threaded through `SingleRequest` /
+    /// ``SchedulerRequest/cacheEligible`` so the prefix fetch and the
+    /// write-back flags agree on every path (single, batched insert,
+    /// upgrade-adopt, prefix-fetch admission). `false` with no bound context.
+    ///
+    /// Takes the input half pre-computed (via the static
+    /// `LRUPromptCache.inputSupportsPromptCache`) rather than the `LMInput`
+    /// itself: passing the non-`Sendable` input through this isolated method
+    /// would merge the request into the actor's region and forbid the
+    /// `sending` hand-off to `EngineDriver.submit` on the batched paths.
+    private func promptCacheEligible(
+        inputEligible: Bool, parameters: GenerateParameters
+    ) -> Bool {
+        guard let context else { return false }
+        return inputEligible
+            && LRUPromptCache.modelSupportsPromptCache(
+                model: context.model, parameters: parameters)
+    }
 }
 
 // MARK: - Public submit API
@@ -849,8 +870,10 @@ extension InferenceScheduler {
         // that cannot fetch (e.g. masked input, whose cache-hit rewrite would
         // drop the mask) must not write back either -- its KV would be keyed
         // by flattened tokens and pollute the cache for unmasked requests.
-        let cacheEligible = LRUPromptCache.canUsePromptCache(
-            input: scheduled.request.input, parameters: parameters, model: context.model)
+        let cacheEligible = promptCacheEligible(
+            inputEligible: LRUPromptCache.inputSupportsPromptCache(
+                input: scheduled.request.input, parameters: parameters),
+            parameters: parameters)
 
         var iteratorCache: [KVCache]? = nil
         var iteratorInput = scheduled.request.input
@@ -935,7 +958,11 @@ extension InferenceScheduler {
             inputTokens: inputTokens,
             modelName: modelName,
             promptCacheSalt: salt,
-            writeBackToPromptCache: writeBack,
+            // Policy-gated, not just a nil test: an ineligible request's flag
+            // must stay false all the way through an upgrade adoption, or the
+            // driver's `record.promptCache ?? promptCache` fallback would
+            // resurrect the write-back with the driver-level cache.
+            writeBackToPromptCache: writeBack && cacheEligible,
             promptCache: cacheForWriteBack,
             submitTime: submitTime,
             wiredMemoryTicket: ticket,
@@ -1308,7 +1335,16 @@ extension InferenceScheduler {
             modelName: scheduled.modelName,
             promptCache: scheduled.request.promptCache,
             promptCacheSalt: scheduled.request.promptCacheSalt,
-            wiredMemoryTicket: scheduled.request.wiredMemoryTicket
+            wiredMemoryTicket: scheduled.request.wiredMemoryTicket,
+            // Policy decided HERE, once, for both the driver's prefix fetch
+            // and its write-back flags (see SchedulerRequest.cacheEligible).
+            // The input half goes through the static predicate so `req`
+            // stays region-disconnected for the `sending` submit below.
+            cacheEligible: promptCacheEligible(
+                inputEligible: LRUPromptCache.inputSupportsPromptCache(
+                    input: scheduled.request.input,
+                    parameters: scheduled.request.parameters),
+                parameters: scheduled.request.parameters)
         )
 
         batchAdmissionEpoch += 1
@@ -1819,7 +1855,14 @@ extension InferenceScheduler {
             modelName: joining.modelName,
             promptCache: joining.request.promptCache,
             promptCacheSalt: joining.request.promptCacheSalt,
-            wiredMemoryTicket: joining.request.wiredMemoryTicket
+            wiredMemoryTicket: joining.request.wiredMemoryTicket,
+            // Same one-shot policy decision as admitToBatch, with the input
+            // half kept static so `req` stays sendable.
+            cacheEligible: promptCacheEligible(
+                inputEligible: LRUPromptCache.inputSupportsPromptCache(
+                    input: joining.request.input,
+                    parameters: joining.request.parameters),
+                parameters: joining.request.parameters)
         )
         batchAdmissionEpoch += 1
         await driver.submit(

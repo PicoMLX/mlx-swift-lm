@@ -331,7 +331,11 @@ actor EngineDriver {
             promptCacheSalt: request.promptCacheSalt,
             promptCache: request.promptCache,
             submitTime: submitTime,
-            writeBackToPromptCache: request.promptCache != nil,
+            // Not just a nil test: `cacheEligible` carries the scheduler's
+            // one-shot PromptCachePolicy decision, so an ineligible request
+            // (e.g. a model whose policy is not `.exact`) neither fetches
+            // nor writes back on the batched path.
+            writeBackToPromptCache: request.promptCache != nil && request.cacheEligible,
             tokensIncludePrompt: true
         )
         return uid
@@ -382,12 +386,14 @@ actor EngineDriver {
         // Same gates as the single path (`startSingle`): the request must
         // have opted in (its own cache instance is fetched from — the
         // driver-level cache is a write-back fallback only), and the
-        // model/input must be cache-eligible. Empty prompts fall through to
-        // `insert`, whose validation reports them as a clean error.
-        guard let cache = request.promptCache, !request.inputTokens.isEmpty else { return nil }
-        guard
-            LRUPromptCache.canUsePromptCache(
-                input: request.input, parameters: request.parameters, model: engine.model)
+        // model/input must be cache-eligible. Eligibility is the scheduler's
+        // ONE-shot PromptCachePolicy decision (`SchedulerRequest.cacheEligible`,
+        // from `LRUPromptCache.canUsePromptCache`), not re-derived here, so
+        // the fetch and the write-back flags can never disagree. Empty
+        // prompts fall through to `insert`, whose validation reports them as
+        // a clean error.
+        guard let cache = request.promptCache, request.cacheEligible,
+            !request.inputTokens.isEmpty
         else { return nil }
 
         let fetch = cache.fetchNearestCacheResult(
@@ -685,10 +691,14 @@ actor EngineDriver {
 
     /// One engine step with token fan-out and prompt-cache write-back.
     private func stepOnce(onResult: (@Sendable ([BatchStepResult]) -> Void)?) {
-        // Capture final caches when ANY destination cache exists -- the
-        // driver-level one or a per-record (per-request) instance.
-        let captureCaches =
-            promptCache != nil || records.values.contains { $0.promptCache != nil }
+        // Capture final caches only when some row will actually write back
+        // (policy-gated flag AND a destination cache -- per-record or
+        // driver-level). Same predicate as `finishOnSemanticStop`; capturing
+        // for rows whose write-back is policy-disabled would be wasted
+        // extraction work.
+        let captureCaches = records.values.contains {
+            $0.writeBackToPromptCache && ($0.promptCache ?? promptCache) != nil
+        }
         let (responses, finishedCaches) = engine.next(capturingFinalCaches: captureCaches)
 
         // Write finished rows back BEFORE delivery, while their records (which
