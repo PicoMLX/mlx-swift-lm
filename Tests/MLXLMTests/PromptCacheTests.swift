@@ -95,6 +95,43 @@ struct PromptCacheTests {
         #expect(longerLayer.offset == 3)
     }
 
+    @Test("Divergent queries return the shortest cached descendant of the shared prefix")
+    func divergentQueryReturnsShortestCachedDescendant() throws {
+        let cache = LRUPromptCache(maxSize: 10)
+        let base = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        // A long stored chain (cheap 1-layer caches) and a much shorter entry
+        // sharing the same 8-token prefix.
+        let longTokens = base + Array(100 ..< 2100)
+        cache.insertCache(
+            model: "model",
+            tokens: longTokens,
+            promptCache: makeSimplePromptCache(layers: 1, seqLen: longTokens.count, value: 1)
+        )
+        let shortTokens = base + [9000, 9001]
+        cache.insertCache(
+            model: "model",
+            tokens: shortTokens,
+            promptCache: makeSimplePromptCache(layers: 1, seqLen: shortTokens.count, value: 5)
+        )
+
+        // The query shares the 8-token prefix and then diverges from both
+        // stored continuations. The lookup must descend from the divergence
+        // node and pick the SHORTEST cached descendant (the 10-token entry),
+        // trimmed back to the shared prefix.
+        let result = cache.fetchNearestCacheResult(model: "model", tokens: base + [7777])
+        #expect(result.hitKind == .longer)
+        #expect(result.matchedTokenCount == base.count)
+        #expect(result.remainder == [7777])
+
+        let layer = try #require(result.cache?.first)
+        #expect(layer.offset == base.count)
+        // The short entry was stored with keys == 5.0, the long chain with
+        // keys == 1.0: seeing 5.0 proves the shallowest descendant won.
+        let keys = try #require(layer.state.first)
+        #expect(keys[0, 0, 0, 0].item(Float.self) == 5.0)
+    }
+
     @Test("LRU eviction honors recency")
     func lruEvictionHonorsRecency() {
         let cache = LRUPromptCache(maxSize: 2)

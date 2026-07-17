@@ -506,26 +506,44 @@ extension LRUPromptCache.State {
             shorter = Array(tokens[...lastCacheIndex])
         }
 
-        // Longer prefix: search for the shortest cached descendant from `current`
+        // Longer prefix: search for the shortest cached descendant of
+        // `current`. Breadth-first, so the first cached node dequeued sits at
+        // the minimum depth — exactly the shortest candidate the previous DFS
+        // selected (ties between same-depth candidates were arbitrary before
+        // — dictionary iteration order — and remain so). Descent still stops
+        // at the first cached node on each path: a cached node's children are
+        // never enqueued. Parent links are recorded per visited node and the
+        // token path is reconstructed once, only for the winner; the previous
+        // DFS rebuilt the path array for every pushed node, O(N²) over a long
+        // stored tail — and `search` runs under the state lock on the driver
+        // actor's hot path, stalling all decoding while it walks.
         var longer: [Int]?
         let commonPrefix = index
         if index > 0 {
-            var best: [Int]?
-            var stack: [(node: LRUPromptCache.TrieNode, extra: [Int])] = [(current, [])]
-            while !stack.isEmpty {
-                let (node, extra) = stack.removeLast()
+            var parents: [ObjectIdentifier: (parent: LRUPromptCache.TrieNode, token: Int)] = [:]
+            var queue: [LRUPromptCache.TrieNode] = [current]
+            var visited = 0
+            var winner: LRUPromptCache.TrieNode?
+            while visited < queue.count {
+                let node = queue[visited]
+                visited += 1
                 if node.cache != nil {
-                    if best == nil || extra.count < best!.count {
-                        best = extra
-                    }
-                } else {
-                    for (tok, child) in node.children {
-                        stack.append((child, extra + [Int(tok)]))
-                    }
+                    winner = node
+                    break
+                }
+                for (tok, child) in node.children {
+                    parents[ObjectIdentifier(child)] = (node, Int(tok))
+                    queue.append(child)
                 }
             }
-            if let best {
-                longer = Array(tokens[..<index]) + best
+            if let winner {
+                var extra: [Int] = []
+                var node = winner
+                while let link = parents[ObjectIdentifier(node)] {
+                    extra.append(link.token)
+                    node = link.parent
+                }
+                longer = Array(tokens[..<index]) + extra.reversed()
             }
         }
 
