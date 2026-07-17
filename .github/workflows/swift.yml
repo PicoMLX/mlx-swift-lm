@@ -84,7 +84,23 @@ jobs:
           xcodebuild test-without-building \
             -scheme mlx-swift-lm-Package \
             -destination 'platform=macOS' \
-            -skipPackagePluginValidation -skipMacroValidation
+            -skipPackagePluginValidation -skipMacroValidation \
+            -skip-testing:MLXLMTests/SchedulerUpgradeParityTests
+
+      # The upgrade-parity suite pauses a decode thread mid-forward (a
+      # blocking gate) and releases it only after the second request makes
+      # scheduler-actor progress. Under the full bundle's concurrency the
+      # cooperative thread pool can starve that hop — the pause never
+      # releases and the whole test process wedges until the runner kills
+      # it, taking every in-flight test down with it. Run the suite in its
+      # own quiet invocation instead (skipped from the bundle above).
+      - name: Run scheduler upgrade parity suite (isolated)
+        run: |
+          xcodebuild test-without-building \
+            -scheme mlx-swift-lm-Package \
+            -destination 'platform=macOS' \
+            -skipPackagePluginValidation -skipMacroValidation \
+            -only-testing:MLXLMTests/SchedulerUpgradeParityTests
 
       # On failure, ship the .xcresult bundles (crash reports included) so a
       # test-runner death that prints nothing to stdout — a wedged process, a
