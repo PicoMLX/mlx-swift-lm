@@ -305,9 +305,9 @@ public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
         if let c = cache?.first {
             // Batched caches carry per-row left padding (and prepared lengths) that
             // a plain causal mask ignores; route through the cache's own mask so
-            // models using this legacy array overload (e.g. Gemma2) don't attend to
-            // padded KV slots under continuous batching. Single (non-batched) caches
-            // keep the original causal-mask path unchanged.
+            // models still using this legacy array overload don't attend to padded
+            // KV slots under continuous batching. Single (non-batched) caches keep
+            // the original causal-mask path unchanged.
             if c is BatchPositionedKVCache,
                 case .array(let m) = c.makeMask(n: t, windowSize: c.maxSize, returnArray: true)
             {
@@ -2169,13 +2169,3 @@ public func maybeQuantizeKVCache(
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
     }
 }
-
-// The fill for masked-out score positions: the most negative finite value of
-// the score dtype (the analogue of Python's `mx.finfo(dtype).min`), so masked
-// positions contribute ~0 after softmax while an all-masked row still
-// softmaxes to finite values instead of NaN.
-//
-// TEMPORARY HOME: #17's call sites (here and Gemma3nText) expect this as an
-// MLX-Swift `MLXArray` extension, but no tagged mlx-swift release provides it
-// yet, which breaks a fresh package resolution. Delete this once the resolved
-// mlx-swift ships `MLXArray.maskFill(for:)`.
