@@ -1340,6 +1340,17 @@ extension InferenceScheduler {
         from single: SingleRequest,
         joining: sending ScheduledRequest
     ) async {
+        // Capture the epoch BEFORE the handshake suspension. `route` verified
+        // `single.contextEpoch == contextEpoch` at dispatch time, but the
+        // `withCheckedContinuation` below suspends this actor: a
+        // `refreshContext` (public `ModelContainer.update`) landing in that
+        // window swaps the model and bumps the epoch, and nothing on the
+        // resume path re-validated. Splicing the deposited caches into a
+        // driver built from the NEW context would decode old-model KV with
+        // new-model weights — real corruption — so the epoch is re-checked
+        // right after the deposit is consumed.
+        let epochAtHandshake = contextEpoch
+
         // Phase 1: enter the upgrade window and request the snapshot.
         state = .upgrading
 
@@ -1414,6 +1425,26 @@ extension InferenceScheduler {
         // stop token (never emitted) or when the budget is already exhausted
         // (the live token is speculative); otherwise the real undelivered token.
         let liveFinalToken = (liveTokenIsStop || remainingBudget <= 0) ? nil : liveCurrentToken
+
+        // Re-validate the epoch AFTER the handshake suspension: if the context
+        // was swapped while the single task was depositing, the caches in
+        // `live` belong to the OLD model and must never be adopted into an
+        // engine built from the new context. Finalize the original request
+        // cleanly on the tokens it already produced (never truncate silently)
+        // and start the joining request fresh on the current context. No
+        // prompt-cache write-back: see `writeBackUpgradedSingle`'s epoch gate.
+        guard contextEpoch == epochAtHandshake else {
+            finishUpgradedSingle(
+                handler: single.handler,
+                lastToken: liveFinalToken,
+                promptTokenCount: single.inputTokens.count,
+                generatedCount: liveGeneratedTokenIds.count,
+                submitTime: single.submitTime,
+                reason: liveTokenIsStop ? .stop : .length
+            )
+            startSingleAfterUpgradeFallback(joining)
+            return
+        }
 
         guard let driver = await ensureDriver() else {
             // Cannot batch this model: deliver the last token, finalize the
@@ -1608,6 +1639,14 @@ extension InferenceScheduler {
         _ single: SingleRequest, cache: [KVCache], generated: [Int]
     ) {
         guard single.writeBackToPromptCache, let promptCache = single.promptCache else { return }
+        // Epoch gate: after a `refreshContext`, the KV in `cache` was computed
+        // by the OLD model, but `ModelContainer.update` can swap weights
+        // without renaming the configuration — the captured `modelName` (the
+        // cache key) cannot be trusted to isolate the entry, so writing it
+        // back could serve old-model KV to new-model requests. Skip instead.
+        // (This also covers finalize paths reached via `ensureDriver`, which
+        // suspends and can observe a refresh mid-flight.)
+        guard single.contextEpoch == contextEpoch else { return }
         promptCache.insertCache(
             model: single.modelName,
             tokens: single.inputTokens + generated,
