@@ -562,9 +562,24 @@ actor EngineDriver {
     /// Cancel a request by engine UID. Removes it from the engine (queued or
     /// active), finishes its stream, and ends its bookkeeping. Returns whether
     /// anything was removed.
+    ///
+    /// The row's prompt+partial KV is written back to the prompt cache before
+    /// the drop (same destination-existence gate as `finishOnSemanticStop`):
+    /// the single path writes back even on cancellation (`runSingle` inserts
+    /// after a `.cancelled` outcome), so a batched consumer dropping its
+    /// stream must not silently discard KV the next request could reuse.
     @discardableResult
     func cancel(uid: Int) -> Bool {
-        let removed = engine.cancel(uid: uid)
+        let wantsCapture =
+            records[uid].map {
+                $0.writeBackToPromptCache && ($0.promptCache ?? promptCache) != nil
+            } ?? false
+        let (removed, captured) = engine.cancel(uid: uid, capturingFinalCache: wantsCapture)
+        if let captured {
+            // Write back while the record (model name / salt) is still
+            // present, mirroring stepOnce's finish flow.
+            writeBack(captured)
+        }
         if let record = records.removeValue(forKey: uid) {
             record.handler.finish()
         }
