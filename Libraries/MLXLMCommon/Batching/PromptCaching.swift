@@ -121,6 +121,13 @@ public struct PromptCacheFetchResult {
 /// block/paged cache) can conform without inheriting ``LRUPromptCache``'s
 /// concrete result types.
 ///
+/// The contract carries only the two operations the library itself drives:
+/// fetch on request admission and insert on write-back. Eviction policy —
+/// entry/byte limits, checkpoint pools, trim scheduling — is deliberately
+/// *not* part of the protocol: it is storage policy that differs per
+/// conformer (``LRUPromptCache`` exposes `trim(nSequences:nBytes:)` and a
+/// `checkpoint:`-taking `insertCache` overload as concrete API instead).
+///
 /// `Sendable` because a prompt cache is shared across the actors that drive
 /// batched inference. Disk persistence is intentionally *not* part of this
 /// protocol — storage policy (where, when, and how to persist) belongs to the
@@ -145,22 +152,13 @@ public protocol PromptCaching: Sendable {
     ///   - model: Model identifier used for isolation.
     ///   - tokens: The token sequence the cache covers.
     ///   - promptCache: The KV cache layers to store.
-    ///   - checkpoint: Whether this is a checkpoint entry (affects eviction).
     ///   - salt: Per-agent isolation salt (default `0`).
     func insertCache(
         model: String,
         tokens: [Int],
         promptCache: [KVCache],
-        checkpoint: Bool,
         salt: UInt64
     )
-
-    /// Evict entries until the cache is within the given limits.
-    ///
-    /// - Parameters:
-    ///   - nSequences: Maximum number of entries to keep (`nil` = no limit).
-    ///   - nBytes: Maximum total bytes to keep (`nil` = no limit).
-    func trim(nSequences: Int?, nBytes: Int?)
 }
 
 // MARK: - Default arguments
@@ -169,8 +167,8 @@ public protocol PromptCaching: Sendable {
 ///
 /// Protocol *requirements* cannot carry default parameter values, so a caller
 /// holding the existential `any PromptCaching` would otherwise have to pass
-/// `salt` / `checkpoint` explicitly. These overloads supply the documented
-/// defaults (`salt: 0`, `checkpoint: false`) by forwarding to the requirements.
+/// `salt` explicitly. These overloads supply the documented default
+/// (`salt: 0`) by forwarding to the requirements.
 extension PromptCaching {
     /// Fetch the nearest matching KV cache, defaulting `salt` to `0`.
     public func fetchNearestCacheResult(
@@ -180,19 +178,12 @@ extension PromptCaching {
         fetchNearestCacheResult(model: model, tokens: tokens, salt: 0)
     }
 
-    /// Insert a KV cache, defaulting `checkpoint` to `false` and `salt` to `0`.
+    /// Insert a KV cache, defaulting `salt` to `0`.
     public func insertCache(
         model: String,
         tokens: [Int],
-        promptCache: [KVCache],
-        checkpoint: Bool = false
+        promptCache: [KVCache]
     ) {
-        insertCache(
-            model: model,
-            tokens: tokens,
-            promptCache: promptCache,
-            checkpoint: checkpoint,
-            salt: 0
-        )
+        insertCache(model: model, tokens: tokens, promptCache: promptCache, salt: 0)
     }
 }
