@@ -143,6 +143,55 @@ struct BatchQuantizedKVCacheTests {
         #expect(cache.offset == 2)
         #expect(cache.batchOffsets.asArray(Int32.self) == [2])
     }
+
+    @Test("trim clamps to the minimum live per-row length")
+    func trimClampsToMinimumLiveRow() {
+        // Ragged batch: leftPadding [4, 0], then prefill 6 tokens. Row offsets
+        // become [2, 6] (live lengths 2 and 6). Trimming by 5 must not drive the
+        // shorter row's offset negative; the trim is clamped to the min live row
+        // length (2) so no row underflows.
+        let cache = BatchQuantizedKVCache(leftPadding: [4, 0], groupSize: 32, bits: 8)
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 6, headDim: 32)
+        _ = cache.updateQuantized(keys: keys, values: values)
+        #expect(cache.batchOffsets.asArray(Int32.self) == [2, 6])
+
+        let trimmed = cache.trim(5)
+        #expect(trimmed == 2)
+        #expect(cache.offset == 4)
+        // No row offset is driven negative.
+        #expect(cache.batchOffsets.asArray(Int32.self) == [0, 4])
+
+        // Extraction still round-trips after the clamped trim: the fully
+        // rewound row extracts as an empty cache, the longer row keeps its
+        // remaining live tokens.
+        #expect(cache.extract(idx: 0).offset == 0)
+        #expect(cache.extract(idx: 1).offset == 4)
+    }
+
+    @Test("Extract clamps a row still inside its left-padding prefix")
+    func extractClampsRowInsidePaddingPrefix() throws {
+        // During chunked prefill the first chunk can leave `_idx` short of a
+        // ragged row's left padding; `filter`'s `_idx >= minLeftPad` guard then
+        // legitimately preserves the row with leftPadding > _idx. Extracting
+        // that row must yield an empty cache instead of trapping on the
+        // invalid `padding ..< _idx` slice.
+        let cache = BatchQuantizedKVCache(leftPadding: [0, 0], groupSize: 32, bits: 8)
+        cache.prepareBatched(leftPadding: [4, 0], lengths: nil, rightPadding: nil)
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 2, headDim: 32)
+        _ = cache.updateQuantized(keys: keys, values: values)
+
+        // Keep only the padded row: minLeftPad (4) exceeds _idx (2), so the
+        // padding shift is skipped and the row keeps leftPadding > _idx.
+        cache.filter(batchIndices: [0])
+        #expect(cache.leftPadding.asArray(Int32.self) == [4])
+        #expect(cache.offset == 2)
+
+        let extracted = cache.extract(idx: 0)
+        #expect(extracted.offset == 0)
+        let (xk, xv) = try #require(extracted.getQuantizedState())
+        #expect(xk.0.dim(-2) == 0)
+        #expect(xv.0.dim(-2) == 0)
+    }
 }
 
 // MARK: - Quantized attention masking
