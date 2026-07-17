@@ -66,6 +66,16 @@ public actor InferenceScheduler {
             prefillStepSize: Int = 2048,
             maxBatchSize: Int? = nil
         ) {
+            // Mirror BatchGenerationEngine.validateConfiguration's `> 0`
+            // requirements. The engine throws for these at construction, but
+            // that construction happens inside `ensureDriver` — mid-flight,
+            // where the throw is swallowed and requests silently fall back
+            // (or, during an upgrade, the running request is truncated).
+            // Loud at configuration time beats silent mid-flight failure.
+            // (`maxBatchSize` is exempt: the driver documents clamping it.)
+            precondition(completionBatchSize > 0, "completionBatchSize must be > 0")
+            precondition(prefillBatchSize > 0, "prefillBatchSize must be > 0")
+            precondition(prefillStepSize > 0, "prefillStepSize must be > 0")
             self.completionBatchSize = completionBatchSize
             self.prefillBatchSize = prefillBatchSize
             self.prefillStepSize = prefillStepSize
@@ -442,6 +452,14 @@ extension InferenceScheduler {
     /// (e.g. quantized/chunked), in which case the caller starts the second
     /// request fresh rather than risking a bad migration.
     static func migrateCaches(_ caches: [KVCache]) -> [any BatchedCache]? {
+        // An EMPTY topology (a cacheless model) must fail the migration, not
+        // vacuously succeed: `BatchGenerationEngine.init` rejects models with
+        // no per-layer caches (`!probe.isEmpty`), so a non-nil `[]` here made
+        // `canUpgrade` approve an upgrade `ensureDriver` could never serve —
+        // the RUNNING request was then finalized `.length` mid-generation,
+        // recurring for every concurrent pair. Returning nil routes such
+        // models onto the graceful serialize path instead.
+        guard !caches.isEmpty else { return nil }
         var batched: [any BatchedCache] = []
         batched.reserveCapacity(caches.count)
         for cache in caches {

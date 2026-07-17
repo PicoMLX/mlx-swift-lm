@@ -220,6 +220,14 @@ struct CacheMigrationTests {
         #expect(InferenceScheduler.migrateCaches([ChunkedKVCache()]) == nil)
     }
 
+    @Test("An empty topology (cacheless model) does not migrate")
+    func emptyTopologyReturnsNil() {
+        // BatchGenerationEngine.init rejects models with no per-layer caches;
+        // a vacuous [] here would approve an upgrade the engine then refuses,
+        // truncating the running request mid-generation.
+        #expect(InferenceScheduler.migrateCaches([]) == nil)
+    }
+
     @Test("A mixed list with one unsupported layer fails the whole migration")
     func mixedListFailsClosed() {
         let mixed: [KVCache] = [KVCacheSimple(), QuantizedKVCache()]
