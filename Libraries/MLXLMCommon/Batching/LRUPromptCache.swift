@@ -144,8 +144,15 @@ public final class LRUPromptCache: PromptCaching {
         let hitKind: HitKind
         /// How many leading tokens the matched cache covers.
         let matchedTokenCount: Int
-        /// For `.longer` hits, how many trailing tokens to trim off the copy.
-        let numToTrim: Int
+        /// For `.longer` hits, the prefix length the copy is physically
+        /// truncated to (`nil` = faithful, full-width copy). Passing this as
+        /// `tokenCount:` into ``materializedCopy(_:tokenCount:)`` — the same
+        /// normalization the insert path uses — keeps the returned buffers
+        /// sized to the matched prefix instead of copying the whole entry and
+        /// only logically trimming offsets, which left the request carrying
+        /// the entire oversized buffer for its lifetime (and made
+        /// `BatchKVCache.extend` pad every batch row out to it).
+        let copyTokenCount: Int?
     }
 
     /// All mutable state, guarded by the lock.
@@ -263,11 +270,10 @@ public final class LRUPromptCache: PromptCaching {
         // Lock-free copy: stored entries are immutable after insert and ARC
         // keeps `entryCaches` alive, so a fetch racing an eviction at worst
         // returns a just-evicted entry — acceptable cache semantics (the
-        // caller holds an independent, valid snapshot either way).
-        let copy = Self.deepCopy(lookup.entryCaches)
-        if lookup.numToTrim > 0 {
-            trimPromptCache(copy, numTokens: lookup.numToTrim)
-        }
+        // caller holds an independent, valid snapshot either way). For
+        // `.longer` hits, `copyTokenCount` truncates the copy to the matched
+        // prefix at materialization, so no explicit trim pass is needed.
+        let copy = Self.materializedCopy(lookup.entryCaches, tokenCount: lookup.copyTokenCount)
         return FetchResult(
             cache: copy,
             remainder: lookup.remainder,
@@ -404,12 +410,13 @@ public final class LRUPromptCache: PromptCaching {
 
     /// Deep-copy a KV cache by reading and writing its state.
     ///
-    /// When `tokenCount` is supplied (the insert path), each layer is normalized
-    /// down to that key length: `KVCacheSimple` is sliced by `stateSnapshot`, and
-    /// a `RotatingKVCache` whose restored `offset` exceeds `tokenCount` is
-    /// normalized by ``normalizeRotating`` so a stored entry's covered length can
-    /// never overshoot its token key. When `tokenCount` is `nil` (the fetch
-    /// path) the copy is faithful — offsets are preserved exactly.
+    /// When `tokenCount` is supplied (the insert path, and longer-prefix fetch
+    /// hits), each layer is normalized down to that key length: `KVCacheSimple`
+    /// is sliced by `stateSnapshot`, and a `RotatingKVCache` whose restored
+    /// `offset` exceeds `tokenCount` is normalized by ``normalizeRotating`` so
+    /// the copy's covered length (and physical buffers) can never overshoot
+    /// that length. When `tokenCount` is `nil` (exact/shorter fetch hits) the
+    /// copy is faithful — offsets are preserved exactly.
     private static func materializedCopy(_ promptCache: [KVCache], tokenCount: Int?) -> [KVCache] {
         let copy = promptCache.map { original -> KVCache in
             var copy: KVCache
@@ -659,7 +666,7 @@ extension LRUPromptCache.State {
                 remainder: [],
                 hitKind: .exact,
                 matchedTokenCount: tokens.count,
-                numToTrim: 0
+                copyTokenCount: nil
             )
         }
 
@@ -673,12 +680,18 @@ extension LRUPromptCache.State {
                 let numToTrim = longer.count - prefix
                 if LRUPromptCache.canSafelyTrim(entry.promptCache, numTokens: numToTrim) {
                     touch(key: result.key, tokens: longer)
+                    // `copyTokenCount: prefix` physically truncates the copy
+                    // (see ``Lookup/copyTokenCount``). Wrapped rotating
+                    // entries — whose `normalizeRotating` would degrade to an
+                    // empty cache — never reach that path: `isTrimmable` is
+                    // false once a `RotatingKVCache` wraps, so the
+                    // `canTrimPromptCache` gate above already refused them.
                     return LRUPromptCache.Lookup(
                         entryCaches: entry.promptCache,
                         remainder: prefix < tokens.count ? Array(tokens[prefix...]) : [],
                         hitKind: .longer,
                         matchedTokenCount: prefix,
-                        numToTrim: numToTrim
+                        copyTokenCount: prefix
                     )
                 }
             }
@@ -693,7 +706,7 @@ extension LRUPromptCache.State {
                 remainder: Array(tokens[shortLength...]),
                 hitKind: .shorter,
                 matchedTokenCount: shortLength,
-                numToTrim: 0
+                copyTokenCount: nil
             )
         }
 
@@ -775,12 +788,5 @@ extension LRUPromptCache.State {
             guard let evicted = lru.pop() else { break }
             delete(key: evicted.key, tokens: evicted.tokens)
         }
-    }
-}
-
-extension LRUPromptCache {
-    /// Deep-copy a KV cache by reading and writing its state.
-    fileprivate static func deepCopy(_ promptCache: [KVCache]) -> [KVCache] {
-        materializedCopy(promptCache, tokenCount: nil)
     }
 }

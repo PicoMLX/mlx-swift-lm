@@ -95,6 +95,36 @@ struct PromptCacheTests {
         #expect(longerLayer.offset == 3)
     }
 
+    @Test("Longer-prefix hits return buffers physically sized to the requested prefix")
+    func longerPrefixHitsReturnPrefixSizedBuffers() throws {
+        let cache = LRUPromptCache(maxSize: 10)
+        cache.insertCache(
+            model: "model",
+            tokens: Array(1 ... 8),
+            promptCache: makeSimplePromptCache(seqLen: 8)
+        )
+
+        let result = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3])
+        #expect(result.hitKind == .longer)
+        #expect(result.remainder.isEmpty)
+        #expect(result.matchedTokenCount == 3)
+
+        // The stored entry covers 8 tokens; the returned copy must be
+        // physically truncated to the 3-token prefix, not a full-width copy
+        // with a logically trimmed offset (which the request would then carry
+        // for its whole lifetime, and BatchKVCache.extend would pad every
+        // batch row out to). `innerState()` exposes the raw backing buffers;
+        // the `state` getter slices to `..<offset` and would not detect an
+        // oversized buffer.
+        let layers = try #require(result.cache)
+        for layer in layers {
+            #expect(layer.offset == 3)
+            for array in layer.innerState() {
+                #expect(array.dim(2) == 3)
+            }
+        }
+    }
+
     @Test("Divergent queries return the shortest cached descendant of the shared prefix")
     func divergentQueryReturnsShortestCachedDescendant() throws {
         let cache = LRUPromptCache(maxSize: 10)
