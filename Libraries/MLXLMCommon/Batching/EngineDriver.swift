@@ -691,7 +691,6 @@ actor EngineDriver {
             model: record.modelName,
             tokens: keyTokens,
             promptCache: finished.finalCache,
-            checkpoint: false,
             salt: record.promptCacheSalt
         )
     }

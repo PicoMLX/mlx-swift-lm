@@ -1048,7 +1048,6 @@ extension InferenceScheduler {
                 model: modelName,
                 tokens: coveredTokens,
                 promptCache: it.cache,
-                checkpoint: false,
                 salt: promptCacheSalt
             )
         }
@@ -1613,7 +1612,6 @@ extension InferenceScheduler {
             model: single.modelName,
             tokens: single.inputTokens + generated,
             promptCache: cache,
-            checkpoint: false,
             salt: single.promptCacheSalt
         )
     }
