@@ -336,12 +336,12 @@ struct PromptCacheTests {
 
     @Test("LRUPromptCache satisfies the PromptCaching protocol surface")
     func conformsToPromptCaching() throws {
-        let cache: any PromptCaching = LRUPromptCache(maxSize: 10)
+        let lru = LRUPromptCache(maxSize: 10)
+        let cache: any PromptCaching = lru
         cache.insertCache(
             model: "model",
             tokens: [1, 2, 3],
             promptCache: makeSimplePromptCache(seqLen: 3),
-            checkpoint: false,
             salt: 0
         )
 
@@ -354,9 +354,23 @@ struct PromptCacheTests {
         #expect(result.reusedTokenCount == 3)
         _ = try #require(result.cache?.first)
 
-        cache.trim(nSequences: 0, nBytes: nil)
+        // `trim` and the `checkpoint:` eviction class are LRU-specific policy,
+        // deliberately absent from the protocol: exercised on the concrete
+        // type only.
+        lru.trim(nSequences: 0, nBytes: nil)
         let afterTrim = cache.fetchNearestCacheResult(model: "model", tokens: [1, 2, 3], salt: 0)
         #expect(afterTrim.hitKind == .none)
+
+        lru.insertCache(
+            model: "model",
+            tokens: [1, 2, 3],
+            promptCache: makeSimplePromptCache(seqLen: 3),
+            checkpoint: true,
+            salt: 0
+        )
+        let checkpointHit = cache.fetchNearestCacheResult(
+            model: "model", tokens: [1, 2, 3], salt: 0)
+        #expect(checkpointHit.hitKind == .exact)
     }
 
     @Test("topologySalt separates cache topologies and is stable")

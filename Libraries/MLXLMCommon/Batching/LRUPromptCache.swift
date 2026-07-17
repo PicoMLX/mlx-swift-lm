@@ -309,6 +309,10 @@ public final class LRUPromptCache: PromptCaching {
     /// it is removed (the new, longer cache supersedes it). After insertion, LRU and
     /// memory-based eviction is triggered if limits are exceeded.
     ///
+    /// The `checkpoint:` eviction class is LRU-specific policy (a separate
+    /// eviction pool) and is deliberately not part of ``PromptCaching``; the
+    /// protocol witness below forwards with `checkpoint: false`.
+    ///
     /// - Parameters:
     ///   - model: Model identifier for isolation.
     ///   - tokens: The token sequence this cache covers.
@@ -351,6 +355,24 @@ public final class LRUPromptCache: PromptCaching {
         }
     }
 
+    /// ``PromptCaching`` conformance: insert without eviction-class tagging.
+    ///
+    /// Forwards to the `checkpoint:`-taking overload with `checkpoint: false`.
+    public func insertCache(
+        model: String,
+        tokens: [Int],
+        promptCache: [KVCache],
+        salt: UInt64 = 0
+    ) {
+        insertCache(
+            model: model,
+            tokens: tokens,
+            promptCache: promptCache,
+            checkpoint: false,
+            salt: salt
+        )
+    }
+
     /// Evict entries until the cache is within the given limits.
     ///
     /// - Parameters:
@@ -365,7 +387,11 @@ public final class LRUPromptCache: PromptCaching {
         }
     }
 
-    /// ``PromptCaching`` conformance: forwards to ``trimTo(nSequences:nBytes:)``.
+    /// Convenience alias for ``trimTo(nSequences:nBytes:)``.
+    ///
+    /// Formerly a ``PromptCaching`` requirement; eviction limits are
+    /// LRU-specific storage policy (the library never drives them), so `trim`
+    /// now lives on the concrete type only.
     public func trim(nSequences: Int? = nil, nBytes: Int? = nil) {
         trimTo(nSequences: nSequences, nBytes: nBytes)
     }
