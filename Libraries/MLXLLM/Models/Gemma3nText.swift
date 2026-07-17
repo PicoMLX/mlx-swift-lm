@@ -476,10 +476,17 @@ class Gemma3nAltUp: Module {
         let activeX = predictions[config.altupActiveIdx]
         let innovation = activated - activeX
 
-        let allCoefsTransposed = allCoefs.transposed(2, 1, 0)
+        // `allCoefs` is [batch, length, numInputs]; the coefficient for each
+        // (input-slot, batch, position) broadcasts over the hidden dim:
+        // [numInputs, batch, length, 1] against innovation's [1, B, L, D].
+        // The previous `transposed(2, 1, 0)` + expand-at-1 produced
+        // [numInputs, 1, length, BATCH] — identical to this for B == 1 (the
+        // only shape ever exercised before batching), but a broadcast trap
+        // (batch lands on the hidden axis) for B > 1.
+        let allCoefsTransposed = allCoefs.transposed(2, 0, 1)
         let corrected =
             expandedDimensions(innovation, axis: 0)
-            * expandedDimensions(allCoefsTransposed, axis: 1)
+            * expandedDimensions(allCoefsTransposed, axis: -1)
         let finalCorrected = corrected + predictions
 
         return finalCorrected.asType(activated.dtype)
