@@ -286,6 +286,17 @@ actor EngineDriver {
             handler.finish()
             return nil
         }
+        // Prefix-cache admission hook (chain PR-8): reuse cached prompt KV and
+        // prefill only the remainder instead of the full prompt.
+        if let uid = admitViaPrefixFetch(
+            request, handler: handler, cancelToken: cancelToken,
+            maxTokens: maxTokens, sampler: sampler,
+            processorSource: processorSource, stateMachine: stateMachine,
+            submitTime: submitTime)
+        {
+            return uid
+        }
+        // END prefix-cache admission hook (chain PR-8)
         let uids: [Int]
         do {
             uids = try engine.insert(
@@ -322,6 +333,131 @@ actor EngineDriver {
         return uid
     }
 
+    // MARK: - Prefix-cache admission (chain PR-8)
+
+    /// Admit `request` by reusing cached prompt KV: fetch the nearest prefix
+    /// from the request's prompt cache, migrate the (deep-copied) hit into
+    /// batch-1 batched caches, prefill only the remainder, and splice the row
+    /// into the running batch. Returns the engine UID on success, or `nil` to
+    /// fall through to the normal full-prefill `insert`.
+    ///
+    /// Structurally this is the same move as the single→batch upgrade
+    /// (`adoptMigrated`): pre-existing caches + a seed token + a known
+    /// history. The topology salt the scheduler mixes into `promptCacheSalt`
+    /// guarantees a hit's cache types match the engine's own factories, and
+    /// `migrateCaches` re-checks per layer regardless.
+    ///
+    /// Multiple simultaneous cache-hit admissions prefill their remainders
+    /// per row (batch-1) rather than as one ragged mixed-depth sub-batch;
+    /// remainders are typically short, and batching them adds per-row-depth
+    /// complexity to `PrefillBatch` for a rare case. Revisit if profiling
+    /// shows concurrent hit-admissions dominating.
+    private func admitViaPrefixFetch(
+        _ request: SchedulerRequest,
+        handler: SchedulerTokenHandler,
+        cancelToken: Int,
+        maxTokens: Int,
+        sampler: RowSampler?,
+        processorSource: RowProcessorSource?,
+        stateMachine: StopSequenceMatcher?,
+        submitTime: TimeInterval
+    ) -> Int? {
+        // Respect the engine's decode cap: adoption splices rows directly
+        // into the live batch, bypassing the completion-capacity queue that
+        // cold inserts go through. At capacity, fall through to `insert`,
+        // which queues under the cap (the request loses only prefix reuse).
+        guard engine.activeCount + engine.queuedCount < engine.completionBatchSize else {
+            return nil
+        }
+        // A wired-memory ticket bounds GPU memory only inside the drain
+        // loop's withWiredLimit step scopes; this path's fetch + remainder
+        // prefill would run un-ticketed inside `submit`. Keep ticketed
+        // requests on the cold path (ticketed prefill runs inside the drain
+        // loop) until hit admission is deferred into the drain loop.
+        guard request.wiredMemoryTicket == nil else { return nil }
+        // Same gates as the single path (`startSingle`): the request must
+        // have opted in (its own cache instance is fetched from — the
+        // driver-level cache is a write-back fallback only), and the
+        // model/input must be cache-eligible. Empty prompts fall through to
+        // `insert`, whose validation reports them as a clean error.
+        guard let cache = request.promptCache, !request.inputTokens.isEmpty else { return nil }
+        guard
+            LRUPromptCache.canUsePromptCache(
+                input: request.input, parameters: request.parameters, model: engine.model)
+        else { return nil }
+
+        let fetch = cache.fetchNearestCacheResult(
+            model: request.modelName, tokens: request.inputTokens,
+            salt: request.promptCacheSalt)
+        guard let fetched = fetch.cache else { return nil }
+
+        var remainder = fetch.remainder
+        if remainder.isEmpty, canTrimPromptCache(fetched), let last = request.inputTokens.last {
+            // Exact hit: the row still needs a seed token to decode from, so
+            // trim the final token's KV and re-feed it (single-path parity).
+            _ = trimPromptCache(fetched, numTokens: 1)
+            remainder = [last]
+        }
+        guard !remainder.isEmpty, let seed = remainder.last else { return nil }
+
+        guard let batched = InferenceScheduler.migrateCaches(fetched) else { return nil }
+
+        // Prefill the remainder (all but its last token, which seeds the
+        // decode) in prefill-sized chunks on the batch-1 caches. Positions
+        // and masks continue from the caches' covered offset; one combined
+        // eval per chunk, mirroring `PrefillBatch`.
+        let prefillTokens = remainder.dropLast()
+        var index = prefillTokens.startIndex
+        while index < prefillTokens.endIndex {
+            let n = Swift.min(engine.prefillStepSize, prefillTokens.endIndex - index)
+            let chunk = MLXArray(
+                prefillTokens[index ..< (index + n)].map { UInt32($0) }
+            ).reshaped([1, n])
+            _ = engine.model.callAsFunction(chunk, cache: batched.map { $0 as any KVCache })
+            eval(batched.flatMap { $0.innerState() })
+            for layer in batched {
+                layer.advanceBatched(n)
+            }
+            index += n
+        }
+
+        let (batch, uids) = engine.makeAdoptedBatch(
+            seedTokens: MLXArray([UInt32(seed)]),
+            caches: batched,
+            samplers: sampler.map { [$0] },
+            processorSources: [processorSource],
+            stateMachines: stateMachine.map { [$0] },
+            maxTokens: [maxTokens],
+            numTokens: [0],
+            // Full prompt history: `makeAdoptedBatch` drops the trailing seed
+            // (== the prompt's last token) and priming re-appends it, so the
+            // row's history equals the prompt exactly — penalty processors
+            // are seeded with the full prompt prefix (single-path parity) and
+            // `allTokens` is prompt-inclusive.
+            tokens: [request.inputTokens]
+        )
+        guard let uid = uids.first else { return nil }
+        engine.adoptActiveBatch(batch)
+
+        if let ticket = request.wiredMemoryTicket {
+            activeWiredMemoryTicket = ticket
+        }
+        records[uid] = RequestRecord(
+            handler: handler,
+            cancelToken: cancelToken,
+            promptTokenCount: request.inputTokens.count,
+            inputTokens: request.inputTokens,
+            modelName: request.modelName,
+            promptCacheSalt: request.promptCacheSalt,
+            promptCache: request.promptCache,
+            submitTime: submitTime,
+            writeBackToPromptCache: true,
+            tokensIncludePrompt: true
+        )
+        return uid
+    }
+
+    // END prefix-cache admission (chain PR-8)
 
     // MARK: - Adopt (single → batch upgrade bridge)
 
