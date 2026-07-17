@@ -32,6 +32,25 @@ import MLXNN
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
 
+    /// Optional continuous-batching scheduler. When set, the streaming
+    /// `generate(input:parameters:wiredMemoryTicket:)` transparently routes
+    /// through it (auto-upgrading single→batch as concurrent requests arrive)
+    /// for non-VLM models. When `nil`, generation uses the existing
+    /// single-stream path with **identical** behavior — strictly opt-in.
+    private let scheduler: InferenceScheduler?
+
+    /// Optional cross-request prompt cache (prefix KV reuse), shared with the
+    /// scheduler. Typed as the protocol so a future block/paged cache lands
+    /// without churning this surface; disk persistence is an app-level
+    /// concern.
+    public let promptCache: (any PromptCaching)?
+
+    /// Whether a continuous-batching scheduler is installed. Internal test
+    /// probe; generation routing checks `scheduler` directly, and
+    /// ``ChatSession`` is deliberately NOT scheduler-aware (sessions keep
+    /// their single-request KV path).
+    var usesScheduler: Bool { scheduler != nil }
+
     public var configuration: ModelConfiguration {
         get async {
             await context.read { $0.configuration }
@@ -52,6 +71,25 @@ public final class ModelContainer: Sendable {
 
     public init(context: consuming ModelContext) {
         self.context = .init(context)
+        self.scheduler = nil
+        self.promptCache = nil
+    }
+
+    /// Create a container with an optional continuous-batching scheduler and/or
+    /// cross-request prompt cache.
+    ///
+    /// Passing `scheduler: nil` (the default) yields a container behaviorally
+    /// identical to ``init(context:)`` — the single-stream path, unchanged.
+    /// Passing a scheduler enables transparent batched routing for non-VLM
+    /// models; VLM contexts (`loadedAsVLM == true`) always use the single path.
+    public init(
+        context: consuming ModelContext,
+        scheduler: InferenceScheduler?,
+        promptCache: (any PromptCaching)? = nil
+    ) {
+        self.context = .init(context)
+        self.scheduler = scheduler
+        self.promptCache = promptCache
     }
 
     /// Perform an action on the model and/or tokenizer. Callers _must_ eval any `MLXArray` before returning as
@@ -124,6 +162,19 @@ public final class ModelContainer: Sendable {
         await context.update {
             action(&$0)
         }
+        // Keep an attached scheduler in sync: it holds a copy of the context
+        // boxed at attach time, which would otherwise go stale when a field
+        // (model/tokenizer/processor) is REPLACED here — scheduler-routed
+        // generations would silently keep the old one while the non-scheduler
+        // path re-reads per call. (In-place mutation of the shared model
+        // object, e.g. the LoRA flow, propagates either way.) refreshContext
+        // is owner-gated, so this is a no-op for a scheduler bound elsewhere.
+        if let scheduler, await scheduler.currentOwner == ObjectIdentifier(self) {
+            let box: SendableBox<ModelContext> = await context.read { context in
+                SendableBox(context)
+            }
+            await scheduler.refreshContext(owner: ObjectIdentifier(self), context: box)
+        }
     }
 
     // MARK: - Thread-safe convenience methods
@@ -188,6 +239,24 @@ public final class ModelContainer: Sendable {
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
 
+        // Transparent batched routing: only when a scheduler is installed AND
+        // the model is not a VLM (image/video prefill is not batched yet). When
+        // `scheduler == nil` this branch is skipped entirely and behavior is
+        // identical to the historical single-stream path below.
+        if let scheduler {
+            let loadedAsVLM = await context.read { $0.loadedAsVLM }
+            if !loadedAsVLM {
+                try await attachSchedulerIfNeeded(scheduler)
+                let request = GenerationRequest(
+                    input: input.consume(),
+                    parameters: parameters,
+                    wiredMemoryTicket: wiredMemoryTicket,
+                    promptCache: promptCache
+                )
+                return try await scheduler.submit(request)
+            }
+        }
+
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no
         // shared mutable state.
@@ -203,6 +272,74 @@ public final class ModelContainer: Sendable {
                 wiredMemoryTicket: wiredMemoryTicket
             )
         }
+    }
+
+    /// Bind the scheduler to this container's context on first use (idempotent).
+    /// The context is transferred to the scheduler in a `SendableBox` — the
+    /// repo's existing non-`Sendable` hand-off box; no new `@unchecked` is
+    /// introduced. The scheduler shares the (already-evaluated) model weights.
+    private func attachSchedulerIfNeeded(_ scheduler: InferenceScheduler) async throws {
+        let owner = ObjectIdentifier(self)
+        if let current = await scheduler.currentOwner {
+            // Attached: fine if it is us, an error if the scheduler already
+            // drives another container (its requests would silently generate
+            // with the first container's model).
+            guard current == owner else {
+                throw BatchedGenerationError.schedulerAlreadyAttached
+            }
+            return
+        }
+        let cache = promptCache
+        let box: SendableBox<ModelContext> = await context.read { context in
+            // Copy the context struct (shares the evaluated model reference) and
+            // box it for transfer to the scheduler actor.
+            let copy = context
+            return SendableBox(copy)
+        }
+        guard await scheduler.attach(owner: owner, context: box, promptCache: cache) else {
+            // Lost an attach race to a different container.
+            throw BatchedGenerationError.schedulerAlreadyAttached
+        }
+    }
+
+    /// Explicitly batched generation: submit several requests at once and get a
+    /// per-request `AsyncStream<Generation>` back, in input order.
+    ///
+    /// Requests route through the scheduler's normal state machine: the first
+    /// starts on the single-stream path and is upgraded into the batch when the
+    /// second is routed, with the rest admitted to the engine directly. (Models
+    /// whose caches cannot migrate single→batch — SSM/hybrid topologies — run
+    /// the requests sequentially instead; admitting fresh batches directly to
+    /// the engine for those models is a planned scheduler improvement.)
+    /// Requires a scheduler to be installed; throws otherwise.
+    ///
+    /// Requests are transferred with `sending` (they carry non-`Sendable`
+    /// `LMInput`).
+    public func generateBatched(
+        _ requests: sending [GenerationRequest]
+    ) async throws -> [AsyncStream<Generation>] {
+        guard let scheduler else {
+            throw BatchedGenerationError.schedulerUnavailable
+        }
+        guard !requests.isEmpty else {
+            throw BatchedGenerationError.batchTooSmall
+        }
+        // VLM inputs carry image/video tensors the text-only batch prefill does
+        // not handle; reject them rather than silently dropping the media.
+        let loadedAsVLM = await context.read { $0.loadedAsVLM }
+        guard !loadedAsVLM else {
+            throw BatchedGenerationError.incompatibleRequests(Array(requests.indices))
+        }
+        try await attachSchedulerIfNeeded(scheduler)
+        // The whole array is transferred to the scheduler actor, which owns it
+        // and routes each request internally (no per-element boundary crossing).
+        return try await scheduler.submitBatch(requests)
+    }
+
+    /// Adjust the runtime batch admission cap on the installed scheduler
+    /// (queue-when-full, clamp `< 1 → 1`). No-op if no scheduler is installed.
+    public func setMaxBatchSize(_ size: Int?) async {
+        await scheduler?.setMaxBatchSize(size)
     }
 
     /// Decode token IDs to a string.
