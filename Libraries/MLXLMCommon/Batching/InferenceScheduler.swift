@@ -1085,10 +1085,32 @@ extension InferenceScheduler {
 extension InferenceScheduler {
 
     /// Lazily create the ``EngineDriver`` (and its ``BatchGenerationEngine``)
-    /// for the bound context. Reuses an existing driver. Returns `nil` if the
-    /// model's cache topology cannot be batched (caller falls back to single).
+    /// for the bound context. Reuses an existing driver unless it is stale
+    /// AND idle, in which case it is torn down and rebuilt from the current
+    /// context. Returns `nil` if the model's cache topology cannot be batched
+    /// (caller falls back to single).
     private func ensureDriver() async -> EngineDriver? {
-        if let driver { return driver }
+        if let existing = driver {
+            guard driverStale else { return existing }
+            // The context was replaced (or the owner detached) while this
+            // driver existed. While it still drains, keep returning it so
+            // in-flight rows — and rows joining that batch — finish on the
+            // model they started with (documented continuity limitation, see
+            // `refreshContext`). Once idle, tear it down here instead of
+            // waiting for a `batchLoopFinished` that may never run again.
+            if await existing.hasWork {
+                return existing
+            }
+            // `hasWork` suspended; a concurrent `refreshContext` may already
+            // have torn the driver down or a concurrent `ensureDriver` may
+            // have replaced it. Only tear down the instance we checked.
+            if self.driver === existing {
+                self.driver = nil
+                driverStale = false
+            } else if let replacement = self.driver {
+                return replacement
+            }
+        }
         guard let context else { return nil }
 
         let engine: BatchGenerationEngine
@@ -1115,6 +1137,11 @@ extension InferenceScheduler {
         } else if let cap = configuration.maxBatchSize {
             await driver.setMaxBatchSize(cap)
         }
+        // Re-check after the await(s): a concurrent `refreshContext` may have
+        // nilled or replaced `self.driver` while this call was suspended.
+        // Never resurrect the discarded instance — return whatever is current
+        // (possibly nil; callers already handle that).
+        guard self.driver === driver else { return self.driver }
         return driver
     }
 
@@ -1299,17 +1326,21 @@ extension InferenceScheduler {
             startBatchLoop(driver)
             return
         }
-        // Only transition out of `.batched`: a `.single`/`.upgrading` state
-        // installed by a concurrent path after the batch emptied must not be
-        // clobbered back to `.idle` (its request would become untracked).
-        guard case .batched = state else { return }
         // The context was replaced while this batch drained; drop the driver
-        // now that it is idle so the next batch is built from the fresh
-        // context (see `refreshContext`).
+        // now that it is confirmed idle so the next batch is built from the
+        // fresh context (see `refreshContext`). This runs BEFORE the
+        // `.batched` guard below: when a concurrent path already moved the
+        // state machine on (early return), the stale driver must still be
+        // torn down here or it would survive — idle — indefinitely and serve
+        // a later batch with the old model.
         if driverStale {
             self.driver = nil
             driverStale = false
         }
+        // Only transition out of `.batched`: a `.single`/`.upgrading` state
+        // installed by a concurrent path after the batch emptied must not be
+        // clobbered back to `.idle` (its request would become untracked).
+        guard case .batched = state else { return }
         state = .idle
         // Requests held because their parameters could not run on the
         // shared engine (see `parametersAreBatchable`) are drained once
