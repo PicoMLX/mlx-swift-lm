@@ -27,6 +27,25 @@ private func getLlama4AttentionScale(
     return scaling[0..., .newAxis]
 }
 
+/// Per-row variant for ragged batches: `rowStarts` carries each row's
+/// absolute position (a batched cache's `batchOffset`), so shorter rows get
+/// the scale for THEIR positions instead of the longest row's. Returns
+/// `[B, 1, L, 1]`, broadcasting against queries `[B, H, L, D]` exactly like
+/// the scalar variant's `[L, 1]`.
+private func getLlama4AttentionScale(
+    rowStarts: MLXArray, length: Int, beta: Float, maxPositionEmbeddings: Int
+) -> MLXArray {
+    let positions =
+        rowStarts[0..., .newAxis].asType(.float32)
+        + MLXArray(Int32(0) ..< Int32(length)).asType(.float32)
+    let scaling =
+        1 + beta
+        * MLX.log(
+            1 + MLX.floor(positions / Float(maxPositionEmbeddings))
+        )
+    return scaling[0..., .newAxis, 0..., .newAxis]
+}
+
 // MARK: - Attention
 
 class Mistral3Attention: Module {
@@ -249,12 +268,25 @@ public class Mistral3TextModelInner: Module {
             let llama4ScalingBeta = ropeParams["llama_4_scaling_beta"]?.asFloat(),
             let originalMaxPosEmbed = ropeParams["original_max_position_embeddings"]?.asInt()
         {
-            attnScale = getLlama4AttentionScale(
-                start: offset,
-                stop: offset + inputs.dim(1),
-                beta: llama4ScalingBeta,
-                maxPositionEmbeddings: originalMaxPosEmbed
-            ).asType(h.dtype)
+            if let positioned = cache?.first as? any BatchPositionedKVCache {
+                // Ragged continuous batch: the scalar `offset` is the longest
+                // row's absolute position, which would give shorter rows the
+                // wrong scale once positions pass maxPositionEmbeddings.
+                // Use each row's own position from the batched cache.
+                attnScale = getLlama4AttentionScale(
+                    rowStarts: positioned.batchOffset,
+                    length: inputs.dim(1),
+                    beta: llama4ScalingBeta,
+                    maxPositionEmbeddings: originalMaxPosEmbed
+                ).asType(h.dtype)
+            } else {
+                attnScale = getLlama4AttentionScale(
+                    start: offset,
+                    stop: offset + inputs.dim(1),
+                    beta: llama4ScalingBeta,
+                    maxPositionEmbeddings: originalMaxPosEmbed
+                ).asType(h.dtype)
+            }
         } else {
             attnScale = MLXArray.ones([inputs.dim(1), 1]).asType(h.dtype)
         }
