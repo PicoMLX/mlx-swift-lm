@@ -141,6 +141,19 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(keys.dim(2) <= 4)
     }
 
+    @Test("isTrimmable(after:) predicts window overflow")
+    func isTrimmableAfterPredictsOverflow() {
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0], keep: 0)
+        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
+        _ = cache.update(keys: kv.0, values: kv.1)
+
+        // offset 4, window 8: trimmable now and through 3 more positions,
+        // but not once the window would be full — matching RotatingKVCache.
+        #expect(cache.isTrimmable)
+        #expect(cache.isTrimmable(after: 3))
+        #expect(cache.isTrimmable(after: 4) == false)
+    }
+
     @Test("prepare/finalize preserve extractable state")
     func prepareFinalizePreserveExtractableState() {
         let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)
@@ -250,6 +263,39 @@ struct BatchedSSMCacheTests {
         list.filterBatched(batchIndices: MLXArray([Int32(0)]))
         let extracted = list.extractBatched(0)
         #expect(extracted is CacheList)
+    }
+
+    @Test("extract preserves the MambaCache subtype")
+    func extractPreservesMambaSubtype() {
+        let mamba = MambaCache(leftPadding: [0, 0])
+        mamba[0] = MLXArray.ones([2, 4])
+        mamba[1] = MLXArray.ones([2, 4])
+
+        let extracted = mamba.extract(0)
+        #expect(extracted is MambaCache)
+        #expect(extracted.slotCount == 2)
+    }
+}
+
+// MARK: - Serialization
+
+@Suite(.serialized)
+struct BatchCacheSerializationTests {
+
+    @Test("savePromptCache fails closed for batched caches")
+    func savePromptCacheRejectsBatchedCaches() {
+        // Batched caches would otherwise serialize under the "KVCache" class
+        // name and reload as a single-sequence cache with multi-row state.
+        let cache = BatchKVCache(leftPadding: [0, 1])
+        let (keys, values) = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("batch-cache-\(UUID().uuidString).safetensors")
+        #expect(throws: (any Error).self) {
+            try savePromptCache(url: url, cache: [cache])
+        }
+        #expect(!FileManager.default.fileExists(atPath: url.path))
     }
 }
 

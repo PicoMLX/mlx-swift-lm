@@ -489,7 +489,11 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     }
 
     public override var isTrimmable: Bool {
-        _scalarOffset < maxCacheSize
+        isTrimmable(after: 0)
+    }
+
+    public override func isTrimmable(after positions: Int) -> Bool {
+        _scalarOffset + positions < maxCacheSize
     }
 
     @discardableResult

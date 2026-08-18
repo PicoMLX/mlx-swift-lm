@@ -120,13 +120,11 @@ public final class BatchedCacheList: CacheList, BatchedCache {
 // MARK: - SSM cache conformance
 
 extension ArraysCache {
-    /// Extract one row as its own single-row cache.
-    ///
-    /// Note: a ``MambaCache`` row is returned as a base ``ArraysCache`` (the
-    /// stored slots are identical); an engine-side Mamba auto-upgrade path can
-    /// refine this to preserve the concrete subtype if needed.
+    /// Extract one row as its own single-row cache, preserving the concrete
+    /// subtype (a ``MambaCache`` row stays a `MambaCache`, so downstream
+    /// `as? MambaCache` checks and speculative checkpoints keep working).
     public func extract(_ idx: Int) -> ArraysCache {
-        let extracted = ArraysCache(size: slotCount)
+        let extracted = self is MambaCache ? MambaCache() : ArraysCache(size: slotCount)
         for slot in 0 ..< slotCount {
             extracted[slot] = self[slot]?[idx ..< (idx + 1)]
         }

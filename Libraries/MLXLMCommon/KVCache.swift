@@ -1743,6 +1743,16 @@ struct KVCacheError: Error, LocalizedError {
 
 // MARK: - Utility Functions
 
+/// True when `cache` is (or, for a ``CacheList``, contains) a multi-row
+/// batched cache, which has no single-sequence serialized form.
+private func containsBatchedRows(_ cache: KVCache) -> Bool {
+    if cache is BatchKVCache || cache is BatchRotatingKVCache { return true }
+    if let list = cache as? CacheList {
+        return list.children.contains(where: containsBatchedRows)
+    }
+    return false
+}
+
 /// Map a cache instance to its Python-compatible class name for serialization.
 private func cacheClassName(_ cache: KVCache) -> String {
     switch cache {
@@ -1811,6 +1821,16 @@ public func savePromptCache(
     let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
     guard stateArrays.isEmpty || !cache.isEmpty else {
         throw KVCacheError(message: "Model state requires at least one prompt cache")
+    }
+
+    // Batched caches hold multi-row state (left padding, per-row offsets) that
+    // the single-sequence restore path cannot reconstruct; `cacheClassName`
+    // would silently serialize them as "KVCache". Fail closed instead.
+    if let batched = cache.first(where: containsBatchedRows) {
+        throw KVCacheError(
+            message:
+                "\(type(of: batched)) holds multi-row batched state and cannot be saved as a prompt cache; extract individual rows first"
+        )
     }
 
     let cacheData = cache.map { $0.state }
