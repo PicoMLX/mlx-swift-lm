@@ -222,6 +222,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
             leftPadding = MLXArray([Int32]())
             batchOffsets = MLXArray([Int32]())
             _idx = 0
+            _rightPadding = nil
             return
         }
 
@@ -232,6 +233,10 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
         values = values?[indices]
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
+        // Transient prepare() state must track the surviving rows too, or a
+        // row filtered out mid-ragged-prefill leaves finalize() rolling other
+        // rows by the removed row's padding (or a shape mismatch).
+        _rightPadding = _rightPadding.map { $0[indices] }
 
         // Shift left to reduce padding. Only meaningful once a KV buffer exists:
         // for a fresh/cancelled-before-prefill cache the tensor slices are no-ops,
@@ -355,10 +360,12 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     public class func merge(_ caches: [KVCache]) -> BatchKVCache {
         // The copy loop below reads data only from `KVCacheSimple` instances; a
         // non-simple cache would silently contribute an all-zero row that the
-        // mask still exposes. Fail loudly instead.
+        // mask still exposes. Exact type: subclasses like `ChunkedKVCache` can
+        // report an `offset` beyond the retained tensor after front trimming,
+        // which would slice out of bounds below. Fail loudly instead.
         precondition(
-            caches.allSatisfy { $0 is KVCacheSimple },
-            "BatchKVCache.merge requires KVCacheSimple instances"
+            caches.allSatisfy { type(of: $0) == KVCacheSimple.self },
+            "BatchKVCache.merge requires exactly KVCacheSimple instances"
         )
         let lengths = caches.map { $0.offset }
         let maxLength = lengths.max() ?? 0
@@ -416,6 +423,13 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// - Parameter cache: A single `KVCacheSimple` to wrap.
     /// - Returns: A new `BatchKVCache` with batch size 1.
     public class func fromSingle(_ cache: KVCacheSimple) -> BatchKVCache {
+        // Exact type for the same reason as `merge`: a `ChunkedKVCache` can
+        // have `offset` beyond its retained tensor after front trimming, which
+        // would set `_idx`/`batchOffsets` past the adopted buffer.
+        precondition(
+            type(of: cache) == KVCacheSimple.self,
+            "BatchKVCache.fromSingle requires exactly a KVCacheSimple instance"
+        )
         let batchCache = BatchKVCache(leftPadding: [0])
 
         if let k = cache.keys, let v = cache.values {

@@ -648,6 +648,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         values = values?[indices]
         batchOffsets = batchOffsets[indices]
         leftPadding = leftPadding[indices]
+        // Transient prepare() state must track the surviving rows too, or a
+        // row filtered out mid-ragged-prefill leaves finalize() rolling other
+        // rows by the removed row's length (or a shape mismatch).
+        _lengths = _lengths.map { $0[indices] }
     }
 
     /// In-place extend this cache with another BatchRotatingKVCache.

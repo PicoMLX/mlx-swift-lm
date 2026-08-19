@@ -5,6 +5,7 @@ import MLX
 import MLXNN
 import Testing
 
+@testable import MLXLLM
 @testable import MLXLMCommon
 
 // MARK: - BatchKVCache
@@ -40,6 +41,23 @@ struct BatchKVCacheCoverageTests {
         let extractedSecond = cache.extract(idx: 1)
         #expect(extractedFirst.offset == 3)
         #expect(extractedSecond.offset == 2)
+    }
+
+    @Test("Filter during a ragged prefill keeps transient right-padding consistent")
+    func filterDuringRaggedPrefillFiltersRightPadding() {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        cache.prepare(rightPadding: MLXArray([Int32(2), Int32(0)]))
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4, value: 2)
+        _ = cache.update(keys: kv.0, values: kv.1)
+
+        // Row 0 is cancelled mid-prefill; finalize must apply only the
+        // surviving row's (zero) right padding, not the removed row's 2.
+        cache.filter(batchIndices: [1])
+        cache.finalize()
+
+        let extracted = cache.extract(idx: 0)
+        #expect(extracted.offset == 5)
+        #expect(cache.leftPadding[0].item(Int32.self) == 0)
     }
 
     @Test("fromSingle/toSingle preserve cache data")
@@ -265,6 +283,24 @@ struct BatchedSSMCacheTests {
         #expect(extracted is CacheList)
     }
 
+    @Test("BatchedCacheList delegates makeMask to its attention child")
+    func batchedCacheListDelegatesMask() throws {
+        // Hybrid models pass the layer's CacheList itself to
+        // createAttentionMask; the composite must surface the batched
+        // attention child's left-padding mask, not BaseKVCache's `.none`.
+        let factories = try makeBatchedCacheFactories(
+            for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
+        let composite = factories[0]([1, 0])
+
+        let mode = composite.makeMask(n: 1, windowSize: nil, returnArray: false)
+        switch mode {
+        case .array(let mask):
+            #expect(mask.dim(0) == 2)
+        case .arrays, .causal, .none:
+            Issue.record("BatchedCacheList should delegate to the batched attention child")
+        }
+    }
+
     @Test("extract preserves the MambaCache subtype")
     func extractPreservesMambaSubtype() {
         let mamba = MambaCache(leftPadding: [0, 0])
@@ -274,6 +310,49 @@ struct BatchedSSMCacheTests {
         let extracted = mamba.extract(0)
         #expect(extracted is MambaCache)
         #expect(extracted.slotCount == 2)
+    }
+}
+
+// MARK: - Model masking
+
+@Suite(.serialized)
+struct Gemma2BatchMaskTests {
+
+    @Test("Fully masked left-padding rows stay finite in float16")
+    func float16PaddingRowsStayFinite() throws {
+        // Converting the old -1e9 mask fill to float16 overflows to -inf; a
+        // query position inside a row's left padding is then fully masked and
+        // its softmax produces NaN, contaminating later layers. The finite
+        // dtype-aware fill keeps those rows finite.
+        let json = """
+            {
+              "hidden_size": 16,
+              "num_hidden_layers": 1,
+              "intermediate_size": 32,
+              "num_attention_heads": 2,
+              "head_dim": 8,
+              "rms_norm_eps": 1e-6,
+              "vocab_size": 32,
+              "num_key_value_heads": 1,
+              "attn_logit_softcapping": 50.0,
+              "final_logit_softcapping": 30.0,
+              "query_pre_attn_scalar": 144.0
+            }
+            """
+        let config = try JSONDecoder().decode(
+            Gemma2Configuration.self, from: Data(json.utf8))
+        let attention = Gemma2Attention(config)
+        attention.update(parameters: attention.parameters().mapValues { $0.asType(.float16) })
+
+        // Row 0 is left-padded by 2: its first two query positions can attend
+        // only padded keys, i.e. a fully masked score row.
+        let cache = BatchKVCache(leftPadding: [2, 0])
+        let mask = cache.makeMask(n: 4, windowSize: nil, returnArray: false)
+        let x = MLXArray.ones([2, 4, 16]).asType(.float16)
+
+        let out = attention(x, mask: mask, cache: cache)
+        eval(out)
+        #expect(isNaN(out).any().item(Bool.self) == false)
     }
 }
 

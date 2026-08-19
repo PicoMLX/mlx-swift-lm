@@ -96,6 +96,20 @@ public final class BatchedCacheList: CacheList, BatchedCache {
         }
     }
 
+    /// Composite caches inherit `BaseKVCache.makeMask`, which knows nothing of
+    /// per-row left padding — but hybrid models pass the layer's `CacheList`
+    /// itself to `createAttentionMask` (e.g. Baichuan M1), so an unequal-length
+    /// batch would decode with `.none` and attend to padded KV positions.
+    /// Delegate to the first attention child, which tracks the padding.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        for cache in batchedCaches where cache is BatchPositionedKVCache {
+            return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
     /// Deep-copy as a `BatchedCacheList`, preserving the `BatchedCache` wrapper.
     ///
     /// `CacheList.copy()` rebuilds a plain `CacheList` from copied children, which
