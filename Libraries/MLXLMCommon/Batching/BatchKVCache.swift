@@ -522,6 +522,15 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     public override func finalize() {
         guard let padding = _rightPadding else { return }
 
+        // Rolling the WHOLE allocation (not just the populated `..<_idx`
+        // prefix) is deliberate and safe: `dynamicRoll` is a circular right
+        // roll (`new[j] = old[(j - shift) mod n]`), so each row's valid data
+        // `[0 ..< _idx - pad]` lands exactly at `[pad ..< _idx]` — the
+        // left-padded layout this method exists to produce. The displaced
+        // right-pad garbage lands at `[_idx ..< _idx + pad]`, which nothing
+        // reads (`update`, `state`, and `extract` all slice `..<_idx`), and
+        // the wrapped capacity zeros land in `[0 ..< pad]`, which the
+        // left-padding mask excludes.
         if let k = keys, let v = values {
             self.keys = dynamicRoll(k, shifts: padding[0..., .newAxis], axis: 2)
             self.values = dynamicRoll(v, shifts: padding[0..., .newAxis], axis: 2)

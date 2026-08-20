@@ -60,6 +60,37 @@ struct BatchKVCacheCoverageTests {
         #expect(cache.leftPadding[0].item(Int32.self) == 0)
     }
 
+    @Test("finalize preserves valid tokens when capacity exceeds the populated prefix")
+    func finalizePreservesValidTokensWithSpareCapacity() throws {
+        // The buffer allocates in 256-position steps, so after a 5-token
+        // update the capacity far exceeds `_idx`. finalize's whole-buffer
+        // circular roll must still land each row's valid data at
+        // `[pad ..< _idx]` (see the invariant comment on `finalize()`).
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        cache.prepare(rightPadding: MLXArray([Int32(2), Int32(0)]))
+
+        // Row 0: 3 valid positions then 2 right-pad slots; row 1: 5 valid.
+        var kVals = [Float](repeating: 0, count: 2 * 5)
+        for row in 0 ..< 2 {
+            let valid = row == 0 ? 3 : 5
+            for pos in 0 ..< valid {
+                kVals[row * 5 + pos] = Float(10 * (row + 1) + pos)
+            }
+        }
+        let keys = MLXArray(kVals, [2, 1, 5, 1])
+        _ = cache.update(keys: keys, values: keys * 2)
+
+        cache.finalize()
+
+        let row0 = cache.extract(idx: 0)
+        #expect(row0.offset == 3)
+        #expect(try #require(row0.keys).asArray(Float.self) == [10, 11, 12])
+
+        let row1 = cache.extract(idx: 1)
+        #expect(row1.offset == 5)
+        #expect(try #require(row1.keys).asArray(Float.self) == [20, 21, 22, 23, 24])
+    }
+
     @Test("fromSingle/toSingle preserve cache data")
     func fromSingleRoundTripPreservesData() throws {
         let single = KVCacheSimple()
