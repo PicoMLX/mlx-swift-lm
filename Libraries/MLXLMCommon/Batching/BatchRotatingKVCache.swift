@@ -673,6 +673,16 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 + "prefilled (keys != nil) before extending; the engine prefills "
                 + "each admitted sub-batch before calling extend."
         )
+        // Same configuration contract `merge` enforces: after extending, every
+        // row is governed by the receiver's window and keep prefix, so rows
+        // built under a different configuration would retain the wrong window
+        // or overwrite positions their original cache had pinned.
+        precondition(
+            other.maxCacheSize == maxCacheSize && other.keep == keep,
+            "BatchRotatingKVCache.extend requires matching maxSize and keep "
+                + "(receiver: maxSize \(maxCacheSize), keep \(keep); "
+                + "other: maxSize \(other.maxCacheSize), keep \(other.keep))"
+        )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
                 // Both empty: concatenate row metadata so admitted rows survive
@@ -978,8 +988,14 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Window mask: restrict attention to the window
         mask = mask & (linds .< rindsRow + Int32(effectiveWindowSize))
 
-        // Adjust left_padding for trimming during multi-token concat
-        let trimSize = _idx - maxCacheSize + (n > 1 ? 1 : 0)
+        // Adjust left_padding for trimming during multi-token concat.
+        // After the ring has wrapped, `_idx` is the circular write pointer,
+        // not the temporal length: `updateConcat` first linearizes the buffer
+        // (`temporalOrder` resets `_idx` to the full buffer length,
+        // `maxCacheSize`) and then trims, so the predicted trim must be
+        // computed from that linearized length.
+        let concatIdx = (n > 1 && rotated) ? maxCacheSize : _idx
+        let trimSize = concatIdx - maxCacheSize + (n > 1 ? 1 : 0)
         if trimSize > 0 {
             effectiveLeftPadding = effectiveLeftPadding - Int32(trimSize)
         }

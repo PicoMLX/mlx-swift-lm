@@ -407,6 +407,34 @@ struct BatchCacheSerializationTests {
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
     }
+
+    @Test("savePromptCache fails closed for multi-row array caches")
+    func savePromptCacheRejectsMultiRowArraysCache() {
+        // ArraysCache/MambaCache are batched by batch dimension, not by type:
+        // a multi-row instance would serialize under its registered class name
+        // and reload batch-sized recurrent state into a single-sequence
+        // continuation. Single-row instances remain saveable.
+        let batched = MambaCache(leftPadding: [0, 0])
+        batched[0] = MLXArray.ones([2, 4])
+        batched[1] = MLXArray.ones([2, 4])
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
+        #expect(throws: (any Error).self) {
+            try savePromptCache(url: url, cache: [batched])
+        }
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+
+        let single = MambaCache()
+        single[0] = MLXArray.ones([1, 4])
+        single[1] = MLXArray.ones([1, 4])
+        let singleURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: singleURL) }
+        #expect(throws: Never.self) {
+            try savePromptCache(url: singleURL, cache: [single])
+        }
+    }
 }
 
 // MARK: - Masking
@@ -427,6 +455,39 @@ struct BatchMaskingTests {
         #expect(mask[1, 0, 0, 0].item(Bool.self) == false)
         #expect(mask[1, 0, 0, 1].item(Bool.self) == false)
         #expect(mask[1, 0, 2, 2].item(Bool.self) == true)
+    }
+
+    @Test("Multi-token mask after rotation predicts the linearization trim")
+    func multiTokenMaskAfterRotationPredictsTrim() {
+        // maxSize 4, row 0 left-padded by 2. Prefilling 4 tokens fills the
+        // ring exactly and one decode step wraps it (`rotated == true`,
+        // `_idx` back at 0+1) while row 0 still has left padding 1. The next
+        // multi-token update linearizes the ring first (temporalOrder resets
+        // the temporal length to maxSize) and then trims one position, so
+        // its mask must derive the trim from the linearized length: row 0's
+        // first valid token ends up at key position 0 and must be attendable.
+        // Computing the trim from the circular write pointer instead leaves
+        // one stale pad in the row's effective left padding and masks it out.
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [2, 0])
+        let (k4, v4) = makeKV(batchSize: 2, heads: 2, seqLen: 4, headDim: 4)
+        _ = cache.update(keys: k4, values: v4)
+        let (k1, v1) = makeKV(batchSize: 2, heads: 2, seqLen: 1, headDim: 4)
+        _ = cache.update(keys: k1, values: v1)
+
+        guard
+            case .array(let mask) = cache.makeMask(n: 2, windowSize: nil, returnArray: true)
+        else {
+            Issue.record("expected an array mask from a batch rotating cache")
+            return
+        }
+        // Key axis spans cappedOffset (3) + n (2) = 5 positions.
+        #expect(mask.dim(-1) == 5)
+        // Row 0, first query, key position 0: the row's first valid token
+        // after the update's linearize-then-trim.
+        #expect(mask[0, 0, 0, 0].item(Bool.self) == true)
+        // The pre-existing single-token behavior is unchanged: row 1 (no
+        // padding) attends its whole window.
+        #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
     }
 }
 
