@@ -310,8 +310,20 @@ private func makeBatchedCacheFactory(
             )
         }
 
+        // Carry the probe's provenance onto every produced cache. This is the
+        // path the engine actually builds caches through -- `fromSingle` and
+        // `merge` are conversion helpers -- so without this, `extract(idx:)`
+        // faithfully restores a `.modelNative` label that was never the
+        // source's, exempting a requested-capacity window from
+        // requested-capacity validation and making runtime status report its
+        // limit as model-defined.
+        let capacityOrigin = rotating.capacityOrigin
+
         return { leftPadding in
-            BatchRotatingKVCache(maxSize: maxSize, leftPadding: leftPadding, keep: keep)
+            let cache = BatchRotatingKVCache(
+                maxSize: maxSize, leftPadding: leftPadding, keep: keep)
+            cache.capacityOrigin = capacityOrigin
+            return cache
         }
     }
 

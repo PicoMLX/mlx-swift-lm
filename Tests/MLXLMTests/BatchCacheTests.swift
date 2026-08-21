@@ -302,6 +302,32 @@ struct BatchedCacheFactoryTests {
         #expect(composite[0]([0, 0]) is BatchedCacheList)
     }
 
+    @Test("The factory carries requested-capacity provenance onto produced caches")
+    func factoryPreservesCapacityOrigin() throws {
+        // This is the path the engine builds caches through; `fromSingle` and
+        // `merge` are conversion helpers. A cache produced here with the
+        // default `modelNative` label would round-trip that wrong label
+        // faithfully through `extract`, so covering only the helpers missed it.
+        let probe = RotatingKVCache(maxSize: 16, keep: 0)
+        var meta = probe.metaState
+        meta[5] = "requested"
+        probe.metaState = meta
+
+        let factories = try makeBatchedCacheFactories(for: [probe])
+        let produced = try #require(factories[0]([0]) as? BatchRotatingKVCache)
+        // `extract` only writes metaState for a populated cache, so fill one
+        // row before asking what provenance comes back.
+        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 1)
+        _ = produced.update(keys: kv.0, values: kv.1)
+        #expect(produced.extract(idx: 0).metaState[5] == "requested")
+
+        // A model-native probe still yields model-native rows.
+        let native = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 0)])
+        let nativeProduced = try #require(native[0]([0]) as? BatchRotatingKVCache)
+        _ = nativeProduced.update(keys: kv.0, values: kv.1)
+        #expect(nativeProduced.extract(idx: 0).metaState[5] == "modelNative")
+    }
+
     @Test("Rotating caches with keep > 0 are rejected (single-stream fallback)")
     func rotatingWithKeepIsRejected() {
         // keep-prefix rotation + per-row left padding cannot be represented by
