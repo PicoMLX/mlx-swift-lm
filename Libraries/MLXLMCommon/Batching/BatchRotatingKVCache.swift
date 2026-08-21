@@ -176,6 +176,15 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// Step size for buffer allocation.
     public var step: Int = 256
 
+    /// Whether this window came from the model's architecture or from a
+    /// requested capacity, carried through from the source caches so
+    /// `extract(idx:)` can restore it. A `RotatingKVCache` restored from the
+    /// legacy five-element `metaState` resets to `.modelNative`, which exempts
+    /// it from requested-capacity validation and makes runtime status report
+    /// the limit as model-defined — so batching a requested-capacity cache
+    /// must not silently relabel it.
+    package var capacityOrigin = RotatingKVCache.CapacityOrigin.modelNative
+
     /// The maximum size of this cache (sliding window size).
     public override var maxSize: Int? { maxCacheSize }
 
@@ -619,6 +628,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         c._scalarOffset = _scalarOffset
         c.rotated = rotated
         c.step = step
+        c.capacityOrigin = capacityOrigin
         c._lengths = _lengths.map { $0[0...] }
         return c
     }
@@ -678,10 +688,13 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // built under a different configuration would retain the wrong window
         // or overwrite positions their original cache had pinned.
         precondition(
-            other.maxCacheSize == maxCacheSize && other.keep == keep,
-            "BatchRotatingKVCache.extend requires matching maxSize and keep "
-                + "(receiver: maxSize \(maxCacheSize), keep \(keep); "
-                + "other: maxSize \(other.maxCacheSize), keep \(other.keep))"
+            other.maxCacheSize == maxCacheSize && other.keep == keep
+                && other.capacityOrigin == capacityOrigin,
+            "BatchRotatingKVCache.extend requires matching maxSize, keep and "
+                + "capacityOrigin (receiver: maxSize \(maxCacheSize), keep \(keep), "
+                + "origin \(capacityOrigin.rawValue); other: maxSize "
+                + "\(other.maxCacheSize), keep \(other.keep), "
+                + "origin \(other.capacityOrigin.rawValue))"
         )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {
             if self.keys == nil && other.keys == nil {
@@ -807,6 +820,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             let cacheIdx = min(min(seqOffset, maxCacheSize), extractedK.dim(2))
             cache.metaState = [
                 String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
+                capacityOrigin.rawValue,
             ]
         }
 
@@ -824,6 +838,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Validate all caches have the same maxSize and keep
         var targetMaxSize: Int = 0
         var targetKeep: Int = -1
+        var targetOrigin = RotatingKVCache.CapacityOrigin.modelNative
+        var sawFirst = false
         for cache in caches {
             guard let rotCache = cache as? RotatingKVCache else {
                 preconditionFailure(
@@ -832,9 +848,11 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             let ms = rotCache.maxSize ?? 0
             // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
             let k = Int(rotCache.metaState.first ?? "0") ?? 0
-            if targetMaxSize == 0 {
+            if !sawFirst {
+                sawFirst = true
                 targetMaxSize = ms
                 targetKeep = k
+                targetOrigin = rotCache.capacityOrigin
             } else {
                 precondition(
                     ms == targetMaxSize,
@@ -843,6 +861,13 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 precondition(
                     k == targetKeep,
                     "BatchRotatingKVCache can only merge caches with the same keep value"
+                )
+                // Every merged row is governed by one window, so one provenance
+                // label has to describe all of them; extraction would otherwise
+                // hand some rows back mislabelled.
+                precondition(
+                    rotCache.capacityOrigin == targetOrigin,
+                    "BatchRotatingKVCache can only merge caches with the same capacity origin"
                 )
             }
         }
@@ -886,8 +911,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         }
 
         guard H > 0 else {
-            return BatchRotatingKVCache(
+            let empty = BatchRotatingKVCache(
                 maxSize: targetMaxSize, leftPadding: padding, keep: max(targetKeep, 0))
+            empty.capacityOrigin = targetOrigin
+            return empty
         }
 
         let keysArr = MLXArray.zeros([B, H, maxLength, Dk], dtype: dt)
@@ -915,6 +942,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
         let cache = BatchRotatingKVCache(
             maxSize: targetMaxSize, leftPadding: padding, keep: max(targetKeep, 0))
+        cache.capacityOrigin = targetOrigin
         cache.keys = keysArr
         cache.values = valuesArr
         cache.batchOffsets = MLXArray(offsets.map { Int32($0) })
@@ -932,7 +960,29 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         let ms = cache.maxSize ?? 0
         // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
         let k = Int(cache.metaState.first ?? "0") ?? 0
+
+        // Same over-window rejection `merge` applies, for the same reason:
+        // `temporalState` is oldest-first, so adopting a source whose offset
+        // exceeds `maxSize` and then reporting `_idx = maxSize` would slice the
+        // OLDEST window out of an over-long buffer and drop the newest tokens.
+        // (`RotatingKVCache.updateConcat` deliberately permits temporary growth
+        // past `maxSize`, so an over-window source is ordinary, not exotic.)
+        //
+        // Rejecting it also restores this class's `_idx == keys.dim(2)` buffer
+        // invariant, which `makeMask` depends on: for a single-token decode it
+        // predicts the front trim as `_idx - maxCacheSize` while `updateInPlace`
+        // performs `keys.dim(2) - maxCacheSize`. An over-window `fromSingle` was
+        // the only path that could decouple the two, making the pre-update mask
+        // treat already-trimmed left padding as still present.
+        precondition(
+            cache.offset <= ms,
+            "BatchRotatingKVCache.fromSingle does not yet support a cache whose "
+                + "offset (\(cache.offset)) exceeds maxSize (\(ms)) "
+                + "(wrapped/over-window source)"
+        )
+
         let batchCache = BatchRotatingKVCache(maxSize: ms, leftPadding: [0], keep: k)
+        batchCache.capacityOrigin = cache.capacityOrigin
 
         let temporalData = cache.temporalState
         if temporalData.count >= 2 {

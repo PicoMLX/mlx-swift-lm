@@ -216,6 +216,64 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache._lengths == nil)
         #expect(cache.keep == 4)
     }
+
+    @Test("fromSingle/toSingle keep the retained window, not the oldest one")
+    func fromSingleRoundTripKeepsRetainedWindow() {
+        // Per-position values, so returning the oldest window instead of the
+        // retained one is visible rather than hidden behind uniform data.
+        func positionalKV(seqLen: Int) -> (MLXArray, MLXArray) {
+            let positions = MLXArray((0 ..< seqLen).map { Float($0 + 1) })
+                .reshaped([1, 1, seqLen, 1])
+            let keys = MLXArray.ones([1, 2, seqLen, 4]) * positions
+            let values = MLXArray.ones([1, 2, seqLen, 4]) * (positions * 10)
+            return (keys, values)
+        }
+
+        // Below the window, and exactly at it: the largest source `fromSingle`
+        // accepts, and the one whose `_idx == maxCacheSize` drives the decode
+        // path's front-trim arithmetic.
+        for seqLen in [5, 8] {
+            let single = RotatingKVCache(maxSize: 8, keep: 0)
+            let kv = positionalKV(seqLen: seqLen)
+            _ = single.update(keys: kv.0, values: kv.1)
+
+            let batch = BatchRotatingKVCache.fromSingle(single)
+            #expect(batch.batchSize == 1)
+
+            let restored = batch.toSingle()
+            #expect(restored.offset == single.offset)
+            #expect(restored.state[0].dim(2) == single.state[0].dim(2))
+            #expect(maxAbsDifference(restored.state[0], single.state[0]) == 0)
+            #expect(maxAbsDifference(restored.state[1], single.state[1]) == 0)
+        }
+    }
+
+    @Test("Requested-capacity provenance survives fromSingle and extract")
+    func capacityOriginSurvivesBatching() {
+        let single = RotatingKVCache(maxSize: 8, keep: 0)
+        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
+        _ = single.update(keys: kv.0, values: kv.1)
+
+        // metaState's sixth field is the capacity origin. Mark this window as
+        // coming from a requested capacity rather than the model architecture.
+        var meta = single.metaState
+        #expect(meta.count == 6)
+        meta[5] = "requested"
+        single.metaState = meta
+
+        // A row restored through the legacy five-field format silently reverts
+        // to `modelNative`, which exempts it from requested-capacity validation
+        // and makes runtime status report the limit as model-defined.
+        let restored = BatchRotatingKVCache.fromSingle(single).extract(idx: 0)
+        #expect(restored.metaState.count == 6)
+        #expect(restored.metaState[5] == "requested")
+
+        // A model-native window keeps its own label.
+        let native = RotatingKVCache(maxSize: 8, keep: 0)
+        _ = native.update(keys: kv.0, values: kv.1)
+        let nativeRestored = BatchRotatingKVCache.fromSingle(native).extract(idx: 0)
+        #expect(nativeRestored.metaState[5] == "modelNative")
+    }
 }
 
 // MARK: - Factory + BatchedCache protocol surface
