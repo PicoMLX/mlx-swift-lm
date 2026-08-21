@@ -225,7 +225,7 @@ struct BatchRotatingKVCacheCoverageTests {
             let positions = MLXArray((0 ..< seqLen).map { Float($0 + 1) })
                 .reshaped([1, 1, seqLen, 1])
             let keys = MLXArray.ones([1, 2, seqLen, 4]) * positions
-            let values = MLXArray.ones([1, 2, seqLen, 4]) * (positions * 10)
+            let values = MLXArray.ones([1, 2, seqLen, 4]) * (positions * Float(10))
             return (keys, values)
         }
 
