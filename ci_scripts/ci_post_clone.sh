@@ -3,37 +3,23 @@
 # Xcode Cloud post-clone setup for PicoMLX's fork of mlx-swift-lm.
 #
 # Lives at the repository root AND is delegated to from
-# IntegrationTesting/ci_scripts/, because Xcode Cloud's rule for which
-# ci_scripts folder it runs (repo root vs. next to the built project) is
-# ambiguous enough not to bet on. PicoCore uses the same arrangement.
-#
-# Fork-only: upstream (ml-explore) builds this project on its own runners
-# and has no ci_scripts anywhere, so every file here sits in a directory
-# upstream does not have and `git merge upstream/main` stays clean.
-
-# Xcode Cloud post-clone setup for PicoMLX's fork of mlx-swift-lm.
-#
-# Fork-only file: upstream (ml-explore) builds this project on its own
-# self-hosted runners, so it has no ci_scripts. Everything here lives in a
-# directory upstream does not have, which keeps `git merge upstream/main`
-# conflict-free — do not move any of it into an upstream-owned file.
-#
-# Xcode Cloud runs the ci_scripts folder that sits next to the project it
-# builds, hence IntegrationTesting/ci_scripts rather than the repo root.
-#
-# The pitfalls below were all found the hard way on PicoCore's Xcode Cloud
-# workflows, which build the same dependency graph (mlx-swift's Metal shader
-# plugin, MLXHuggingFaceMacros' swift-syntax macro). See
-# PicoCore's ci_scripts/README.md for the long-form rationale.
+# IntegrationTesting/ci_scripts/, so it runs whichever folder Xcode Cloud
+# picks. Fork-only: upstream (ml-explore) builds this project on its own
+# runners and has no ci_scripts at either location, so `git merge
+# upstream/main` stays conflict-free. Do not move any of this into an
+# upstream-owned file.
 
 set -eu
 
 echo "=== PicoMLX ci_post_clone.sh running (repo=${CI_PRIMARY_REPOSITORY_PATH:-?} branch=${CI_BRANCH:-?}) ==="
 
-# Xcode Cloud runs on a fresh machine and cannot present Xcode's interactive
-# prompts for trusting compiler macros (MLXHuggingFaceMacros) or build tool
-# plugins (mlx-swift's PrepareMetalShaders / CudaBuild). Equivalent to
-# -skipMacroValidation and -skipPackagePluginValidation.
+REPO="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/.." && pwd)}"
+PROJECT="$REPO/IntegrationTesting/IntegrationTesting.xcodeproj"
+
+# A fresh runner cannot present Xcode's interactive prompts for trusting
+# compiler macros (MLXHuggingFaceMacros) or build tool plugins (mlx-swift's
+# PrepareMetalShaders / CudaBuild). Equivalent to -skipMacroValidation and
+# -skipPackagePluginValidation.
 defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
 # The plugin key is genuinely misspelled ("Validatation") inside Xcode; the
 # misspelled form is the one Xcode reads. Keep the correct spelling too in
@@ -41,53 +27,65 @@ defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
 defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
 
-# Build swift-syntax from source rather than using prebuilts. Xcode 26's
+# Build swift-syntax from source rather than using prebuilts: Xcode 26's
 # explicit-modules planning (FB21002128) fails macro targets with "Unable to
 # resolve module dependency: 'SwiftSyntax'" when a workspace with local
-# package dependencies is built for macOS. Pair this with the
-# XCODE_XCCONFIG_FILE workflow variable described in ci_override.xcconfig.
+# package dependencies is built for macOS. Pair with the XCODE_XCCONFIG_FILE
+# workflow variable described in ci_override.xcconfig.
 defaults write com.apple.dt.Xcode IDEPackageEnablePrebuilts -bool NO
 
-# Xcode 26 ships the Metal compiler as a separate download that Xcode Cloud
-# images don't include, and mlx-swift compiles .metal kernels. Without it the
-# build fails with "cannot execute tool 'metal' due to missing Metal
-# Toolchain". Attempt unconditionally: when already current the download is a
-# fast no-op, and `xcrun --find metal` is not a reliable installed-check
-# because a resolvable shim path doesn't prove the component is mounted.
-xcodebuild -downloadComponent MetalToolchain ||
-    xcodebuild -downloadComponent MetalToolchain ||
-    true
+# Let the resolver actually run.
+#
+# Xcode Cloud sets both of these to true during "Configure Xcode", BEFORE this
+# script, to force builds to use a committed resolved file:
+#   IDEPackageOnlyUseVersionsFromResolvedFile = true
+#   IDEDisableAutomaticPackageResolution      = true
+# `xcodebuild -resolvePackageDependencies` honours them, so with no committed
+# file it does not resolve — it fails with the very error it was invoked to
+# prevent ("a resolved file is required when automatic dependency resolution
+# is disabled").
+#
+# This repo has no project-level resolved file and should not gain one:
+# IntegrationTesting.xcodeproj declares its own remote packages
+# (swift-huggingface, swift-transformers) on top of the local `..` package, so
+# its graph is a superset of the root Package.resolved and cannot be served by
+# it; and a committed file would sit in an upstream-owned directory and go
+# stale whenever upstream changes a dependency. Resolving here is the
+# alternative, so resolution has to be switched back on.
+#
+# Deliberately NOT restored afterwards: later phases (`xcodebuild
+# -describeSchemes`, the build itself) resolve again, and re-disabling would
+# reintroduce the same failure. Determinism for this build comes from the
+# single resolve below rather than from a checked-in file.
+defaults write com.apple.dt.Xcode IDEDisableAutomaticPackageResolution -bool NO
+defaults write com.apple.dt.Xcode IDEPackageOnlyUseVersionsFromResolvedFile -bool NO
 
-# Gate by executing the compiler, not by resolving its path.
-if ! xcrun metal --version >/dev/null 2>&1; then
-    echo "error: Metal Toolchain unavailable after download attempts" >&2
-    exit 1
+# Xcode 26 ships the Metal compiler as a separate download absent from Xcode
+# Cloud images, and mlx-swift compiles .metal kernels. Gate by executing the
+# compiler rather than resolving its path — `xcrun --find metal` succeeds on a
+# shim even when the component isn't mounted. Only download when genuinely
+# missing: on these images the toolchain is already imported, and an
+# unconditional download logs a confusing "Metal Toolchain is already
+# imported" error.
+if xcrun metal --version >/dev/null 2>&1; then
+    echo "Metal Toolchain already available"
+else
+    xcodebuild -downloadComponent MetalToolchain || true
+    if ! xcrun metal --version >/dev/null 2>&1; then
+        echo "error: Metal Toolchain unavailable after download attempt" >&2
+        exit 1
+    fi
 fi
 
-# Generate the workspace's resolved-package state.
-#
-# This repo checks in only the root Package.resolved; the project at
-# IntegrationTesting/ has no
-# project.xcworkspace/xcshareddata/swiftpm/Package.resolved, and Xcode Cloud
-# runs its dependency-resolution phase with automatic resolution DISABLED —
-# hence "a resolved file is required ... Running resolver because the
-# following dependencies were added: 'swift-syntax'".
-#
-# It must happen here, in ci_post_clone: Xcode Cloud's resolution phase runs
-# BETWEEN ci_post_clone and ci_pre_xcodebuild, so a later hook cannot heal it.
-#
-# Resolving on the runner (rather than committing a resolved file) is
-# deliberate: a checked-in file would go stale the moment upstream changes a
-# dependency requirement, and it would sit inside an upstream-owned directory.
-# A genuinely unavailable pinned revision still fails loudly at this step.
-xcodebuild -resolvePackageDependencies \
-    -project "$(dirname "$0")/../IntegrationTesting/IntegrationTesting.xcodeproj" \
-    -scheme IntegrationTesting
+# Generate the project-level resolved file. Must happen in ci_post_clone:
+# Xcode Cloud's own resolution phase runs between post_clone and
+# pre_xcodebuild, so no later hook can heal it.
+echo "Resolving package dependencies for $PROJECT"
+xcodebuild -resolvePackageDependencies -project "$PROJECT" -scheme IntegrationTesting
 
-# Deliberately NOT purging CI_DERIVED_DATA_PATH or the SwiftPM caches here.
-# PicoCore does that to clear a cache poisoned by builds that predate
-# IDEPackageEnablePrebuilts=NO. This workflow starts with prebuilts already
-# off, so there is nothing to purge, and keeping the cache leaves builds
-# incremental — mlx-swift is expensive to rebuild from scratch. Add the purge
+# Deliberately NOT purging CI_DERIVED_DATA_PATH or the SwiftPM caches. PicoCore
+# does that to clear a cache poisoned by builds predating the prebuilts
+# setting; this workflow starts with prebuilts off, and keeping the cache
+# leaves builds incremental (mlx-swift is expensive to rebuild cold). Add it
 # only if "Unable to resolve module dependency: 'SwiftSyntax'" survives the
 # settings above.
