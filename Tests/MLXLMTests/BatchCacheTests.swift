@@ -302,6 +302,26 @@ struct BatchedSSMCacheTests {
         #expect(mamba.batchSize == 1)
     }
 
+    @Test("advanceBatched leaves recurrent padding metadata to the model")
+    func arraysCacheAdvanceIsModelOwned() {
+        let mamba = MambaCache(leftPadding: [0, 2])
+        mamba[0] = MLXArray.ones([2, 4])
+        let cache: any BatchedCache = mamba
+        cache.prepareBatched(leftPadding: nil, lengths: [4, 2], rightPadding: nil)
+
+        // What a mask-aware mixer does during the forward pass: Mamba2,
+        // FalconH1, GraniteMoeHybrid, LFM2MoE, Qwen3.5 and Qwen3Next all call
+        // `advance(chunk)` themselves.
+        mamba.advance(2)
+        let afterModel = mamba.currentLengths?.asArray(Int32.self)
+
+        // The engine's post-chunk hook must not advance it a second time, or
+        // `lengths` runs a full chunk ahead and the next chunk's SSM mask
+        // suppresses valid tokens.
+        cache.advanceBatched(2)
+        #expect(mamba.currentLengths?.asArray(Int32.self) == afterModel)
+    }
+
     @Test("BatchedCacheList preserves nested topology")
     func batchedCacheListNested() throws {
         let factories = try makeBatchedCacheFactories(

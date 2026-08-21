@@ -173,8 +173,29 @@ extension ArraysCache: BatchedCache {
         extract(idx)
     }
 
-    public func advanceBatched(_ n: Int) {
-        advance(n)
+    public func advanceBatched(_: Int) {
+        // Intentionally a no-op: the *model* owns advancement for recurrent
+        // caches, and it has already advanced this cache during the forward
+        // pass the engine is advancing after.
+        //
+        // Every mask-aware SSM mixer calls `cache.advance(...)` itself —
+        // Mamba2 (`Mamba2.swift`), FalconH1, GraniteMoeHybrid, LFM2MoE,
+        // Qwen3.5 and Qwen3Next are exactly the models that also call
+        // `createSSMMask`, i.e. the ones whose padding metadata is load
+        // bearing. Forwarding the engine's chunk hook to `advance` too
+        // subtracted `n` twice, so `lengths` and `leftPadding` ran a full
+        // chunk ahead and the next chunk's SSM mask could suppress valid
+        // tokens or admit padding.
+        //
+        // Models that never advance (BaichuanM1) or advance without masking
+        // (Jamba, LFM2) do not read this metadata, so leaving it untouched is
+        // equally correct for them — and they are single-stream anyway.
+        //
+        // ``BatchKVCache`` and ``BatchRotatingKVCache`` already no-op this for
+        // the same reason, which is what made the asymmetry a bug rather than
+        // a design. If a future batched cache genuinely needs engine-driven
+        // advancement, give it an owner explicitly rather than reinstating the
+        // blanket forward.
     }
 }
 
