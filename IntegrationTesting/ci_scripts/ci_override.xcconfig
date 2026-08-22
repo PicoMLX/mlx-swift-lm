@@ -1,0 +1,26 @@
+// Global build-setting overrides for PicoMLX's Xcode Cloud workflows.
+//
+// Fork-only file — upstream has no ci_scripts directory, so nothing here
+// conflicts when merging upstream/main.
+//
+// Xcode 26 enables Swift explicitly-built modules by default, which breaks
+// module resolution for macro targets (MLXHuggingFaceMacros fails with
+// "Unable to resolve module dependency: 'SwiftSyntax'") when building a
+// workspace with local package dependencies for a macOS destination
+// (FB21002128). The setting cannot be expressed in Package.swift or in a
+// scheme, so it lives here.
+//
+// To activate, add this environment variable to the workflow in App Store
+// Connect. Workflow values are literal, not shell-expanded, so use the fixed
+// clone path rather than $CI_PRIMARY_REPOSITORY_PATH:
+//   XCODE_XCCONFIG_FILE = /Volumes/workspace/repository/IntegrationTesting/ci_scripts/ci_override.xcconfig
+SWIFT_ENABLE_EXPLICIT_MODULES = NO
+
+// Pin the graph to Apple silicon. With explicit modules off, a generic
+// "Any Mac" destination left the active architecture ambiguous and
+// swift-syntax built x86_64-only ("Could not find module
+// 'SwiftCompilerPlugin' for target 'arm64-apple-macos'; found:
+// x86_64-apple-macos"). Xcode Cloud Macs are Apple silicon.
+// Do not reuse this file for workflows that ship universal binaries.
+ARCHS = arm64
+ONLY_ACTIVE_ARCH = NO

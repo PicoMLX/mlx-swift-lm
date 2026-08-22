@@ -254,7 +254,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -269,6 +270,13 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Mask out left-padded positions per sequence (continuous batching):
+    // row `b` may attend only to positions `>= leftPadding[b]`.
+    if let leftPadding {
+        let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= lp)
     }
 
     return mask
@@ -1425,16 +1433,25 @@ public class ArraysCache: BaseKVCache {
 
     internal var slotCount: Int { cache.count }
 
-    /// Create attention mask based on left padding or prepared sequence lengths
+    /// Create attention mask from left padding and/or prepared sequence lengths.
+    ///
+    /// The two bounds are independent and can both be active: a batched ragged
+    /// prefill builds the cache with per-row `leftPadding` and then calls
+    /// `prepare(lengths:)` for the right-hand bound. Treating them as
+    /// alternatives (`if`/`else if`) silently dropped the lengths bound in
+    /// exactly that case, so mask-aware SSM mixers committed trailing
+    /// right-padding tokens into their convolution and recurrent state.
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
+        var mask: MLXArray?
         if let leftPadding {
-            return positions .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
-            return positions .< lengths[0..., .newAxis]
-        } else {
-            return nil
+            mask = positions .>= leftPadding[0..., .newAxis]
         }
+        if let lengths {
+            let withinLength = positions .< lengths[0..., .newAxis]
+            mask = mask.map { $0 & withinLength } ?? withinLength
+        }
+        return mask
     }
 
     // MARK: - Serialization
@@ -1735,6 +1752,21 @@ struct KVCacheError: Error, LocalizedError {
 
 // MARK: - Utility Functions
 
+/// True when `cache` is (or, for a ``CacheList``, contains) a multi-row
+/// batched cache, which has no single-sequence serialized form.
+private func containsBatchedRows(_ cache: KVCache) -> Bool {
+    if cache is BatchKVCache || cache is BatchRotatingKVCache { return true }
+    // ArraysCache/MambaCache are batched by carrying a batch dimension > 1
+    // rather than by type; a multi-row instance has no single-sequence
+    // serialized form either. Single-row (ordinary prompt-cache) instances
+    // stay saveable.
+    if let arrays = cache as? ArraysCache, arrays.batchSize > 1 { return true }
+    if let list = cache as? CacheList {
+        return list.children.contains(where: containsBatchedRows)
+    }
+    return false
+}
+
 /// Map a cache instance to its Python-compatible class name for serialization.
 private func cacheClassName(_ cache: KVCache) -> String {
     switch cache {
@@ -1803,6 +1835,16 @@ public func savePromptCache(
     let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
     guard stateArrays.isEmpty || !cache.isEmpty else {
         throw KVCacheError(message: "Model state requires at least one prompt cache")
+    }
+
+    // Batched caches hold multi-row state (left padding, per-row offsets) that
+    // the single-sequence restore path cannot reconstruct; `cacheClassName`
+    // would silently serialize them as "KVCache". Fail closed instead.
+    if let batched = cache.first(where: containsBatchedRows) {
+        throw KVCacheError(
+            message:
+                "\(type(of: batched)) holds multi-row batched state and cannot be saved as a prompt cache; extract individual rows first"
+        )
     }
 
     let cacheData = cache.map { $0.state }
