@@ -776,6 +776,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // the effective valid start is max(0, leftPadding).
         let padding = max(0, rawPadding)
 
+        // Logical write position, narrowed to the physical tensor length below
+        // when this row actually has one.
+        var cacheIdx = min(max(0, seqOffset), maxCacheSize)
+
         if let k = keys, let v = values {
             var extractedK = k[idx ..< (idx + 1)]
             var extractedV = v[idx ..< (idx + 1)]
@@ -806,7 +810,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             }
 
             cache.state = [extractedK, extractedV]
-            cache.offset = seqOffset
             // Restore `idx` as the row's logical cache write position, not the
             // padded tensor length. In the rotated path the slice keeps trailing
             // padded slots beyond this row's `seqOffset` (a shorter/left-padded
@@ -817,12 +820,24 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             // (`min(seqOffset, maxCacheSize)`) and the physical tensor length so a
             // full row still restores `idx == maxCacheSize` (wraps to `keep`) while
             // a shorter row writes at its true logical position.
-            let cacheIdx = min(min(seqOffset, maxCacheSize), extractedK.dim(2))
-            cache.metaState = [
-                String(keep), String(maxCacheSize), "256", String(seqOffset), String(cacheIdx),
-                capacityOrigin.rawValue,
-            ]
+            cacheIdx = min(cacheIdx, extractedK.dim(2))
         }
+
+        // Metadata is restored for every row, populated or not. A row extracted
+        // before its first update — early cancellation, or an admitted row that
+        // never prefilled — still has to carry this cache's window, keep prefix
+        // and capacity provenance. Leaving it to the populated branch returned a
+        // default `RotatingKVCache` labelled `.modelNative`, which exempts a
+        // requested-capacity window from requested-capacity validation and makes
+        // runtime status report its limit as model-defined.
+        //
+        // `seqOffset` starts at `-leftPadding` and only advances on update, so an
+        // empty row's is <= 0; clamp rather than hand the setter a negative
+        // offset it has no meaning for.
+        cache.metaState = [
+            String(keep), String(maxCacheSize), "256", String(max(0, seqOffset)),
+            String(cacheIdx), capacityOrigin.rawValue,
+        ]
 
         return cache
     }

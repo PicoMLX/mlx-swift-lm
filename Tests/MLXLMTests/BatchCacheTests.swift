@@ -274,6 +274,29 @@ struct BatchRotatingKVCacheCoverageTests {
         let nativeRestored = BatchRotatingKVCache.fromSingle(native).extract(idx: 0)
         #expect(nativeRestored.metaState[5] == "modelNative")
     }
+
+    @Test("Extracting a row that never prefilled still restores its metadata")
+    func extractRestoresMetadataForEmptyRow() {
+        // A row can be extracted before its first update — early cancellation,
+        // or an admitted row that never prefilled. It still has to carry the
+        // window, keep prefix and capacity provenance: a default-labelled
+        // `modelNative` row is exempted from requested-capacity validation and
+        // reports its limit as model-defined.
+        let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0, 2], keep: 4)
+        cache.capacityOrigin = .requested
+        #expect(cache.isEmpty)
+
+        for row in 0 ..< 2 {
+            let extracted = cache.extract(idx: row)
+            #expect(extracted.metaState.count == 6)
+            #expect(extracted.metaState[0] == "4")   // keep
+            #expect(extracted.metaState[1] == "16")  // maxSize
+            #expect(extracted.metaState[5] == "requested")
+            // Nothing was written, so the row starts from zero rather than from
+            // its negative pre-prefill batch offset.
+            #expect(extracted.offset == 0)
+        }
+    }
 }
 
 // MARK: - Factory + BatchedCache protocol surface
