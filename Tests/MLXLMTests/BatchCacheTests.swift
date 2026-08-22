@@ -429,6 +429,26 @@ struct BatchedSSMCacheTests {
         #expect(mamba.currentLengths?.asArray(Int32.self) == afterModel)
     }
 
+    @Test("The SSM mask applies left padding and lengths together")
+    func ssmMaskCombinesBothPaddingBounds() throws {
+        // A batched ragged prefill sets both: the factory builds the cache with
+        // per-row `leftPadding`, then the engine calls `prepare(lengths:)` for
+        // the right-hand bound. Row 1 is left-padded by 2 and 3 tokens long, so
+        // in a width-6 chunk only positions 2..<5 are real.
+        let mamba = MambaCache(leftPadding: [0, 2])
+        mamba.prepare(lengths: [4, 5])
+
+        let mask = mamba.makeMask(N: 6)
+        let values = try #require(mask).asArray(Bool.self)
+
+        // Row 0: no left padding, length 4 -> positions 0..<4.
+        #expect(Array(values[0 ..< 6]) == [true, true, true, true, false, false])
+        // Row 1: left padding 2, length 5 -> positions 2..<5. Treating the two
+        // bounds as alternatives kept positions 5 valid, and a mask-aware mixer
+        // committed that right-padding token into its recurrent state.
+        #expect(Array(values[6 ..< 12]) == [false, false, true, true, true, false])
+    }
+
     @Test("BatchedCacheList preserves nested topology")
     func batchedCacheListNested() throws {
         let factories = try makeBatchedCacheFactories(

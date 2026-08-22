@@ -1433,16 +1433,25 @@ public class ArraysCache: BaseKVCache {
 
     internal var slotCount: Int { cache.count }
 
-    /// Create attention mask based on left padding or prepared sequence lengths
+    /// Create attention mask from left padding and/or prepared sequence lengths.
+    ///
+    /// The two bounds are independent and can both be active: a batched ragged
+    /// prefill builds the cache with per-row `leftPadding` and then calls
+    /// `prepare(lengths:)` for the right-hand bound. Treating them as
+    /// alternatives (`if`/`else if`) silently dropped the lengths bound in
+    /// exactly that case, so mask-aware SSM mixers committed trailing
+    /// right-padding tokens into their convolution and recurrent state.
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
+        var mask: MLXArray?
         if let leftPadding {
-            return positions .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
-            return positions .< lengths[0..., .newAxis]
-        } else {
-            return nil
+            mask = positions .>= leftPadding[0..., .newAxis]
         }
+        if let lengths {
+            let withinLength = positions .< lengths[0..., .newAxis]
+            mask = mask.map { $0 & withinLength } ?? withinLength
+        }
+        return mask
     }
 
     // MARK: - Serialization
