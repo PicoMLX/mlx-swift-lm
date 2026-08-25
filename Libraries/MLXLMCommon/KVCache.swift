@@ -1756,11 +1756,14 @@ struct KVCacheError: Error, LocalizedError {
 /// batched cache, which has no single-sequence serialized form.
 private func containsBatchedRows(_ cache: KVCache) -> Bool {
     if cache is BatchKVCache || cache is BatchRotatingKVCache { return true }
-    // ArraysCache/MambaCache are batched by carrying a batch dimension > 1
-    // rather than by type; a multi-row instance has no single-sequence
-    // serialized form either. Single-row (ordinary prompt-cache) instances
-    // stay saveable.
-    if let arrays = cache as? ArraysCache, arrays.batchSize > 1 { return true }
+    // ArraysCache/MambaCache are batched by carrying a batch dimension
+    // rather than by type; any instance whose batch size is not exactly one
+    // has no single-sequence serialized form. That includes zero rows — a
+    // populated cache filtered with an empty index set keeps tensors with a
+    // batch dimension of 0, and restoring those against a single-request
+    // input fails later and less legibly than refusing the save here.
+    // Single-row (ordinary prompt-cache) instances stay saveable.
+    if let arrays = cache as? ArraysCache, arrays.batchSize != 1 { return true }
     if let list = cache as? CacheList {
         return list.children.contains(where: containsBatchedRows)
     }

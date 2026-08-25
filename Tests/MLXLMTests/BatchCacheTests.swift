@@ -108,6 +108,29 @@ struct BatchKVCacheCoverageTests {
         #expect(maxAbsDifference(restoredKeys, originalKeys) == 0)
     }
 
+    @Test("trim clamps to the shortest row of an unequal batch")
+    func trimClampsToShortestRow() {
+        // leftPadding [2, 0] + a 3-token update leaves logical row lengths
+        // [1, 3] under a padded width of 3. A global trim of 2 must clamp to
+        // the shorter row's single token, or that row's offset goes negative
+        // and its padding exceeds the buffer, making a later extract slice an
+        // invalid range.
+        let cache = BatchKVCache(leftPadding: [2, 0])
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4, value: 1)
+        _ = cache.update(keys: kv.0, values: kv.1)
+
+        let trimmed = cache.trim(2)
+        #expect(trimmed == 1)
+        #expect(cache.batchOffsets.asArray(Int32.self) == [0, 2])
+        // The clamped state stays extractable for the short row.
+        #expect(cache.extract(idx: 0).offset == 0)
+
+        let rotating = BatchRotatingKVCache(maxSize: 16, leftPadding: [2, 0], keep: 0)
+        _ = rotating.update(keys: kv.0, values: kv.1)
+        #expect(rotating.trim(2) == 1)
+        #expect(rotating.batchOffsets.asArray(Int32.self) == [0, 2])
+    }
+
     @Test("makeMask honours left padding during decode")
     func makeMaskUsesLeftPaddingDuringDecode() {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
@@ -553,6 +576,24 @@ struct BatchCacheSerializationTests {
             try savePromptCache(url: url, cache: [cache])
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test("savePromptCache fails closed for zero-row array caches")
+    func savePromptCacheRejectsZeroRowArraysCache() {
+        // A populated cache filtered with an empty index set keeps tensors
+        // with a batch dimension of 0; restoring those against a
+        // single-request input fails later and less legibly than refusing
+        // the save here.
+        let mamba = MambaCache(leftPadding: [0, 0])
+        mamba[0] = MLXArray.ones([2, 4])
+        mamba.filter(batchIndices: MLXArray([Int32]()))
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zero-row-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        #expect(throws: (any Error).self) {
+            try savePromptCache(url: url, cache: [mamba])
+        }
     }
 
     @Test("savePromptCache fails closed for multi-row array caches")

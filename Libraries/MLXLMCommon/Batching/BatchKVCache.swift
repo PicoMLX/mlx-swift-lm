@@ -176,7 +176,14 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(_idx, n)
+        // `_idx` is the padded physical width, not every row's logical
+        // length: in an unequal batch a shorter row's length is its
+        // `batchOffsets` entry, and trimming past it drives that row's offset
+        // negative and its padding beyond `_idx`, so a later `extract` slices
+        // an invalid range. Clamp to the shortest row (non-negative: an
+        // admitted row that has not prefilled sits at `-leftPadding`).
+        let shortestRow = batchSize > 0 ? Int(batchOffsets.min().item(Int32.self)) : 0
+        let trimmed = min(_idx, max(0, shortestRow), n)
         _idx -= trimmed
         batchOffsets = batchOffsets - Int32(trimmed)
         return trimmed
@@ -358,6 +365,10 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// - Parameter caches: An array of `KVCacheSimple` instances.
     /// - Returns: A new `BatchKVCache` containing all sequences.
     public class func merge(_ caches: [KVCache]) -> BatchKVCache {
+        // Same empty-input rejection as `BatchRotatingKVCache.merge`: an empty
+        // batch cache (leftPadding of size 0) mismatches the first real
+        // update's batch dimension and fails there, less legibly than here.
+        precondition(!caches.isEmpty, "BatchKVCache.merge requires at least one cache")
         // The copy loop below reads data only from `KVCacheSimple` instances; a
         // non-simple cache would silently contribute an all-zero row that the
         // mask still exposes. Exact type: subclasses like `ChunkedKVCache` can

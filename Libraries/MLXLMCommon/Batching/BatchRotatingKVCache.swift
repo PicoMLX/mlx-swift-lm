@@ -507,7 +507,14 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(_scalarOffset, n)
+        // `_scalarOffset` tracks the padded batch, not every row: in an
+        // unequal batch a shorter row's logical length is its `batchOffsets`
+        // entry, and trimming past it drives that row's offset negative and
+        // its padding beyond the buffer, so a later `extract` slices an
+        // invalid range. Clamp to the shortest row (non-negative: an admitted
+        // row that has not prefilled sits at `-leftPadding`).
+        let shortestRow = batchSize > 0 ? Int(batchOffsets.min().item(Int32.self)) : 0
+        let trimmed = min(_scalarOffset, max(0, shortestRow), n)
         _scalarOffset -= trimmed
         _idx -= trimmed
         batchOffsets = batchOffsets - Int32(trimmed)
@@ -850,6 +857,14 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     /// - Parameter caches: An array of `RotatingKVCache` instances.
     /// - Returns: A new `BatchRotatingKVCache` containing all sequences.
     public class func merge(_ caches: [KVCache]) -> BatchRotatingKVCache {
+        // An empty input provides no window configuration to preserve, so
+        // discovery below would leave maxSize at 0 and return a cache that
+        // rejects every extend (configuration mismatch) and whose first
+        // update writes into a zero-length allocation. Fail here instead.
+        precondition(
+            !caches.isEmpty,
+            "BatchRotatingKVCache.merge requires at least one cache"
+        )
         // Validate all caches have the same maxSize and keep
         var targetMaxSize: Int = 0
         var targetKeep: Int = -1
