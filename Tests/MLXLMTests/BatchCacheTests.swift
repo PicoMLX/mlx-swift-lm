@@ -143,6 +143,11 @@ struct BatchKVCacheCoverageTests {
             // Row 0/1 left-padded slot 0 is masked out.
             #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
             #expect(mask[1, 0, 0, 0].item(Bool.self) == false)
+            // Depth is per-row, not boolean: row 1 (padding 3) keeps slot 1
+            // masked while row 0 (padding 1) can attend it — collapsing every
+            // positive padding to one would pass the slot-0 checks alone.
+            #expect(mask[0, 0, 1, 1].item(Bool.self) == true)
+            #expect(mask[1, 0, 1, 1].item(Bool.self) == false)
         case .arrays, .causal, .none:
             Issue.record("BatchKVCache should produce an explicit array mask for this path")
         }
@@ -234,17 +239,32 @@ struct BatchRotatingKVCacheCoverageTests {
     }
 
     @Test("prepare/finalize preserve extractable state")
-    func prepareFinalizePreserveExtractableState() {
+    func prepareFinalizePreserveExtractableState() throws {
         let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)
         cache.prepare(lengths: [3, 5], rightPadding: [2, 0])
 
-        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4, value: 2)
+        // Position-stamped so post-finalize extraction is checkable by
+        // content, not just by cleared metadata.
+        let kv = makePositionKV(positions: 0 ..< 5, heads: 2, headDim: 4, batchSize: 2)
         _ = cache.update(keys: kv.0, values: kv.1)
         #expect(cache._lengths != nil)
 
         cache.finalize()
         #expect(cache._lengths == nil)
         #expect(cache.keep == 4)
+
+        // Row 0 keeps its 3 real tokens (the trailing 2 of the update were
+        // right padding), row 1 all 5 — each in order, with the row's own
+        // offset, and free of padding.
+        let row0 = cache.extract(idx: 0)
+        #expect(row0.offset == 3)
+        let row0Keys = try #require(row0.state.first)
+        #expect(row0Keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 2])
+
+        let row1 = cache.extract(idx: 1)
+        #expect(row1.offset == 5)
+        let row1Keys = try #require(row1.state.first)
+        #expect(row1Keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 2, 3, 4])
     }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
@@ -367,6 +387,9 @@ struct BatchedCacheFactoryTests {
         // faithfully through `extract`, so covering only the helpers missed it.
         let probe = RotatingKVCache(maxSize: 16, keep: 0)
         var meta = probe.metaState
+        // #require before every [5] access: a five-field regression should
+        // fail this test, not trap the suite.
+        try #require(meta.count == 6)
         meta[5] = "requested"
         probe.metaState = meta
 
@@ -376,13 +399,17 @@ struct BatchedCacheFactoryTests {
         // row before asking what provenance comes back.
         let kv = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 1)
         _ = produced.update(keys: kv.0, values: kv.1)
-        #expect(produced.extract(idx: 0).metaState[5] == "requested")
+        let producedMeta = produced.extract(idx: 0).metaState
+        try #require(producedMeta.count == 6)
+        #expect(producedMeta[5] == "requested")
 
         // A model-native probe still yields model-native rows.
         let native = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 0)])
         let nativeProduced = try #require(native[0]([0]) as? BatchRotatingKVCache)
         _ = nativeProduced.update(keys: kv.0, values: kv.1)
-        #expect(nativeProduced.extract(idx: 0).metaState[5] == "modelNative")
+        let nativeMeta = nativeProduced.extract(idx: 0).metaState
+        try #require(nativeMeta.count == 6)
+        #expect(nativeMeta[5] == "modelNative")
     }
 
     @Test("Rotating caches with keep > 0 are rejected (single-stream fallback)")
@@ -510,10 +537,21 @@ struct BatchedSSMCacheTests {
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
         let composite = factories[0]([0, 0])
         let list = try #require(composite as? BatchedCacheList)
-        // Filtering routes through each child without flattening the topology.
-        list.filterBatched(batchIndices: MLXArray([Int32(0)]))
+        // Give the attention child two distinguishable rows so a no-op
+        // filter is visible below (makeDistinctKV keys row i with i+1).
+        let attention = try #require(list[0] as? BatchKVCache)
+        let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = attention.update(keys: keys, values: values)
+
+        // Filtering routes through each child without flattening the
+        // topology — and actually shrinks it: keep only row 1.
+        list.filterBatched(batchIndices: MLXArray([Int32(1)]))
+        #expect(attention.batchSize == 1)
         let extracted = list.extractBatched(0)
-        #expect(extracted is CacheList)
+        let childList = try #require(extracted as? CacheList)
+        let simple = try #require(childList[0] as? KVCacheSimple)
+        let extractedKeys = try #require(simple.state.first)
+        #expect(maxAbsDifference(extractedKeys, MLXArray.ones(extractedKeys.shape) * 2) == 0)
     }
 
     @Test("BatchedCacheList delegates makeMask to its attention child")
@@ -630,6 +668,9 @@ struct BatchCacheSerializationTests {
         #expect(throws: (any Error).self) {
             try savePromptCache(url: url, cache: [mamba])
         }
+        // Fail-closed means no artifact either: a save that writes the file
+        // and then throws would leave callers an invalid cache on disk.
+        #expect(!FileManager.default.fileExists(atPath: url.path))
     }
 
     @Test("savePromptCache keeps multi-row array-cache snapshots saveable")
@@ -754,12 +795,12 @@ private func maxAbsDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
     abs(lhs.asType(.float32) - rhs.asType(.float32)).max().item(Float.self)
 }
 
-/// Single-row KV whose every key/value is stamped with its absolute position,
-/// so window-retention tests can assert which positions survived by content.
+/// KV whose every key/value is stamped with its absolute position, so
+/// window-retention tests can assert which positions survived by content.
 private func makePositionKV(
-    positions: Range<Int>, heads: Int, headDim: Int
+    positions: Range<Int>, heads: Int, headDim: Int, batchSize: Int = 1
 ) -> (MLXArray, MLXArray) {
     let stamps = MLXArray(positions.map { Float($0) }).reshaped([1, 1, positions.count, 1])
-    let ones = MLXArray.ones([1, heads, positions.count, headDim])
+    let ones = MLXArray.ones([batchSize, heads, positions.count, headDim])
     return (ones * stamps, ones * (stamps + 100))
 }
