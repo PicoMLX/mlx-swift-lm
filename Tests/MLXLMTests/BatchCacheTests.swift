@@ -136,14 +136,20 @@ struct BatchKVCacheCoverageTests {
     }
 
     @Test("trim clamps to the shortest row of an unequal batch")
-    func trimClampsToShortestRow() {
+    func trimClampsToShortestRow() throws {
         // leftPadding [2, 0] + a 3-token update leaves logical row lengths
         // [1, 3] under a padded width of 3. A global trim of 2 must clamp to
         // the shorter row's single token, or that row's offset goes negative
         // and its padding exceeds the buffer, making a later extract slice an
         // invalid range.
         let cache = BatchKVCache(leftPadding: [2, 0])
-        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4, value: 1)
+        // Position-stamped rather than a constant fill: `trim` is pure index
+        // arithmetic, so a variant that dropped the OLDEST tokens (advancing
+        // the padding) instead of the newest (pulling the write head back)
+        // lands on exactly the same offsets and satisfies every count-based
+        // assertion here. Only the retained content separates the two.
+        let kv = makePositionKV(
+            positions: 0 ..< 3, heads: 2, headDim: 4, batchSize: 2, rowStride: 10)
         _ = cache.update(keys: kv.0, values: kv.1)
 
         let trimmed = cache.trim(2)
@@ -151,6 +157,17 @@ struct BatchKVCacheCoverageTests {
         #expect(cache.batchOffsets.asArray(Int32.self) == [0, 2])
         // The clamped state stays extractable for the short row.
         #expect(cache.extract(idx: 0).offset == 0)
+        // The long row keeps its two OLDEST positions: trim drops from the
+        // tail. Stamps of [11, 12] would mean the front was dropped instead,
+        // and [0, 1] would mean row 0's data leaked into row 1.
+        let row1 = cache.extract(idx: 1)
+        #expect(row1.offset == 2)
+        let row1Keys = try #require(row1.state.first)
+        #expect(row1Keys[0, 0, 0..., 0].asArray(Float.self) == [10, 11])
+        // Values carry the same stamps offset by 100: a trim that repositioned
+        // only the key tensor would satisfy the keys assertion alone.
+        let row1Values = try #require(row1.state.last)
+        #expect(row1Values[0, 0, 0..., 0].asArray(Float.self) == [110, 111])
 
         let rotating = BatchRotatingKVCache(maxSize: 16, leftPadding: [2, 0], keep: 0)
         _ = rotating.update(keys: kv.0, values: kv.1)
@@ -160,6 +177,15 @@ struct BatchKVCacheCoverageTests {
         // trim that moves the offsets but leaves stale per-row padding makes
         // the emptied shortest row slice an invalid range.
         #expect(rotating.extract(idx: 0).offset == 0)
+        // And the same tail-drop check: the rotating trim decrements both the
+        // window index and the scalar offset, so a front-dropping variant is
+        // equally invisible to the offset assertions above.
+        let rotatingRow1 = rotating.extract(idx: 1)
+        #expect(rotatingRow1.offset == 2)
+        let rotatingRow1Keys = try #require(rotatingRow1.state.first)
+        #expect(rotatingRow1Keys[0, 0, 0..., 0].asArray(Float.self) == [10, 11])
+        let rotatingRow1Values = try #require(rotatingRow1.state.last)
+        #expect(rotatingRow1Values[0, 0, 0..., 0].asArray(Float.self) == [110, 111])
     }
 
     @Test("makeMask honours left padding during decode")
