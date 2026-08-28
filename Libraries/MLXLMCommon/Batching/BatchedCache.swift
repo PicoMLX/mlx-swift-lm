@@ -204,6 +204,16 @@ extension ArraysCache: BatchedCache {
 /// A closure that allocates one batched cache for `leftPadding.count` rows.
 public typealias BatchedCacheFactory = (_ leftPadding: [Int]) -> any BatchedCache
 
+/// `ArraysCache.makeMask` treats a non-nil `leftPadding` as a left-padded
+/// layout: left padding becomes the only mask bound, and `prepare(lengths:)`
+/// no longer excludes right padding (`advance` turns `lengths` into a
+/// remaining-count, so it cannot double as an end bound). The batched engine
+/// prefills right-padded with no left padding, so an all-zero `leftPadding`
+/// must construct the cache with `nil` for the lengths bound to apply.
+private func ssmLeftPadding(_ leftPadding: [Int]) -> [Int]? {
+    leftPadding.allSatisfy { $0 == 0 } ? nil : leftPadding
+}
+
 /// Error thrown when a model's cache topology cannot be batched.
 public enum BatchedCacheError: Error, CustomStringConvertible, Equatable {
     case unsupportedCacheTopology(layer: Int, path: String, cacheType: String, reason: String)
@@ -279,12 +289,14 @@ private func makeBatchedCacheFactory(
     // Exact-type matches avoid misclassifying subclasses such as
     // MambaCache : ArraysCache and ChunkedKVCache : KVCacheSimple.
     if Swift.type(of: cache) == MambaCache.self {
-        return { leftPadding in MambaCache(leftPadding: leftPadding) }
+        return { leftPadding in MambaCache(leftPadding: ssmLeftPadding(leftPadding)) }
     }
 
     if Swift.type(of: cache) == ArraysCache.self, let arrays = cache as? ArraysCache {
         let slotCount = arrays.slotCount
-        return { leftPadding in ArraysCache(size: slotCount, leftPadding: leftPadding) }
+        return { leftPadding in
+            ArraysCache(size: slotCount, leftPadding: ssmLeftPadding(leftPadding))
+        }
     }
 
     if let rotating = cache as? RotatingKVCache {

@@ -1433,25 +1433,16 @@ public class ArraysCache: BaseKVCache {
 
     internal var slotCount: Int { cache.count }
 
-    /// Create attention mask from left padding and/or prepared sequence lengths.
-    ///
-    /// The two bounds are independent and can both be active: a batched ragged
-    /// prefill builds the cache with per-row `leftPadding` and then calls
-    /// `prepare(lengths:)` for the right-hand bound. Treating them as
-    /// alternatives (`if`/`else if`) silently dropped the lengths bound in
-    /// exactly that case, so mask-aware SSM mixers committed trailing
-    /// right-padding tokens into their convolution and recurrent state.
+    /// Create attention mask based on left padding or prepared sequence lengths
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
-        var mask: MLXArray?
         if let leftPadding {
-            mask = positions .>= leftPadding[0..., .newAxis]
+            return positions .>= leftPadding[0..., .newAxis]
+        } else if let lengths {
+            return positions .< lengths[0..., .newAxis]
+        } else {
+            return nil
         }
-        if let lengths {
-            let withinLength = positions .< lengths[0..., .newAxis]
-            mask = mask.map { $0 & withinLength } ?? withinLength
-        }
-        return mask
     }
 
     // MARK: - Serialization
@@ -1752,18 +1743,19 @@ struct KVCacheError: Error, LocalizedError {
 
 // MARK: - Utility Functions
 
-/// True when `cache` is (or, for a ``CacheList``, contains) a multi-row
-/// batched cache, which has no single-sequence serialized form.
+/// True when `cache` is (or, for a ``CacheList``, contains) a cache with no
+/// restorable serialized form: a `Batch*` attention cache (absent from the
+/// restore registry) or a zero-row array cache.
 private func containsBatchedRows(_ cache: KVCache) -> Bool {
     if cache is BatchKVCache || cache is BatchRotatingKVCache { return true }
-    // ArraysCache/MambaCache are batched by carrying a batch dimension
-    // rather than by type; any instance whose batch size is not exactly one
-    // has no single-sequence serialized form. That includes zero rows — a
-    // populated cache filtered with an empty index set keeps tensors with a
-    // batch dimension of 0, and restoring those against a single-request
-    // input fails later and less legibly than refusing the save here.
-    // Single-row (ordinary prompt-cache) instances stay saveable.
-    if let arrays = cache as? ArraysCache, arrays.batchSize != 1 { return true }
+    // ArraysCache/MambaCache snapshots are batch-aware in the serialized
+    // format (state, lengths and left padding all round-trip; see the
+    // ArraysCache/MambaCache round-trip tests), so multi-row instances stay
+    // saveable. Zero rows are still refused: a populated cache filtered with
+    // an empty index set keeps tensors with a batch dimension of 0, and
+    // restoring those against a real input fails later and less legibly
+    // than refusing the save here.
+    if let arrays = cache as? ArraysCache, arrays.batchSize == 0 { return true }
     if let list = cache as? CacheList {
         return list.children.contains(where: containsBatchedRows)
     }
@@ -1840,13 +1832,14 @@ public func savePromptCache(
         throw KVCacheError(message: "Model state requires at least one prompt cache")
     }
 
-    // Batched caches hold multi-row state (left padding, per-row offsets) that
-    // the single-sequence restore path cannot reconstruct; `cacheClassName`
-    // would silently serialize them as "KVCache". Fail closed instead.
+    // Batch* attention caches hold multi-row state (left padding, per-row
+    // offsets) that the restore path cannot reconstruct — `cacheClassName`
+    // would silently serialize them as "KVCache" — and a zero-row array cache
+    // restores into tensors no real input can use. Fail closed instead.
     if let batched = cache.first(where: containsBatchedRows) {
         throw KVCacheError(
             message:
-                "\(type(of: batched)) holds multi-row batched state and cannot be saved as a prompt cache; extract individual rows first"
+                "\(type(of: batched)) holds batched state with no restorable single-cache form and cannot be saved as a prompt cache; extract individual rows first"
         )
     }
 

@@ -452,24 +452,22 @@ struct BatchedSSMCacheTests {
         #expect(mamba.currentLengths?.asArray(Int32.self) == afterModel)
     }
 
-    @Test("The SSM mask applies left padding and lengths together")
-    func ssmMaskCombinesBothPaddingBounds() throws {
-        // A batched ragged prefill sets both: the factory builds the cache with
-        // per-row `leftPadding`, then the engine calls `prepare(lengths:)` for
-        // the right-hand bound. Row 1 is left-padded by 2 and 3 tokens long, so
-        // in a width-6 chunk only positions 2..<5 are real.
-        let mamba = MambaCache(leftPadding: [0, 2])
-        mamba.prepare(lengths: [4, 5])
+    @Test("SSM factories drop an all-zero left padding so lengths bound the mask")
+    func ssmFactoryZeroLeftPaddingKeepsLengthsBound() throws {
+        // `ArraysCache.makeMask` treats a non-nil `leftPadding` as a
+        // left-padded layout and makes it the only mask bound — even when
+        // every entry is zero. The batched engine prefills right-padded and
+        // always hands the factory an all-zero left padding, so the factory
+        // must construct SSM caches with `nil`: otherwise `prepare(lengths:)`
+        // stops excluding right padding and mask-aware mixers commit padding
+        // tokens into their recurrent state.
+        let factories = try makeBatchedCacheFactories(for: [MambaCache()])
+        let cache = try #require(factories[0]([0, 0]) as? MambaCache)
+        cache.prepare(lengths: [1, 2])
 
-        let mask = mamba.makeMask(N: 6)
-        let values = try #require(mask).asArray(Bool.self)
-
-        // Row 0: no left padding, length 4 -> positions 0..<4.
-        #expect(Array(values[0 ..< 6]) == [true, true, true, true, false, false])
-        // Row 1: left padding 2, length 5 -> positions 2..<5. Treating the two
-        // bounds as alternatives kept positions 5 valid, and a mask-aware mixer
-        // committed that right-padding token into its recurrent state.
-        #expect(Array(values[6 ..< 12]) == [false, false, true, true, true, false])
+        let values = try #require(cache.makeMask(N: 2)).asArray(Bool.self)
+        // Row 0: length 1 -> position 0 only. Row 1: length 2 -> both.
+        #expect(values == [true, false, true, true])
     }
 
     @Test("BatchedCacheList preserves nested topology")
@@ -596,32 +594,27 @@ struct BatchCacheSerializationTests {
         }
     }
 
-    @Test("savePromptCache fails closed for multi-row array caches")
-    func savePromptCacheRejectsMultiRowArraysCache() {
-        // ArraysCache/MambaCache are batched by batch dimension, not by type:
-        // a multi-row instance would serialize under its registered class name
-        // and reload batch-sized recurrent state into a single-sequence
-        // continuation. Single-row instances remain saveable.
-        let batched = MambaCache(leftPadding: [0, 0])
+    @Test("savePromptCache keeps multi-row array-cache snapshots saveable")
+    func savePromptCacheAllowsMultiRowArraysCache() throws {
+        // The serialized format is batch-aware for ArraysCache/MambaCache —
+        // state, lengths and left padding all round-trip (see the upstream
+        // ArraysCache/MambaCache round-trip tests) — so multi-row instances
+        // must stay saveable. Only zero-row instances and the Batch*
+        // attention caches, which the restore registry cannot reconstruct,
+        // are refused.
+        let batched = MambaCache()
         batched[0] = MLXArray.ones([2, 4])
         batched[1] = MLXArray.ones([2, 4])
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
-        #expect(throws: (any Error).self) {
-            try savePromptCache(url: url, cache: [batched])
-        }
-        #expect(!FileManager.default.fileExists(atPath: url.path))
+        defer { try? FileManager.default.removeItem(at: url) }
+        try savePromptCache(url: url, cache: [batched])
 
-        let single = MambaCache()
-        single[0] = MLXArray.ones([1, 4])
-        single[1] = MLXArray.ones([1, 4])
-        let singleURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
-        defer { try? FileManager.default.removeItem(at: singleURL) }
-        #expect(throws: Never.self) {
-            try savePromptCache(url: singleURL, cache: [single])
-        }
+        let (loaded, _) = try loadPromptCache(url: url)
+        let restored = try #require(loaded[0] as? MambaCache)
+        #expect(restored[0]?.shape == [2, 4])
+        #expect(restored[1]?.shape == [2, 4])
     }
 }
 
