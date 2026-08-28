@@ -388,27 +388,36 @@ struct BatchedCacheFactoryTests {
     func factoryRoutesSupportedTypes() throws {
         // #require on .first throughout: a factory array missing an entry
         // should fail the test, not trap the suite on a [0] subscript.
+        // Each required factory is bound to a local before it is called:
+        // invoking the macro expansion directly — `#require(x.first)(args)` —
+        // crashes the Swift 6.3.3 frontend (assertion in
+        // ConstraintSystem::recordArgumentList) even though 6.2 accepts it,
+        // and the two-step form is semantically identical on both.
         let simple = try makeBatchedCacheFactories(for: [KVCacheSimple()])
-        #expect(try #require(simple.first)([0, 0]) is BatchKVCache)
+        let makeSimple = try #require(simple.first)
+        #expect(makeSimple([0, 0]) is BatchKVCache)
 
         let rotating = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16)])
-        let producedRotating = try #require(
-            try #require(rotating.first)([0]) as? BatchRotatingKVCache)
+        let makeRotating = try #require(rotating.first)
+        let producedRotating = try #require(makeRotating([0]) as? BatchRotatingKVCache)
         // The window must come from the probe, not a default: a hard-coded
         // maxSize would make the engine retain the wrong number of tokens.
         #expect(producedRotating.maxSize == 16)
 
         let arrays = try makeBatchedCacheFactories(for: [ArraysCache(size: 2)])
-        let arraysCache = try #require(arrays.first)([0])
+        let makeArrays = try #require(arrays.first)
+        let arraysCache = makeArrays([0])
         #expect(arraysCache is ArraysCache)
         #expect((arraysCache as? ArraysCache)?.slotCount == 2)
 
         let mamba = try makeBatchedCacheFactories(for: [MambaCache()])
-        #expect(try #require(mamba.first)([0]) is MambaCache)
+        let makeMamba = try #require(mamba.first)
+        #expect(makeMamba([0]) is MambaCache)
 
         let composite = try makeBatchedCacheFactories(
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
-        #expect(try #require(composite.first)([0, 0]) is BatchedCacheList)
+        let makeComposite = try #require(composite.first)
+        #expect(makeComposite([0, 0]) is BatchedCacheList)
     }
 
     @Test("The factory carries requested-capacity provenance onto produced caches")
