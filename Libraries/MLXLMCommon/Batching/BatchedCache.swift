@@ -211,7 +211,12 @@ public typealias BatchedCacheFactory = (_ leftPadding: [Int]) -> any BatchedCach
 /// prefills right-padded with no left padding, so an all-zero `leftPadding`
 /// must construct the cache with `nil` for the lengths bound to apply.
 private func ssmLeftPadding(_ leftPadding: [Int]) -> [Int]? {
-    leftPadding.allSatisfy { $0 == 0 } ? nil : leftPadding
+    // An explicit empty array is preserved: mapping it to nil would let
+    // `ArraysCache.batchSize` fall back to 1, betraying the factory's
+    // `leftPadding.count`-rows promise for a zero-row batch (extend would
+    // then synthesize a phantom row when allocating missing state).
+    if leftPadding.isEmpty { return leftPadding }
+    return leftPadding.allSatisfy { $0 == 0 } ? nil : leftPadding
 }
 
 /// Error thrown when a model's cache topology cannot be batched.

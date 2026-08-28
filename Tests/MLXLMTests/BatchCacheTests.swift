@@ -470,6 +470,22 @@ struct BatchedSSMCacheTests {
         #expect(values == [true, false, true, true])
     }
 
+    @Test("SSM factories preserve zero-row cardinality")
+    func ssmFactoryPreservesZeroRowCardinality() throws {
+        // An empty batch must stay empty: if the factory mapped `[]` to a nil
+        // left padding, `ArraysCache.batchSize` would fall back to 1 and
+        // `extend` would synthesize a phantom zero-filled row when allocating
+        // the "missing" left-hand state.
+        let factories = try makeBatchedCacheFactories(for: [MambaCache()])
+        let empty = try #require(factories[0]([]) as? MambaCache)
+        #expect(empty.batchSize == 0)
+
+        let populated = MambaCache()
+        populated[0] = MLXArray.ones([2, 4])
+        empty.extend(other: populated)
+        #expect(empty[0]?.dim(0) == 2)
+    }
+
     @Test("BatchedCacheList preserves nested topology")
     func batchedCacheListNested() throws {
         let factories = try makeBatchedCacheFactories(

@@ -722,6 +722,19 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             return
         }
 
+        // keep > 0 pins a fixed prefix at the head of the ring. Ragged
+        // extension left-pads the shorter side, and at the rotation wrap
+        // `updateInPlace` preserves the head `keep` positions — for a padded
+        // row those are the pads — while `makeMask` can only exclude a prefix
+        // of the window, so the padded row would attend to trailing garbage.
+        // The factory rejects keep > 0 topologies outright; this guards
+        // direct construction.
+        precondition(
+            keep == 0 || self._idx == other._idx,
+            "BatchRotatingKVCache.extend with keep > 0 requires equal-length "
+                + "rows; ragged extension would left-pad into the pinned keep prefix"
+        )
+
         // If rotation states differ, put both in temporal order
         if self.rotated != other.rotated || self._idx != other._idx {
             self.temporalOrder()
@@ -918,6 +931,18 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         let padding = lengths.map { maxLength - $0 }
         let offsets = caches.map { $0.offset }
         let B = caches.count
+
+        // keep > 0 pins a fixed prefix at the head of the ring. Merging
+        // ragged sources left-pads the shorter rows, and at the rotation wrap
+        // `updateInPlace` preserves those pads as the keep prefix while
+        // `makeMask` can only exclude a prefix of the window, so padded rows
+        // would attend to trailing garbage. The factory rejects keep > 0
+        // topologies outright; this guards direct construction.
+        precondition(
+            targetKeep <= 0 || padding.allSatisfy { $0 == 0 },
+            "BatchRotatingKVCache.merge with keep > 0 requires equal-length "
+                + "sources; ragged merge would left-pad into the pinned keep prefix"
+        )
 
         // Find dimensions from first non-empty cache
         var H = 0
