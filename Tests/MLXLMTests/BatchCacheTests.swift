@@ -282,6 +282,10 @@ struct BatchRotatingKVCacheCoverageTests {
         // but leaves stale or misordered values feeds corrupted values to
         // attention (makePositionKV stamps them at +100).
         let values = try #require(extracted.state.last)
+        // Pairing first, then the set: sorting each side independently would
+        // accept a cache that retains the right values but permutes them
+        // differently from the keys, pairing every key with a wrong value.
+        #expect(maxAbsDifference(values, keys + 100) == 0)
         let retainedValues = values[0, 0, 0..., 0].asArray(Float.self).sorted()
         #expect(retainedValues == [100, 101, 103, 104])
     }
@@ -636,9 +640,13 @@ struct BatchedSSMCacheTests {
         let cache = try #require(factory([0, 0]) as? MambaCache)
         cache.prepare(lengths: [1, 2])
 
-        let values = try #require(cache.makeMask(N: 2)).asArray(Bool.self)
+        let mask = try #require(cache.makeMask(N: 2))
+        // Shape before contents: `asArray` flattens, so [4], [1, 4] or a
+        // transposed layout with the same values would pass while broadcasting
+        // along the wrong axis in a mask-aware mixer.
+        #expect(mask.shape == [2, 2])
         // Row 0: length 1 -> position 0 only. Row 1: length 2 -> both.
-        #expect(values == [true, false, true, true])
+        #expect(mask.asArray(Bool.self) == [true, false, true, true])
     }
 
     @Test("SSM factories preserve zero-row cardinality")
@@ -708,6 +716,47 @@ struct BatchedSSMCacheTests {
         #expect(maxAbsDifference(simpleValues, MLXArray.ones(simpleValues.shape) * 20) == 0)
         let rotValues = try #require(rotChild.state.last)
         #expect(maxAbsDifference(rotValues, MLXArray.ones(rotValues.shape) * 20) == 0)
+    }
+
+    @Test("BatchedCacheList extends every child")
+    func batchedCacheListExtends() throws {
+        // `DecodeBatch.extend` calls `extendBatched` on every layer cache when
+        // a request is admitted mid-batch, composites included. A composite
+        // that extended only one child, or appended inconsistent state, would
+        // leave a dynamically admitted hybrid request running with mismatched
+        // cache cardinalities — and nothing else in this suite covers it.
+        let factories = try makeBatchedCacheFactories(
+            for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
+        let factory = try #require(factories.first)
+
+        let base = try #require(factory([0, 0]) as? BatchedCacheList)
+        try #require(base.children.count == 2)
+        let baseAttention = try #require(base[0] as? BatchKVCache)
+        let baseRotating = try #require(base[1] as? BatchRotatingKVCache)
+        let baseKV = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = baseAttention.update(keys: baseKV.0, values: baseKV.1)
+        _ = baseRotating.update(keys: baseKV.0, values: baseKV.1)
+
+        let addition = try #require(factory([0]) as? BatchedCacheList)
+        let additionAttention = try #require(addition[0] as? BatchKVCache)
+        let additionRotating = try #require(addition[1] as? BatchRotatingKVCache)
+        let additionKV = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 9)
+        _ = additionAttention.update(keys: additionKV.0, values: additionKV.1)
+        _ = additionRotating.update(keys: additionKV.0, values: additionKV.1)
+
+        base.extendBatched(addition)
+
+        // Every child grew, and the appended row carries the incoming state.
+        #expect(baseAttention.batchSize == 3)
+        #expect(baseRotating.batchSize == 3)
+        let appended = try #require(base.extractBatched(2) as? CacheList)
+        try #require(appended.children.count == 2)
+        let appendedSimple = try #require(appended[0] as? KVCacheSimple)
+        let appendedKeys = try #require(appendedSimple.state.first)
+        #expect(maxAbsDifference(appendedKeys, additionKV.0) == 0)
+        let appendedRotating = try #require(appended[1] as? RotatingKVCache)
+        let appendedRotatingKeys = try #require(appendedRotating.state.first)
+        #expect(maxAbsDifference(appendedRotatingKeys, additionKV.0) == 0)
     }
 
     @Test("BatchedCacheList delegates makeMask to its attention child")
@@ -877,6 +926,10 @@ struct BatchCacheSerializationTests {
         let batched = MambaCache(leftPadding: [1, 0])
         batched[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
         batched[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
+        // Unequal per-row lengths, so the metadata this test claims to cover
+        // is actually exercised: a serializer that drops or reorders them
+        // lets a resumed mask-aware mixer treat padding as live input.
+        batched.prepare(lengths: [3, 5])
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
@@ -895,6 +948,7 @@ struct BatchCacheSerializationTests {
         #expect(maxAbsDifference(slot0, try #require(batched[0])) == 0)
         #expect(maxAbsDifference(slot1, try #require(batched[1])) == 0)
         #expect(restored.leftPaddingValues == [1, 0])
+        #expect(restored.lengthsValues == [3, 5])
     }
 }
 
@@ -904,11 +958,15 @@ struct BatchCacheSerializationTests {
 struct BatchMaskingTests {
 
     @Test("createCausalMask masks left padding per sequence")
-    func causalMaskHonoursLeftPadding() {
+    func causalMaskHonoursLeftPadding() throws {
         let leftPadding = MLXArray([Int32(1), Int32(2)])
         let mask = createCausalMask(n: 4, offset: 0, leftPadding: leftPadding)
 
-        #expect(mask.dim(0) == 2)
+        // #require every dimension the subscripts below rely on: a shorter
+        // mask would otherwise trap in MLX after recording the failure.
+        try #require(mask.dim(0) == 2)
+        try #require(mask.dim(-1) >= 4)
+        try #require(mask.dim(-2) >= 4)
         // Row 0: leftPadding 1 → position 0 masked, position 1 attendable on the diagonal.
         #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
         #expect(mask[0, 0, 1, 1].item(Bool.self) == true)
