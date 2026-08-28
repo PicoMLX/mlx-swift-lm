@@ -53,10 +53,13 @@ struct BatchKVCacheCoverageTests {
     }
 
     @Test("Filter during a ragged prefill keeps transient right-padding consistent")
-    func filterDuringRaggedPrefillFiltersRightPadding() {
+    func filterDuringRaggedPrefillFiltersRightPadding() throws {
         let cache = BatchKVCache(leftPadding: [0, 0])
         cache.prepare(rightPadding: MLXArray([Int32(2), Int32(0)]))
-        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4, value: 2)
+        // Row-distinct, so filtering the cancelled row's cache state (not just
+        // its `_rightPadding` entry) is observable: the survivor must not
+        // inherit row 0's attention history.
+        let kv = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 5, headDim: 4)
         _ = cache.update(keys: kv.0, values: kv.1)
 
         // Row 0 is cancelled mid-prefill; finalize must apply only the
@@ -67,6 +70,11 @@ struct BatchKVCacheCoverageTests {
         let extracted = cache.extract(idx: 0)
         #expect(extracted.offset == 5)
         #expect(cache.leftPadding[0].item(Int32.self) == 0)
+        // makeDistinctKV keys row i with i+1 and values with (i+1)*10.
+        let keys = try #require(extracted.state.first)
+        #expect(maxAbsDifference(keys, MLXArray.ones(keys.shape) * 2) == 0)
+        let values = try #require(extracted.state.last)
+        #expect(maxAbsDifference(values, MLXArray.ones(values.shape) * 20) == 0)
     }
 
     @Test("finalize preserves valid tokens when capacity exceeds the populated prefix")
@@ -94,10 +102,15 @@ struct BatchKVCacheCoverageTests {
         let row0 = cache.extract(idx: 0)
         #expect(row0.offset == 3)
         #expect(try #require(row0.keys).asArray(Float.self) == [10, 11, 12])
+        // Values too: a roll that lands the keys correctly while leaving the
+        // value buffer padded or out of order feeds corrupted values to the
+        // next attention step. The input sets values = keys * 2.
+        #expect(try #require(row0.values).asArray(Float.self) == [20, 22, 24])
 
         let row1 = cache.extract(idx: 1)
         #expect(row1.offset == 5)
         #expect(try #require(row1.keys).asArray(Float.self) == [20, 21, 22, 23, 24])
+        #expect(try #require(row1.values).asArray(Float.self) == [40, 42, 44, 46, 48])
     }
 
     @Test("fromSingle/toSingle preserve cache data")
@@ -172,16 +185,29 @@ struct BatchKVCacheCoverageTests {
         // Models read `cache?.ropeOffset` with `cache` typed as `KVCache?`, so the
         // batched override must win via witness-table dispatch (not the scalar
         // KVCache extension default).
-        let full: any KVCache = BatchKVCache(leftPadding: [1, 0])
-        guard case .batch = full.ropeOffset else {
+        // Unequal, non-trivial offsets: layers position RoPE from the
+        // associated values, so a witness returning `.batch` with zeroed,
+        // scalarized or misordered offsets shifts token positions even though
+        // the dispatch looks correct. leftPadding [1, 0] starts the rows at
+        // [-1, 0]; a 3-token update lands them at [2, 3].
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4, value: 1)
+        let fullCache = BatchKVCache(leftPadding: [1, 0])
+        _ = fullCache.update(keys: kv.0, values: kv.1)
+        let full: any KVCache = fullCache
+        guard case .batch(let fullOffsets) = full.ropeOffset else {
             Issue.record("BatchKVCache.ropeOffset via KVCache should be .batch")
             return
         }
-        let rotating: any KVCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [1, 0], keep: 0)
-        guard case .batch = rotating.ropeOffset else {
+        #expect(fullOffsets.asArray(Int32.self) == [2, 3])
+
+        let rotatingCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [1, 0], keep: 0)
+        _ = rotatingCache.update(keys: kv.0, values: kv.1)
+        let rotating: any KVCache = rotatingCache
+        guard case .batch(let rotatingOffsets) = rotating.ropeOffset else {
             Issue.record("BatchRotatingKVCache.ropeOffset via KVCache should be .batch")
             return
         }
+        #expect(rotatingOffsets.asArray(Int32.self) == [2, 3])
     }
 }
 
@@ -263,7 +289,13 @@ struct BatchRotatingKVCacheCoverageTests {
 
     @Test("prepare/finalize preserve extractable state")
     func prepareFinalizePreserveExtractableState() throws {
-        let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [2, 0], keep: 4)
+        // Zero construction-time left padding, matching how the engine builds
+        // batched caches (`makeBatchedCache` always passes zeros and declares
+        // ragged rows through `prepare(rightPadding:)`). Combining a
+        // construction-time left padding with a prepare-time right padding
+        // describes a row that is padded from both ends while `lengths` claims
+        // the full span, and `finalize` then charges the row for both.
+        let cache = BatchRotatingKVCache(maxSize: 32, leftPadding: [0, 0], keep: 4)
         cache.prepare(lengths: [3, 5], rightPadding: [2, 0])
 
         // Position-stamped so post-finalize extraction is checkable by
@@ -283,11 +315,16 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(row0.offset == 3)
         let row0Keys = try #require(row0.state.first)
         #expect(row0Keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 2])
+        // Values roll with the keys (makePositionKV stamps them at +100).
+        let row0Values = try #require(row0.state.last)
+        #expect(row0Values[0, 0, 0..., 0].asArray(Float.self) == [100, 101, 102])
 
         let row1 = cache.extract(idx: 1)
         #expect(row1.offset == 5)
         let row1Keys = try #require(row1.state.first)
         #expect(row1Keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 2, 3, 4])
+        let row1Values = try #require(row1.state.last)
+        #expect(row1Values[0, 0, 0..., 0].asArray(Float.self) == [100, 101, 102, 103, 104])
     }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
@@ -468,6 +505,13 @@ struct BatchedCacheFactoryTests {
         #expect(throws: BatchedCacheError.self) {
             _ = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 4)])
         }
+        // Recursive routing must reject it inside a composite too: a factory
+        // validating only top-level types would batch a hybrid model's nested
+        // keep-prefix cache.
+        #expect(throws: BatchedCacheError.self) {
+            _ = try makeBatchedCacheFactories(
+                for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16, keep: 4))])
+        }
     }
 
     @Test("Factory rejects quantized and chunked caches")
@@ -608,6 +652,10 @@ struct BatchedSSMCacheTests {
         // reaches one child is visible below (makeDistinctKV keys row i with
         // i+1); a composite with inconsistent child cardinalities selects
         // the wrong request or fails on later extraction.
+        // Child count first: if the factory dropped the second nested cache —
+        // the topology defect this test exists to catch — `list[1]` would trap
+        // before Swift Testing could report it.
+        try #require(list.children.count == 2)
         let attention = try #require(list[0] as? BatchKVCache)
         let rotating = try #require(list[1] as? BatchRotatingKVCache)
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
@@ -621,6 +669,7 @@ struct BatchedSSMCacheTests {
         #expect(rotating.batchSize == 1)
         let extracted = list.extractBatched(0)
         let childList = try #require(extracted as? CacheList)
+        try #require(childList.children.count == 2)
         let simple = try #require(childList[0] as? KVCacheSimple)
         let extractedKeys = try #require(simple.state.first)
         #expect(maxAbsDifference(extractedKeys, MLXArray.ones(extractedKeys.shape) * 2) == 0)
