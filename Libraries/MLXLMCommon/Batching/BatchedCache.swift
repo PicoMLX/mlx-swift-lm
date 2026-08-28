@@ -314,11 +314,11 @@ private func makeBatchedCacheFactory(
         let keep = Int(rotating.metaState.first ?? "0") ?? 0
 
         // keep > 0 cannot currently be combined with per-row left padding: at
-        // the rotation wrap, `BatchRotatingKVCache` rolls a padded row's pads
-        // to the END of the buffer to protect the keep prefix, but the
-        // prefix-only `leftPadding` mask cannot express trailing garbage, so
-        // those zero-K/V slots would be attended until overwritten. Until the
-        // mask model supports it, keep-prefix topologies fall back to
+        // the rotation wrap the keep prefix would either pin a padded row's
+        // pads or, rolled to the END of the buffer, leave them attendable —
+        // the prefix-only `leftPadding` mask cannot express trailing garbage.
+        // `BatchRotatingKVCache` fails closed at that wrap; until the mask
+        // model supports it, keep-prefix topologies fall back to
         // single-stream (in-repo models all use keep == 0; keep == 4 arises
         // only via `GenerateParameters.maxKVSize`).
         guard keep == 0 else {

@@ -342,21 +342,23 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
         // Rotate — wrap to keep (not 0) so the first `keep` positions are never overwritten
         if _idx == maxCacheSize {
-            // When keep > 0 and some sequences have left-padding, the keep zone
-            // (positions 0..<keep) may contain padding zeros rather than the
-            // sequence's actual keep-prefix tokens. Roll away the left-padding
-            // so that each sequence's data starts at position 0, ensuring the
-            // global keep zone correctly protects per-sequence keep prefixes.
-            // On subsequent wraps leftPadding is already ≤ 0 so the roll is a no-op.
+            // keep > 0 pins positions 0..<keep at the wrap. A row still
+            // carrying left padding would either pin its pads as the keep
+            // prefix, or (if the pads were rolled out first) leave them
+            // attendable at the tail of the ring for up to
+            // maxSize - keep - padding further steps — `makeMask` can only
+            // exclude a prefix of the window. Ragged batches under a keep
+            // prefix are fine strictly below the window; the wrap is where
+            // they stop being representable, so fail closed here. The
+            // factory rejects keep > 0 topologies for exactly this reason;
+            // only direct construction can reach this state.
             if keep > 0 {
-                let effectivePadding = MLX.maximum(MLXArray(Int32(0)), leftPadding)
-                if effectivePadding.max().item(Int32.self) > 0 {
-                    self.keys = dynamicRoll(
-                        self.keys!, shifts: -effectivePadding[0..., .newAxis], axis: 2)
-                    self.values = dynamicRoll(
-                        self.values!, shifts: -effectivePadding[0..., .newAxis], axis: 2)
-                    leftPadding = leftPadding - effectivePadding
-                }
+                precondition(
+                    MLX.maximum(MLXArray(Int32(0)), leftPadding).max().item(Int32.self) == 0,
+                    "BatchRotatingKVCache cannot wrap a keep > 0 window while a "
+                        + "row still carries left padding: the pinned keep prefix "
+                        + "would capture or expose padding"
+                )
             }
             rotated = true
             _idx = keep
@@ -722,19 +724,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             return
         }
 
-        // keep > 0 pins a fixed prefix at the head of the ring. Ragged
-        // extension left-pads the shorter side, and at the rotation wrap
-        // `updateInPlace` preserves the head `keep` positions — for a padded
-        // row those are the pads — while `makeMask` can only exclude a prefix
-        // of the window, so the padded row would attend to trailing garbage.
-        // The factory rejects keep > 0 topologies outright; this guards
-        // direct construction.
-        precondition(
-            keep == 0 || self._idx == other._idx,
-            "BatchRotatingKVCache.extend with keep > 0 requires equal-length "
-                + "rows; ragged extension would left-pad into the pinned keep prefix"
-        )
-
         // If rotation states differ, put both in temporal order
         if self.rotated != other.rotated || self._idx != other._idx {
             self.temporalOrder()
@@ -931,18 +920,6 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         let padding = lengths.map { maxLength - $0 }
         let offsets = caches.map { $0.offset }
         let B = caches.count
-
-        // keep > 0 pins a fixed prefix at the head of the ring. Merging
-        // ragged sources left-pads the shorter rows, and at the rotation wrap
-        // `updateInPlace` preserves those pads as the keep prefix while
-        // `makeMask` can only exclude a prefix of the window, so padded rows
-        // would attend to trailing garbage. The factory rejects keep > 0
-        // topologies outright; this guards direct construction.
-        precondition(
-            targetKeep <= 0 || padding.allSatisfy { $0 == 0 },
-            "BatchRotatingKVCache.merge with keep > 0 requires equal-length "
-                + "sources; ragged merge would left-pad into the pinned keep prefix"
-        )
 
         // Find dimensions from first non-empty cache
         var H = 0
