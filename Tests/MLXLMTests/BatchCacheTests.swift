@@ -386,26 +386,29 @@ struct BatchedCacheFactoryTests {
 
     @Test("Factory routes supported cache types")
     func factoryRoutesSupportedTypes() throws {
+        // #require on .first throughout: a factory array missing an entry
+        // should fail the test, not trap the suite on a [0] subscript.
         let simple = try makeBatchedCacheFactories(for: [KVCacheSimple()])
-        #expect(simple[0]([0, 0]) is BatchKVCache)
+        #expect(try #require(simple.first)([0, 0]) is BatchKVCache)
 
         let rotating = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16)])
-        let producedRotating = try #require(rotating[0]([0]) as? BatchRotatingKVCache)
+        let producedRotating = try #require(
+            try #require(rotating.first)([0]) as? BatchRotatingKVCache)
         // The window must come from the probe, not a default: a hard-coded
         // maxSize would make the engine retain the wrong number of tokens.
         #expect(producedRotating.maxSize == 16)
 
         let arrays = try makeBatchedCacheFactories(for: [ArraysCache(size: 2)])
-        let arraysCache = arrays[0]([0])
+        let arraysCache = try #require(arrays.first)([0])
         #expect(arraysCache is ArraysCache)
         #expect((arraysCache as? ArraysCache)?.slotCount == 2)
 
         let mamba = try makeBatchedCacheFactories(for: [MambaCache()])
-        #expect(mamba[0]([0]) is MambaCache)
+        #expect(try #require(mamba.first)([0]) is MambaCache)
 
         let composite = try makeBatchedCacheFactories(
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
-        #expect(composite[0]([0, 0]) is BatchedCacheList)
+        #expect(try #require(composite.first)([0, 0]) is BatchedCacheList)
     }
 
     @Test("The factory carries requested-capacity provenance onto produced caches")
@@ -515,7 +518,7 @@ struct BatchedSSMCacheTests {
     }
 
     @Test("advanceBatched leaves recurrent padding metadata to the model")
-    func arraysCacheAdvanceIsModelOwned() {
+    func arraysCacheAdvanceIsModelOwned() throws {
         let mamba = MambaCache(leftPadding: [0, 2])
         mamba[0] = MLXArray.ones([2, 4])
         let cache: any BatchedCache = mamba
@@ -525,7 +528,11 @@ struct BatchedSSMCacheTests {
         // FalconH1, GraniteMoeHybrid, LFM2MoE, Qwen3.5 and Qwen3Next all call
         // `advance(chunk)` themselves.
         mamba.advance(2)
-        let afterModel = mamba.currentLengths?.asArray(Int32.self)
+        // #require and check the advanced value itself: a regression that
+        // clears `currentLengths` would otherwise slip through the final
+        // nil == nil comparison.
+        let afterModel = try #require(mamba.currentLengths?.asArray(Int32.self))
+        #expect(afterModel == [2, 0])
 
         // The engine's post-chunk hook must not advance it a second time, or
         // `lengths` runs a full chunk ahead and the next chunk's SSM mask
