@@ -291,7 +291,7 @@ struct BatchRotatingKVCacheCoverageTests {
     }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
-    func fromSingleRoundTripKeepsRetainedWindow() {
+    func fromSingleRoundTripKeepsRetainedWindow() throws {
         // Per-position values, so returning the oldest window instead of the
         // retained one is visible rather than hidden behind uniform data.
         func positionalKV(seqLen: Int) -> (MLXArray, MLXArray) {
@@ -315,9 +315,15 @@ struct BatchRotatingKVCacheCoverageTests {
 
             let restored = batch.toSingle()
             #expect(restored.offset == single.offset)
-            #expect(restored.state[0].dim(2) == single.state[0].dim(2))
-            #expect(maxAbsDifference(restored.state[0], single.state[0]) == 0)
-            #expect(maxAbsDifference(restored.state[1], single.state[1]) == 0)
+            // #require'd .first/.last, not [0]/[1]: a round trip returning
+            // fewer than two state tensors should fail the test, not trap.
+            let restoredKeys = try #require(restored.state.first)
+            let restoredValues = try #require(restored.state.last)
+            let singleKeys = try #require(single.state.first)
+            let singleValues = try #require(single.state.last)
+            #expect(restoredKeys.dim(2) == singleKeys.dim(2))
+            #expect(maxAbsDifference(restoredKeys, singleKeys) == 0)
+            #expect(maxAbsDifference(restoredValues, singleValues) == 0)
         }
     }
 
@@ -581,9 +587,14 @@ struct BatchedSSMCacheTests {
         #expect(empty.batchSize == 0)
 
         let populated = MambaCache()
-        populated[0] = MLXArray.ones([2, 4])
+        populated[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
         empty.extend(other: populated)
-        #expect(empty[0]?.dim(0) == 2)
+        // Content, not just the batch dimension: an extend that allocates
+        // two correctly shaped rows but zero-fills the incoming recurrent
+        // state would corrupt the admitted requests' next model call.
+        let slot0 = try #require(empty[0])
+        #expect(slot0.dim(0) == 2)
+        #expect(maxAbsDifference(slot0, try #require(populated[0])) == 0)
     }
 
     @Test("BatchedCacheList preserves nested topology")
@@ -727,6 +738,18 @@ struct BatchCacheSerializationTests {
             try savePromptCache(url: url, cache: [cache])
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
+
+        // The rotating variant is just as unrestorable; a guard that only
+        // recognized BatchKVCache would let a multi-row rotating snapshot
+        // through to reload as an invalid single-sequence cache.
+        let rotating = BatchRotatingKVCache(maxSize: 16, leftPadding: [0, 1], keep: 0)
+        _ = rotating.update(keys: keys, values: values)
+        let rotatingURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("batch-rotating-\(UUID().uuidString).safetensors")
+        #expect(throws: (any Error).self) {
+            try savePromptCache(url: rotatingURL, cache: [rotating])
+        }
+        #expect(!FileManager.default.fileExists(atPath: rotatingURL.path))
     }
 
     @Test("savePromptCache fails closed for zero-row array caches")
