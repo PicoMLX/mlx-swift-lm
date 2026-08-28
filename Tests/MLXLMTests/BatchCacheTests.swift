@@ -200,10 +200,10 @@ struct BatchRotatingKVCacheCoverageTests {
     @Test("Overflow keeps the sliding window and preserves keep")
     func overflowPreservesKeepAndWindow() throws {
         let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0], keep: 2)
-        let first = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
+        let first = makePositionKV(positions: 0 ..< 4, heads: 2, headDim: 4)
         _ = cache.update(keys: first.0, values: first.1)
 
-        let second = makeKV(batchSize: 1, heads: 2, seqLen: 1, headDim: 4, value: 9)
+        let second = makePositionKV(positions: 4 ..< 5, heads: 2, headDim: 4)
         _ = cache.update(keys: second.0, values: second.1)
 
         let extracted = cache.extract(idx: 0)
@@ -211,6 +211,13 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.keep == 2)
         #expect(extracted.maxSize == 4)
         #expect(keys.dim(2) <= 4)
+        // Each key is stamped with its absolute position, so the retained
+        // window is checkable by content: the pinned keep prefix (0, 1)
+        // plus the newest suffix (3, 4), with the oldest non-keep position
+        // (2) evicted. Compared as a sorted set because the ring's internal
+        // layout may rotate.
+        let retained = keys[0, 0, 0..., 0].asArray(Float.self).sorted()
+        #expect(retained == [0, 1, 3, 4])
     }
 
     @Test("isTrimmable(after:) predicts window overflow")
@@ -272,15 +279,17 @@ struct BatchRotatingKVCacheCoverageTests {
     }
 
     @Test("Requested-capacity provenance survives fromSingle and extract")
-    func capacityOriginSurvivesBatching() {
+    func capacityOriginSurvivesBatching() throws {
         let single = RotatingKVCache(maxSize: 8, keep: 0)
         let kv = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 1)
         _ = single.update(keys: kv.0, values: kv.1)
 
         // metaState's sixth field is the capacity origin. Mark this window as
         // coming from a requested capacity rather than the model architecture.
+        // #require rather than #expect: on a five-field regression the [5]
+        // accesses below would trap and take the rest of the suite with them.
         var meta = single.metaState
-        #expect(meta.count == 6)
+        try #require(meta.count == 6)
         meta[5] = "requested"
         single.metaState = meta
 
@@ -288,14 +297,16 @@ struct BatchRotatingKVCacheCoverageTests {
         // to `modelNative`, which exempts it from requested-capacity validation
         // and makes runtime status report the limit as model-defined.
         let restored = BatchRotatingKVCache.fromSingle(single).extract(idx: 0)
-        #expect(restored.metaState.count == 6)
+        try #require(restored.metaState.count == 6)
         #expect(restored.metaState[5] == "requested")
 
         // A model-native window keeps its own label.
         let native = RotatingKVCache(maxSize: 8, keep: 0)
         _ = native.update(keys: kv.0, values: kv.1)
         let nativeRestored = BatchRotatingKVCache.fromSingle(native).extract(idx: 0)
-        #expect(nativeRestored.metaState[5] == "modelNative")
+        let nativeMeta = nativeRestored.metaState
+        try #require(nativeMeta.count == 6)
+        #expect(nativeMeta[5] == "modelNative")
     }
 
     @Test("Extracting a row that never prefilled still restores its metadata")
@@ -396,14 +407,21 @@ struct BatchedCacheFactoryTests {
     }
 
     @Test("BatchedCache protocol drives a full-attention cache")
-    func protocolSurfaceFullAttention() {
+    func protocolSurfaceFullAttention() throws {
         let cache: any BatchedCache = BatchKVCache(leftPadding: [0, 0])
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
         _ = cache.update(keys: keys, values: values)
 
-        cache.filterBatched(batchIndices: MLXArray([Int32(0), Int32(1)]))
+        // Shrink to row 1 only — an identity filter would let a missing or
+        // no-op protocol witness pass. The surviving row must carry row 1's
+        // distinct stamp (makeDistinctKV keys row i with value i+1).
+        cache.filterBatched(batchIndices: MLXArray([Int32(1)]))
+        let batch = try #require(cache as? BatchKVCache)
+        #expect(batch.batchSize == 1)
         let extracted = cache.extractBatched(0)
-        #expect(extracted is KVCacheSimple)
+        let simple = try #require(extracted as? KVCacheSimple)
+        let extractedKeys = try #require(simple.state.first)
+        #expect(maxAbsDifference(extractedKeys, MLXArray.ones(extractedKeys.shape) * 2) == 0)
         // advanceBatched is a no-op for full attention; just confirm it is callable.
         cache.advanceBatched(1)
     }
@@ -567,7 +585,11 @@ struct Gemma2BatchMaskTests {
 
         let out = attention(x, mask: mask, cache: cache)
         eval(out)
+        // Finite, not merely non-NaN: an infinity that survives the masked
+        // softmax without producing NaN would still corrupt downstream
+        // computation.
         #expect(isNaN(out).any().item(Bool.self) == false)
+        #expect(isInf(out).any().item(Bool.self) == false)
     }
 }
 
@@ -618,9 +640,9 @@ struct BatchCacheSerializationTests {
         // must stay saveable. Only zero-row instances and the Batch*
         // attention caches, which the restore registry cannot reconstruct,
         // are refused.
-        let batched = MambaCache()
-        batched[0] = MLXArray.ones([2, 4])
-        batched[1] = MLXArray.ones([2, 4])
+        let batched = MambaCache(leftPadding: [1, 0])
+        batched[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        batched[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("mamba-cache-\(UUID().uuidString).safetensors")
@@ -629,8 +651,14 @@ struct BatchCacheSerializationTests {
 
         let (loaded, _) = try loadPromptCache(url: url)
         let restored = try #require(loaded[0] as? MambaCache)
-        #expect(restored[0]?.shape == [2, 4])
-        #expect(restored[1]?.shape == [2, 4])
+        // Contents and batch metadata, not just shapes: state restored with
+        // the right dimensions but wrong values would corrupt every
+        // subsequent generation silently.
+        let slot0 = try #require(restored[0])
+        let slot1 = try #require(restored[1])
+        #expect(maxAbsDifference(slot0, try #require(batched[0])) == 0)
+        #expect(maxAbsDifference(slot1, try #require(batched[1])) == 0)
+        #expect(restored.leftPaddingValues == [1, 0])
     }
 }
 
@@ -652,6 +680,11 @@ struct BatchMaskingTests {
         #expect(mask[1, 0, 0, 0].item(Bool.self) == false)
         #expect(mask[1, 0, 0, 1].item(Bool.self) == false)
         #expect(mask[1, 0, 2, 2].item(Bool.self) == true)
+        // The second padded position is what distinguishes padding 2 from
+        // padding 1: its own diagonal must be masked, and a later query must
+        // not attend the padded key either (causality alone would allow it).
+        #expect(mask[1, 0, 1, 1].item(Bool.self) == false)
+        #expect(mask[1, 0, 3, 1].item(Bool.self) == false)
     }
 
     @Test("Multi-token mask after rotation predicts the linearization trim")
@@ -719,4 +752,14 @@ private func makeDistinctKV(
 
 private func maxAbsDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
     abs(lhs.asType(.float32) - rhs.asType(.float32)).max().item(Float.self)
+}
+
+/// Single-row KV whose every key/value is stamped with its absolute position,
+/// so window-retention tests can assert which positions survived by content.
+private func makePositionKV(
+    positions: Range<Int>, heads: Int, headDim: Int
+) -> (MLXArray, MLXArray) {
+    let stamps = MLXArray(positions.map { Float($0) }).reshaped([1, 1, positions.count, 1])
+    let ones = MLXArray.ones([1, heads, positions.count, headDim])
+    return (ones * stamps, ones * (stamps + 100))
 }
