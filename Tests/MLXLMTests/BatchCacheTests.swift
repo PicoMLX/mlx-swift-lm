@@ -156,17 +156,23 @@ struct BatchKVCacheCoverageTests {
         _ = rotating.update(keys: kv.0, values: kv.1)
         #expect(rotating.trim(2) == 1)
         #expect(rotating.batchOffsets.asArray(Int32.self) == [0, 2])
+        // Same extractability check the non-rotating variant makes above: a
+        // trim that moves the offsets but leaves stale per-row padding makes
+        // the emptied shortest row slice an invalid range.
+        #expect(rotating.extract(idx: 0).offset == 0)
     }
 
     @Test("makeMask honours left padding during decode")
-    func makeMaskUsesLeftPaddingDuringDecode() {
+    func makeMaskUsesLeftPaddingDuringDecode() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
         let mode = cache.makeMask(n: 2, windowSize: nil, returnArray: false)
 
         switch mode {
         case .array(let mask):
-            #expect(mask.dim(0) == 3)
-            #expect(mask.dim(2) == 2)
+            // #require, not #expect: a one-row regression would otherwise
+            // continue into the row-1 subscripts below and trap in MLX.
+            try #require(mask.dim(0) == 3)
+            try #require(mask.dim(2) == 2)
             // Row 0/1 left-padded slot 0 is masked out.
             #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
             #expect(mask[1, 0, 0, 0].item(Bool.self) == false)
@@ -272,6 +278,12 @@ struct BatchRotatingKVCacheCoverageTests {
         // layout may rotate.
         let retained = keys[0, 0, 0..., 0].asArray(Float.self).sorted()
         #expect(retained == [0, 1, 3, 4])
+        // Values ride the same eviction: a rotate that keeps the right keys
+        // but leaves stale or misordered values feeds corrupted values to
+        // attention (makePositionKV stamps them at +100).
+        let values = try #require(extracted.state.last)
+        let retainedValues = values[0, 0, 0..., 0].asArray(Float.self).sorted()
+        #expect(retainedValues == [100, 101, 103, 104])
     }
 
     @Test("isTrimmable(after:) predicts window overflow")
@@ -299,8 +311,11 @@ struct BatchRotatingKVCacheCoverageTests {
         cache.prepare(lengths: [3, 5], rightPadding: [2, 0])
 
         // Position-stamped so post-finalize extraction is checkable by
-        // content, not just by cleared metadata.
-        let kv = makePositionKV(positions: 0 ..< 5, heads: 2, headDim: 4, batchSize: 2)
+        // content, and row-strided so the rows are distinguishable: with
+        // identical stamps a finalize that swapped or copied one row's state
+        // into the other would still produce the expected sequences.
+        let kv = makePositionKV(
+            positions: 0 ..< 5, heads: 2, headDim: 4, batchSize: 2, rowStride: 10)
         _ = cache.update(keys: kv.0, values: kv.1)
         #expect(cache._lengths != nil)
 
@@ -319,12 +334,13 @@ struct BatchRotatingKVCacheCoverageTests {
         let row0Values = try #require(row0.state.last)
         #expect(row0Values[0, 0, 0..., 0].asArray(Float.self) == [100, 101, 102])
 
+        // Row 1 carries its own stamps (+10), so a row swap is visible.
         let row1 = cache.extract(idx: 1)
         #expect(row1.offset == 5)
         let row1Keys = try #require(row1.state.first)
-        #expect(row1Keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 2, 3, 4])
+        #expect(row1Keys[0, 0, 0..., 0].asArray(Float.self) == [10, 11, 12, 13, 14])
         let row1Values = try #require(row1.state.last)
-        #expect(row1Values[0, 0, 0..., 0].asArray(Float.self) == [100, 101, 102, 103, 104])
+        #expect(row1Values[0, 0, 0..., 0].asArray(Float.self) == [110, 111, 112, 113, 114])
     }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
@@ -540,8 +556,14 @@ struct BatchedCacheFactoryTests {
         let simple = try #require(extracted as? KVCacheSimple)
         let extractedKeys = try #require(simple.state.first)
         #expect(maxAbsDifference(extractedKeys, MLXArray.ones(extractedKeys.shape) * 2) == 0)
-        // advanceBatched is a no-op for full attention; just confirm it is callable.
+        // advanceBatched is a no-op for full attention — and must stay one:
+        // `PrefillBatch.prompt` calls it after every chunk, so a witness that
+        // shifted offsets or state would move subsequent attention positions.
+        let offsetsBefore = batch.batchOffsets.asArray(Int32.self)
+        let paddingBefore = batch.leftPadding.asArray(Int32.self)
         cache.advanceBatched(1)
+        #expect(batch.batchOffsets.asArray(Int32.self) == offsetsBefore)
+        #expect(batch.leftPadding.asArray(Int32.self) == paddingBefore)
     }
 }
 
@@ -639,6 +661,9 @@ struct BatchedSSMCacheTests {
         let slot0 = try #require(empty[0])
         #expect(slot0.dim(0) == 2)
         #expect(maxAbsDifference(slot0, try #require(populated[0])) == 0)
+        // Metadata has to grow with the tensor, or scheduling and later
+        // filtering see a different batch size than the recurrent state.
+        #expect(empty.batchSize == 2)
     }
 
     @Test("BatchedCacheList preserves nested topology")
@@ -676,6 +701,13 @@ struct BatchedSSMCacheTests {
         let rotChild = try #require(childList[1] as? RotatingKVCache)
         let rotKeys = try #require(rotChild.state.first)
         #expect(maxAbsDifference(rotKeys, MLXArray.ones(rotKeys.shape) * 2) == 0)
+        // Values too, from both children: a filter that selects row 1's keys
+        // while retaining row 0's values would let the surviving hybrid
+        // request attend another request's history (row 1 values are 20).
+        let simpleValues = try #require(simple.state.last)
+        #expect(maxAbsDifference(simpleValues, MLXArray.ones(simpleValues.shape) * 20) == 0)
+        let rotValues = try #require(rotChild.state.last)
+        #expect(maxAbsDifference(rotValues, MLXArray.ones(rotValues.shape) * 20) == 0)
     }
 
     @Test("BatchedCacheList delegates makeMask to its attention child")
@@ -718,6 +750,18 @@ struct BatchedSSMCacheTests {
         #expect(maxAbsDifference(slot0, MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])) == 0)
         let slot1 = try #require(typed[1])
         #expect(maxAbsDifference(slot1, MLXArray(8 ..< 12).asType(.float32).reshaped([1, 4])) == 0)
+
+        // Row 1 as well: an extract that ignored its index argument and always
+        // returned row 0 would pass every assertion above while handing the
+        // engine another request's recurrent state.
+        let extractedSecond = try #require(mamba.extract(1) as? MambaCache)
+        let secondSlot0 = try #require(extractedSecond[0])
+        #expect(
+            maxAbsDifference(secondSlot0, MLXArray(4 ..< 8).asType(.float32).reshaped([1, 4])) == 0)
+        let secondSlot1 = try #require(extractedSecond[1])
+        #expect(
+            maxAbsDifference(secondSlot1, MLXArray(12 ..< 16).asType(.float32).reshaped([1, 4]))
+                == 0)
     }
 }
 
@@ -910,6 +954,10 @@ struct BatchMaskingTests {
         // The pre-existing single-token behavior is unchanged: row 1 (no
         // padding) attends its whole window.
         #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
+        // Causality still holds within the update: key position 4 is the
+        // second query's own slot, so the first query must not attend it. An
+        // all-true array of the right width would pass every check above.
+        #expect(mask[0, 0, 0, 4].item(Bool.self) == false)
     }
 }
 
@@ -948,10 +996,18 @@ private func maxAbsDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
 
 /// KV whose every key/value is stamped with its absolute position, so
 /// window-retention tests can assert which positions survived by content.
+/// `rowStride` offsets each batch row's stamps so multi-row tests can also
+/// tell the rows apart — without it every row carries identical values and a
+/// cache that swaps or copies rows passes unnoticed.
 private func makePositionKV(
-    positions: Range<Int>, heads: Int, headDim: Int, batchSize: Int = 1
+    positions: Range<Int>, heads: Int, headDim: Int, batchSize: Int = 1,
+    rowStride: Float = 0
 ) -> (MLXArray, MLXArray) {
-    let stamps = MLXArray(positions.map { Float($0) }).reshaped([1, 1, positions.count, 1])
+    var stampValues = [Float]()
+    for row in 0 ..< batchSize {
+        stampValues.append(contentsOf: positions.map { Float($0) + Float(row) * rowStride })
+    }
+    let stamps = MLXArray(stampValues).reshaped([batchSize, 1, positions.count, 1])
     let ones = MLXArray.ones([batchSize, heads, positions.count, headDim])
     return (ones * stamps, ones * (stamps + 100))
 }
