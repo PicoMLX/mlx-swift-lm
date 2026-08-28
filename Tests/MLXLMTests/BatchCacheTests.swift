@@ -433,7 +433,8 @@ struct BatchedCacheFactoryTests {
         probe.metaState = meta
 
         let factories = try makeBatchedCacheFactories(for: [probe])
-        let produced = try #require(factories[0]([0]) as? BatchRotatingKVCache)
+        let factory = try #require(factories.first)
+        let produced = try #require(factory([0]) as? BatchRotatingKVCache)
         // `extract` only writes metaState for a populated cache, so fill one
         // row before asking what provenance comes back.
         let kv = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 1)
@@ -444,7 +445,8 @@ struct BatchedCacheFactoryTests {
 
         // A model-native probe still yields model-native rows.
         let native = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 0)])
-        let nativeProduced = try #require(native[0]([0]) as? BatchRotatingKVCache)
+        let nativeFactory = try #require(native.first)
+        let nativeProduced = try #require(nativeFactory([0]) as? BatchRotatingKVCache)
         _ = nativeProduced.update(keys: kv.0, values: kv.1)
         let nativeMeta = nativeProduced.extract(idx: 0).metaState
         try #require(nativeMeta.count == 6)
@@ -558,7 +560,8 @@ struct BatchedSSMCacheTests {
         // stops excluding right padding and mask-aware mixers commit padding
         // tokens into their recurrent state.
         let factories = try makeBatchedCacheFactories(for: [MambaCache()])
-        let cache = try #require(factories[0]([0, 0]) as? MambaCache)
+        let factory = try #require(factories.first)
+        let cache = try #require(factory([0, 0]) as? MambaCache)
         cache.prepare(lengths: [1, 2])
 
         let values = try #require(cache.makeMask(N: 2)).asArray(Bool.self)
@@ -573,7 +576,8 @@ struct BatchedSSMCacheTests {
         // `extend` would synthesize a phantom zero-filled row when allocating
         // the "missing" left-hand state.
         let factories = try makeBatchedCacheFactories(for: [MambaCache()])
-        let empty = try #require(factories[0]([]) as? MambaCache)
+        let factory = try #require(factories.first)
+        let empty = try #require(factory([]) as? MambaCache)
         #expect(empty.batchSize == 0)
 
         let populated = MambaCache()
@@ -586,7 +590,8 @@ struct BatchedSSMCacheTests {
     func batchedCacheListNested() throws {
         let factories = try makeBatchedCacheFactories(
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
-        let composite = factories[0]([0, 0])
+        let factory = try #require(factories.first)
+        let composite = factory([0, 0])
         let list = try #require(composite as? BatchedCacheList)
         // Give BOTH children two distinguishable rows so a filter that only
         // reaches one child is visible below (makeDistinctKV keys row i with
@@ -620,7 +625,8 @@ struct BatchedSSMCacheTests {
         // attention child's left-padding mask, not BaseKVCache's `.none`.
         let factories = try makeBatchedCacheFactories(
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
-        let composite = factories[0]([1, 0])
+        let factory = try #require(factories.first)
+        let composite = factory([1, 0])
 
         let mode = composite.makeMask(n: 1, windowSize: nil, returnArray: false)
         switch mode {
