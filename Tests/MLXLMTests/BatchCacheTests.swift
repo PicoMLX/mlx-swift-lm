@@ -14,7 +14,7 @@ import Testing
 struct BatchKVCacheCoverageTests {
 
     @Test("Lifecycle covers update, filter, extend, and extract")
-    func lifecycleRoundTrip() {
+    func lifecycleRoundTrip() throws {
         // Zero-padding here so this test exercises lifecycle bookkeeping, not
         // left-padding normalization (padding behavior is covered elsewhere).
         let cache = BatchKVCache(leftPadding: [0, 0])
@@ -41,6 +41,15 @@ struct BatchKVCacheCoverageTests {
         let extractedSecond = cache.extract(idx: 1)
         #expect(extractedFirst.offset == 3)
         #expect(extractedSecond.offset == 2)
+
+        // The appended row's actual tensors, not just bookkeeping: an extend
+        // that fixed offsets and padding while duplicating or zero-filling
+        // the appended state would pass every check above and silently attach
+        // the wrong history to an admitted request.
+        let appendedKeys = try #require(extractedSecond.state.first)
+        #expect(maxAbsDifference(appendedKeys, extensionKV.0) == 0)
+        let appendedValues = try #require(extractedSecond.state.last)
+        #expect(maxAbsDifference(appendedValues, extensionKV.1) == 0)
     }
 
     @Test("Filter during a ragged prefill keeps transient right-padding consistent")
@@ -106,6 +115,11 @@ struct BatchKVCacheCoverageTests {
         #expect(restored.offset == single.offset)
         #expect(restoredKeys.shape == originalKeys.shape)
         #expect(maxAbsDifference(restoredKeys, originalKeys) == 0)
+        // Values too: a round trip that preserves keys but drops or swaps the
+        // value tensor changes every subsequent attention output.
+        let restoredValues = try #require(restored.state.last)
+        let originalValues = try #require(single.state.last)
+        #expect(maxAbsDifference(restoredValues, originalValues) == 0)
     }
 
     @Test("trim clamps to the shortest row of an unequal batch")
@@ -330,7 +344,7 @@ struct BatchRotatingKVCacheCoverageTests {
     }
 
     @Test("Extracting a row that never prefilled still restores its metadata")
-    func extractRestoresMetadataForEmptyRow() {
+    func extractRestoresMetadataForEmptyRow() throws {
         // A row can be extracted before its first update — early cancellation,
         // or an admitted row that never prefilled. It still has to carry the
         // window, keep prefix and capacity provenance: a default-labelled
@@ -342,10 +356,13 @@ struct BatchRotatingKVCacheCoverageTests {
 
         for row in 0 ..< 2 {
             let extracted = cache.extract(idx: row)
-            #expect(extracted.metaState.count == 6)
-            #expect(extracted.metaState[0] == "4")   // keep
-            #expect(extracted.metaState[1] == "16")  // maxSize
-            #expect(extracted.metaState[5] == "requested")
+            let meta = extracted.metaState
+            // #require: a shorter representation should fail the test, not
+            // trap the suite on the subscripts below.
+            try #require(meta.count == 6)
+            #expect(meta[0] == "4")   // keep
+            #expect(meta[1] == "16")  // maxSize
+            #expect(meta[5] == "requested")
             // Nothing was written, so the row starts from zero rather than from
             // its negative pre-prefill batch offset.
             #expect(extracted.offset == 0)
@@ -364,7 +381,10 @@ struct BatchedCacheFactoryTests {
         #expect(simple[0]([0, 0]) is BatchKVCache)
 
         let rotating = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16)])
-        #expect(rotating[0]([0]) is BatchRotatingKVCache)
+        let producedRotating = try #require(rotating[0]([0]) as? BatchRotatingKVCache)
+        // The window must come from the probe, not a default: a hard-coded
+        // maxSize would make the engine retain the wrong number of tokens.
+        #expect(producedRotating.maxSize == 16)
 
         let arrays = try makeBatchedCacheFactories(for: [ArraysCache(size: 2)])
         let arraysCache = arrays[0]([0])
@@ -567,6 +587,11 @@ struct BatchedSSMCacheTests {
         switch mode {
         case .array(let mask):
             #expect(mask.dim(0) == 2)
+            // Delegation semantics, not just shape: the child's [1, 0]
+            // padding must survive — row 0's padded slot masked, row 1's
+            // attendable. Any two-row array would pass the dim check alone.
+            #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+            #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
         case .arrays, .causal, .none:
             Issue.record("BatchedCacheList should delegate to the batched attention child")
         }
