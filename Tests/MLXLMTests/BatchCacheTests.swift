@@ -191,7 +191,7 @@ struct BatchKVCacheCoverageTests {
 struct BatchRotatingKVCacheCoverageTests {
 
     @Test("Lifecycle covers update, filter, extend, and extract with keep > 0")
-    func lifecycleRoundTrip() {
+    func lifecycleRoundTrip() throws {
         let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0, 0], keep: 2)
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
         _ = cache.update(keys: keys, values: values)
@@ -214,6 +214,15 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(extractedSecond.offset == 2)
         // `keep` is exposed on the batched cache (RotatingKVCache.keep is private).
         #expect(cache.keep == 2)
+
+        // The appended row's actual tensors: an extend that fixed the
+        // bookkeeping while duplicating or zero-filling the appended state
+        // would pass every check above and become another request's
+        // attention history.
+        let appendedKeys = try #require(extractedSecond.state.first)
+        #expect(maxAbsDifference(appendedKeys, extensionKV.0) == 0)
+        let appendedValues = try #require(extractedSecond.state.last)
+        #expect(maxAbsDifference(appendedValues, extensionKV.1) == 0)
     }
 
     @Test("Overflow keeps the sliding window and preserves keep")
@@ -480,10 +489,11 @@ struct BatchedCacheFactoryTests {
 struct BatchedSSMCacheTests {
 
     @Test("ArraysCache conforms to the BatchedCache lifecycle")
-    func arraysCacheBatchedLifecycle() {
+    func arraysCacheBatchedLifecycle() throws {
         let mamba = MambaCache(leftPadding: [0, 0])
-        mamba[0] = MLXArray.ones([2, 4])
-        mamba[1] = MLXArray.ones([2, 4])
+        // Distinguishable rows, so filtering is checkable by content below.
+        mamba[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        mamba[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
 
         let cache: any BatchedCache = mamba
         cache.prepareBatched(leftPadding: nil, lengths: [3, 5], rightPadding: nil)
@@ -495,6 +505,13 @@ struct BatchedSSMCacheTests {
 
         cache.filterBatched(batchIndices: MLXArray([Int32(0)]))
         #expect(mamba.batchSize == 1)
+        // The recurrent tensors themselves shrink to the selected row:
+        // filtering only the metadata would hand a one-row input two-row
+        // SSM state on the next model call.
+        let slot0 = try #require(mamba[0])
+        #expect(maxAbsDifference(slot0, MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])) == 0)
+        let slot1 = try #require(mamba[1])
+        #expect(maxAbsDifference(slot1, MLXArray(8 ..< 12).asType(.float32).reshaped([1, 4])) == 0)
     }
 
     @Test("advanceBatched leaves recurrent padding metadata to the model")
@@ -557,21 +574,29 @@ struct BatchedSSMCacheTests {
             for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))])
         let composite = factories[0]([0, 0])
         let list = try #require(composite as? BatchedCacheList)
-        // Give the attention child two distinguishable rows so a no-op
-        // filter is visible below (makeDistinctKV keys row i with i+1).
+        // Give BOTH children two distinguishable rows so a filter that only
+        // reaches one child is visible below (makeDistinctKV keys row i with
+        // i+1); a composite with inconsistent child cardinalities selects
+        // the wrong request or fails on later extraction.
         let attention = try #require(list[0] as? BatchKVCache)
+        let rotating = try #require(list[1] as? BatchRotatingKVCache)
         let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
         _ = attention.update(keys: keys, values: values)
+        _ = rotating.update(keys: keys, values: values)
 
         // Filtering routes through each child without flattening the
         // topology — and actually shrinks it: keep only row 1.
         list.filterBatched(batchIndices: MLXArray([Int32(1)]))
         #expect(attention.batchSize == 1)
+        #expect(rotating.batchSize == 1)
         let extracted = list.extractBatched(0)
         let childList = try #require(extracted as? CacheList)
         let simple = try #require(childList[0] as? KVCacheSimple)
         let extractedKeys = try #require(simple.state.first)
         #expect(maxAbsDifference(extractedKeys, MLXArray.ones(extractedKeys.shape) * 2) == 0)
+        let rotChild = try #require(childList[1] as? RotatingKVCache)
+        let rotKeys = try #require(rotChild.state.first)
+        #expect(maxAbsDifference(rotKeys, MLXArray.ones(rotKeys.shape) * 2) == 0)
     }
 
     @Test("BatchedCacheList delegates makeMask to its attention child")
@@ -598,14 +623,21 @@ struct BatchedSSMCacheTests {
     }
 
     @Test("extract preserves the MambaCache subtype")
-    func extractPreservesMambaSubtype() {
+    func extractPreservesMambaSubtype() throws {
         let mamba = MambaCache(leftPadding: [0, 0])
-        mamba[0] = MLXArray.ones([2, 4])
-        mamba[1] = MLXArray.ones([2, 4])
+        // Distinguishable rows: extraction that picks the wrong row or
+        // zero-fills would corrupt subsequent SSM generation while passing a
+        // subtype-and-slot-count check.
+        mamba[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        mamba[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
 
         let extracted = mamba.extract(0)
-        #expect(extracted is MambaCache)
-        #expect(extracted.slotCount == 2)
+        let typed = try #require(extracted as? MambaCache)
+        #expect(typed.slotCount == 2)
+        let slot0 = try #require(typed[0])
+        #expect(maxAbsDifference(slot0, MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])) == 0)
+        let slot1 = try #require(typed[1])
+        #expect(maxAbsDifference(slot1, MLXArray(8 ..< 12).asType(.float32).reshaped([1, 4])) == 0)
     }
 }
 
@@ -716,7 +748,9 @@ struct BatchCacheSerializationTests {
         try savePromptCache(url: url, cache: [batched])
 
         let (loaded, _) = try loadPromptCache(url: url)
-        let restored = try #require(loaded[0] as? MambaCache)
+        // `loaded.first`, not `loaded[0]`: an empty restored array should
+        // fail the #require, not trap before it can record the failure.
+        let restored = try #require(loaded.first as? MambaCache)
         // Contents and batch metadata, not just shapes: state restored with
         // the right dimensions but wrong values would corrupt every
         // subsequent generation silently.
