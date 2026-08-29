@@ -17,6 +17,31 @@ private func create<C: Codable, M>(
     }
 }
 
+private struct ArchitectureConfiguration: Decodable {
+    var architectures: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case architectures
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        architectures = try container.decodeIfPresent([String].self, forKey: .architectures) ?? []
+    }
+}
+
+private func createQwen3CompatibleModel(configuration data: Data) throws -> any LanguageModel {
+    let architecture = try JSONDecoder.json5().decode(ArchitectureConfiguration.self, from: data)
+    let configuration = try JSONDecoder.json5().decode(Qwen3Configuration.self, from: data)
+    try configuration.validateModelConfiguration()
+
+    if architecture.architectures.contains("JinaForRanking") {
+        return JinaRerankerModel(configuration)
+    }
+
+    return Qwen3Model(configuration)
+}
+
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
@@ -39,7 +64,7 @@ public enum LLMTypeRegistry {
         "gemma4_unified": create(Gemma4Configuration.self, Gemma4Model.init),
         "gemma4_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
         "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
-        "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
+        "qwen3": createQwen3CompatibleModel,
         "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
         "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
@@ -54,6 +79,7 @@ public enum LLMTypeRegistry {
         "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
+        "helium": create(HeliumConfiguration.self, HeliumModel.init),
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
@@ -317,6 +343,10 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let jina_reranker_v3_mlx = ModelConfiguration(
+        id: "jinaai/jina-reranker-v3-mlx"
+    )
+
     static public let qwen3MoE_30b_a3b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3-30B-A3B-4bit",
         defaultPrompt: "Why is the sky blue?",
@@ -363,6 +393,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         id: "mlx-community/Llama-3.2-3B-Instruct-4bit",
         defaultPrompt: "What is the difference between a fruit and a vegetable?",
         extraEOSTokens: ["<|eot_id|>"]
+    )
+
+    static public let helium_1_2b_4bit = ModelConfiguration(
+        id: "mlx-community/helium-1-preview-2b-4bit",
+        defaultPrompt: "Why is the sky blue?"
     )
 
     static public let deepseek_r1_4bit = ModelConfiguration(
@@ -500,6 +535,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             hy_mt2_7b_8bit,
             granite3_3_2b_4bit,
             granite_4_0_h_tiny_4bit_dwq,
+            helium_1_2b_4bit,
             llama3_1_8B_4bit,
             llama3_2_1B_4bit,
             llama3_2_3B_4bit,
@@ -517,6 +553,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_1_7b_4bit,
             qwen3_4b_4bit,
             qwen3_8b_4bit,
+            jina_reranker_v3_mlx,
             qwen3MoE_30b_a3b_4bit,
             qwen3_5_2b_4bit,
             qwen3_6_27b_4bit,
@@ -695,7 +732,8 @@ public final class LLMModelFactory: GenericModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            weightFileSelection: configuration.weightFileSelection)
 
         let tokenizer = try await tokenizerTask
 

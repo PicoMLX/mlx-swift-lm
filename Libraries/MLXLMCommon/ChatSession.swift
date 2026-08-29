@@ -1053,6 +1053,9 @@ public final class ChatSession {
 
                         var reusedMainCacheWithoutDraft = false
                         var requiresMainOnlyContinuation = false
+                        // Prompt tokens this turn does not prefill because the cache
+                        // already represents them. Reported to the caller on `.info`.
+                        var cachedPromptTokenCount = 0
                         // Read off the prepared input, not `input`: the latter may be narrowed to
                         // a token-only suffix below, which would hide media the model still sees.
                         let carriesPreparedMedia =
@@ -1132,10 +1135,12 @@ public final class ChatSession {
                             case .appendSuffix(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                cachedPromptTokenCount = suffixStart
 
                             case .appendSuffixToMain(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                cachedPromptTokenCount = suffixStart
                                 // The draft does not represent the same private
                                 // Harmony path. Preserve the authoritative main
                                 // cache and use it alone for this continuation.
@@ -1146,6 +1151,7 @@ public final class ChatSession {
                                 input = LMInput(
                                     tokens: MLXArray(
                                         Array(promptTokenIds.dropFirst(commonPrefixLength))))
+                                cachedPromptTokenCount = commonPrefixLength
 
                             case .rebuild:
                                 kvCache = KVCacheStorage(
@@ -1279,6 +1285,7 @@ public final class ChatSession {
                                         draftKVCache = nil
                                         lmState = nil
                                         input = preparedInput
+                                        cachedPromptTokenCount = 0
                                     }
 
                                     // Allocate the draft KV cache once and reuse it across turns,
@@ -1329,6 +1336,7 @@ public final class ChatSession {
                         var assistant = AssistantGeneration()
 
                         for await item in generation.stream {
+                            let item = item.attributingCachedPromptTokens(cachedPromptTokenCount)
                             assistant.consume(item)
 
                             // collect tool calls for dispatch; if no

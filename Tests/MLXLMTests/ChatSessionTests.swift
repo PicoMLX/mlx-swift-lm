@@ -640,6 +640,36 @@ public class ChatSessionTests: XCTestCase {
             fullSecondPromptLength - firstPromptLength - 3)
     }
 
+    func testCompletionInfoAttributesReusedCachePrefix() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        let first = try await collectGeneration(session.streamDetails(to: "first"))
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        XCTAssertEqual(first.info.cachedPromptTokenCount, 0)
+        XCTAssertEqual(first.info.totalPromptTokenCount, firstPromptLength)
+        XCTAssertEqual(first.info.cacheEfficiency, 0)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLength = await lengthIterator.next()
+        let fullSecondPromptLength = try XCTUnwrap(secondRenderedLength)
+
+        // The reused prefix is the first prompt plus the tokens it generated.
+        XCTAssertEqual(second.info.cachedPromptTokenCount, firstPromptLength + 3)
+        XCTAssertEqual(second.info.totalPromptTokenCount, fullSecondPromptLength)
+        XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
+    }
+
     func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()

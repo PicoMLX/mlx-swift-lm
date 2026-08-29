@@ -562,7 +562,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         load: @escaping ContainerLoader
     ) {
         self.configuration = configuration
-        self.capabilities = LanguageModelCapabilities(capabilities: capabilities)
+        self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.weightsLocation = weightsLocation
         self.load = load
@@ -683,7 +683,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             enum Destination: Sendable { case response, reasoning }
             case appendText(String, entryID: String?, destination: Destination)
             case toolCall(id: String, name: String, arguments: String)
-            case updateMetadata([String: any Sendable & Codable & Equatable], entryID: String?)
+            case updateMetadata(
+                [String: any ConvertibleToGeneratedContent & Sendable], entryID: String?)
             case updateUsage(
                 input: LanguageModelExecutorGenerationChannel.Usage.Input,
                 output: LanguageModelExecutorGenerationChannel.Usage.Output,
@@ -711,7 +712,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         }
 
         static func emitMetadata(
-            _ values: [String: any Sendable & Codable & Equatable], entryID: String?,
+            _ values: [String: any ConvertibleToGeneratedContent & Sendable], entryID: String?,
             into channel: LanguageModelExecutorGenerationChannel
         ) async {
             generationObserver?(.updateMetadata(values, entryID: entryID))
@@ -1661,8 +1662,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             guard let info = result.completionInfo else { return }
             await Self.emitUsage(
                 input: .init(
-                    totalTokenCount: info.promptTokenCount,
-                    cachedTokenCount: 0),
+                    totalTokenCount: info.totalPromptTokenCount,
+                    cachedTokenCount: info.cachedPromptTokenCount),
                 output: .init(
                     totalTokenCount: info.generationTokenCount,
                     reasoningTokenCount: min(
@@ -1796,12 +1797,15 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         text: text, entryID: entryID, destination: .response, into: channel)
                 case .info(let info):
                     // MLX-LM emits one .info event at end-of-generation with
-                    // authoritative scalar token counts (`promptTokenCount`
-                    // is the prompt; `generationTokenCount` is the
-                    // model-generated completion -- see Evaluate.swift's
+                    // authoritative scalar token counts (`totalPromptTokenCount`
+                    // is the rendered prompt, of which `cachedPromptTokenCount`
+                    // came from a reused KV-cache prefix; `generationTokenCount`
+                    // is the model-generated completion -- see Evaluate.swift's
                     // `GenerateCompletionInfo` definition).
                     await Self.emitUsage(
-                        input: .init(totalTokenCount: info.promptTokenCount, cachedTokenCount: 0),
+                        input: .init(
+                            totalTokenCount: info.totalPromptTokenCount,
+                            cachedTokenCount: info.cachedPromptTokenCount),
                         output: .init(
                             totalTokenCount: info.generationTokenCount, reasoningTokenCount: 0),
                         entryID: entryID, into: channel)
@@ -2000,7 +2004,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 // so we must not also rely on per-delta auto-summing). The
                 // reasoning count is clamped to never exceed the total.
                 await Self.emitUsage(
-                    input: .init(totalTokenCount: info.promptTokenCount, cachedTokenCount: 0),
+                    input: .init(
+                        totalTokenCount: info.totalPromptTokenCount,
+                        cachedTokenCount: info.cachedPromptTokenCount),
                     output: .init(
                         totalTokenCount: info.generationTokenCount,
                         reasoningTokenCount: min(reasoningTokenCount, info.generationTokenCount)),

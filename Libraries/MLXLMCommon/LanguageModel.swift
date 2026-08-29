@@ -17,6 +17,26 @@ public protocol BaseLanguageModel: Module {
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
+/// Weight files a model needs that no naming convention or `model.safetensors.index.json`
+/// selects.
+///
+/// A checkpoint can ship weights in a file that neither the conventional `model*.safetensors`
+/// names nor its own index cover: `jinaai/jina-reranker-v3-mlx` keeps its reranking head in
+/// `projector.safetensors` and maps only the transformer shards in its index, so the head is
+/// never read and the model fails to load. The reference implementation has the same gap and
+/// closes it the same way -- the checkpoint's `rerank.py` loads that file by name.
+///
+/// Conform a model to this protocol to name those files. Being explicit rather than widening
+/// the selection is what keeps unrelated weights out: a stray tensor whose name a model's
+/// `sanitize(weights:)` rewrites is loaded silently rather than reported.
+public protocol AdditionalWeightFilesProviding {
+    /// File names, relative to the model directory.
+    ///
+    /// They are loaded after the selected weight files, so a file that is already selected is
+    /// not loaded twice, and names that are not present are ignored.
+    var additionalWeightFiles: [String] { get }
+}
+
 /// Optional metadata a model wants written into converted safetensors.
 ///
 /// Model-specific metadata lets future loaders distinguish transformed MLX-native
@@ -288,6 +308,14 @@ public enum PrepareResult {
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
+    /// Build derived state after checkpoint or adapter topology updates and
+    /// before the model is used for inference.
+    ///
+    /// Implementations may materialize arrays or replace storage-sharing
+    /// module views. The library invokes this lifecycle hook while it has
+    /// exclusive access to the model; inference calls must remain read-only.
+    func prepare() throws
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// `state` is the ``LMOutput/state`` a caller carried over from earlier
@@ -347,6 +375,9 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    /// Most language models have no derived inference state to prepare.
+    public func prepare() throws {}
+
     @available(
         *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
         message:

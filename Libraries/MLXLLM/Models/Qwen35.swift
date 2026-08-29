@@ -12,109 +12,6 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// MARK: - Fused router top-k
-
-/// One-kernel replacement for the decode router tail: `chainRouterTopK`
-/// fully sorts all `E` experts (`ArgPartition::eval_gpu` delegates to
-/// `gpu_merge_sort`) just to name `K` — three serial dispatches, three
-/// encoder-wide barriers, where barrier-bound decode needs one.
-///
-/// Bit-identical to the chain by construction: the sort is stable
-/// (`sort.h`'s `LessThan` compares values only, ties keep input order), so
-/// counting the elements ranked strictly above `i` — with the index packed
-/// into the low bits of a monotone bit key as the tie-break — reproduces
-/// each winner's slot. `±0.0` normalises to one bit pattern (they compare
-/// equal but differ bitwise), NaN maps above `+inf` (all NaNs tie), and the
-/// sum accumulates sequentially in the output dtype from zero, in slot
-/// order, matching `reduce.metal`'s `thread_reduce`.
-private let routerTopKSource = """
-    uint row = threadgroup_position_in_grid.y;
-    uint t = thread_position_in_threadgroup.x;
-
-    threadgroup ulong sk[E_];
-    threadgroup float top_v[K_];
-
-    float v = static_cast<float>(gates[row * E_ + t]);
-    uint b = (v == 0.0f) ? 0u : as_type<uint>(v);
-    uint mono = isnan(v) ? 0xFFFFFFFFu : (b ^ ((uint)(((int)b) >> 31) | 0x80000000u));
-    ulong key = (((ulong)mono) << 32) | (ulong)t;
-    sk[t] = key;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    int above = 0;
-    for (uint j = 0; j < E_; ++j) {
-        above += (sk[j] > key) ? 1 : 0;
-    }
-    if (above < K_) {
-        top_v[K_ - 1 - above] = v;
-        inds[row * K_ + (K_ - 1 - above)] = t;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (t == 0) {
-        T acc = static_cast<T>(0);
-        for (int q = 0; q < K_; ++q) {
-            acc = static_cast<T>(top_v[q]) + acc;
-        }
-        for (int q = 0; q < K_; ++q) {
-            T s = static_cast<T>(top_v[q]);
-            scores[row * K_ + q] = NORM_ ? (s / acc) : s;
-        }
-    }
-    """
-
-private final class RouterTopKKernel: Sendable {
-    static let shared = RouterTopKKernel()
-    let kernel: MLXFast.MLXFastKernel
-
-    private init() {
-        kernel = MLXFast.metalKernel(
-            name: "router_topk_norm",
-            inputNames: ["gates"],
-            outputNames: ["inds", "scores"],
-            source: routerTopKSource
-        )
-    }
-}
-
-/// Metal's threads-per-threadgroup ceiling; one thread per expert, so past
-/// this the dispatch is invalid, not just slow.
-private let maxFusedRouterExperts = 1024
-
-/// Top-`k` + optional normalisation over the last axis in one dispatch:
-/// `(indices, scores)` shaped `[..., k]`, bit-identical to
-/// `chainRouterTopK`, `uint32` indices included. One threadgroup per row
-/// with an `O(E²)` rank count — callers gate this on the single-row decode
-/// case. Internal so the bitwise test can reach it.
-func fusedRouterTopK(_ gates: MLXArray, k: Int, normalize: Bool) -> (MLXArray, MLXArray) {
-    let e = gates.dim(-1)
-    let rows = gates.size / e
-    let shape = Array(gates.shape.dropLast()) + [k]
-    let out = RouterTopKKernel.shared.kernel(
-        [gates],
-        template: [
-            ("T", gates.dtype), ("E_", e), ("K_", k), ("NORM_", normalize ? 1 : 0),
-        ],
-        grid: (e, rows, 1),
-        threadGroup: (e, 1, 1),
-        outputShapes: [shape, shape],
-        outputDTypes: [.uint32, gates.dtype]
-    )
-    return (out[0], out[1])
-}
-
-/// The three-dispatch router tail the fused kernel replaces — the prefill
-/// path, and the bitwise test's reference.
-func chainRouterTopK(_ gates: MLXArray, k: Int, normalize: Bool) -> (MLXArray, MLXArray) {
-    let kth = gates.dim(-1) - k
-    let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
-    var scores = MLX.takeAlong(gates, inds, axis: -1)
-    if normalize {
-        scores = scores / scores.sum(axis: -1, keepDims: true)
-    }
-    return (inds, scores)
-}
-
 // MARK: - Configuration
 
 private enum RopeParametersCodingKey: String, CodingKey {
@@ -288,6 +185,11 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+    // Inference-only physical projection. The four registered modules remain
+    // as views so checkpoint, adapter, and parameter paths do not change.
+    private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
+    var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -334,6 +236,94 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let inputProjectionPrefixes = [
+            "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
+        ]
+        let replacesInputProjection = parameters.flattened().contains { key, _ in
+            inputProjectionPrefixes.contains(where: key.hasPrefix)
+        }
+        defer {
+            // Parameter updates are incremental and can throw after changing an
+            // earlier tensor. Invalidate on both success and failure so a stale
+            // physical projection can never remain published.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let replacesInputProjection =
+            key == "in_proj_qkv" || key == "in_proj_z"
+            || key == "in_proj_b" || key == "in_proj_a"
+        defer {
+            // This is conservative when the setter itself rejects the value,
+            // and necessary when a bulk update changed an earlier key first.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+    /// Build one physical quantized projection while retaining the four named
+    /// module paths as storage-sharing views. This runs at most once between
+    /// parameter/module updates; failed eligibility checks are not repeated on
+    /// every token. The model loader calls this before publishing the model;
+    /// forward passes never invoke it.
+    @discardableResult
+    func prepareFusedInputProjection() throws -> Bool {
+        try fusedInputProjection.prepare(
+            enabled: fusedInputProjectionEnabled,
+            linears: [
+                inProjQKV, inProjZ, inProjB, inProjA,
+            ]
+        ) { sourceViews in
+            try update(
+                modules: ModuleChildren(values: [
+                    "in_proj_qkv": .value(sourceViews[0]),
+                    "in_proj_z": .value(sourceViews[1]),
+                    "in_proj_b": .value(sourceViews[2]),
+                    "in_proj_a": .value(sourceViews[3]),
+                ]), verify: [])
+        }
+    }
+
+    func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
+        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+    ) {
+        guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+            return (
+                inProjQKV(inputs),
+                inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
+                inProjB(inputs),
+                inProjA(inputs)
+            )
+        }
+
+        let projected = fusedInProj(inputs)
+        let qkvEnd = keyDim * 2 + valueDim
+        let zEnd = qkvEnd + valueDim
+        let bEnd = zEnd + numVHeads
+        let aEnd = bEnd + numVHeads
+        return (
+            projected[0..., 0..., ..<qkvEnd],
+            projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                batch, sequence, numVHeads, headVDim),
+            projected[0..., 0..., zEnd ..< bEnd],
+            projected[0..., 0..., bEnd ..< aEnd]
+        )
     }
 
     func callAsFunction(
@@ -388,10 +378,7 @@ final class Qwen35GatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        var qkv = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        var (qkv, z, b, a) = projectInputs(x, batch: B, sequence: S)
 
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
@@ -678,37 +665,25 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
-        let (inds, scores) = routerTopK(gates, k: topK)
+        let (inds, scores) = moeRouterTopK(
+            gates, k: topK, normalize: normTopkProb)
 
-        let y = switchMLP(x, inds)
-        let combined = weightedExpertSum(y, scores)
+        let tokenCount = x.size / x.dim(-1)
+        let flatX = x.reshaped(tokenCount, x.dim(-1))
+        let flatIndices = inds.reshaped(tokenCount, topK)
+        let flatScores = scores.reshaped(tokenCount, topK)
+        let combined = switchMLP.callAndWeightedReduce(
+            flatX, flatIndices, weights: flatScores, fuseSortedReduction: true
+        ).reshaped(x.shape)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
 
         return combined + sharedY
     }
-
-    /// Decode (one row): the fused kernel, one dispatch instead of three
-    /// barriers, bit-identical. Prefill: the chain — many rows make the
-    /// `O(E²)` rank count the wrong shape, and there is no barrier to save.
-    private func routerTopK(_ gates: MLXArray, k: Int) -> (MLXArray, MLXArray) {
-        let e = gates.dim(-1)
-        if gates.size == e, e <= maxFusedRouterExperts {
-            return fusedRouterTopK(gates, k: k, normalize: normTopkProb)
-        }
-        return chainRouterTopK(gates, k: k, normalize: normTopkProb)
-    }
 }
 
 // MARK: - Decoder Layer
-
-/// Caches the compiled decode path can drive: their attention is the plain
-/// `cache.update` + SDPA route in `attentionWithCacheUpdate`. Quantized and
-/// turbo caches have their own routes and take the general path.
-private func hasPlainAttentionRoute(_ cache: KVCache) -> Bool {
-    !(cache is QuantizedKVCacheProtocol) && !(cache is TurboQuantKVCache)
-}
 
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
@@ -767,7 +742,7 @@ final class Qwen35DecoderLayer: Module {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
-            if !isLinear, let cache, hasPlainAttentionRoute(cache) {
+            if !isLinear, let cache, usesPlainAttentionCacheRoute(cache) {
                 return decodeAttentionLayer(x, mask: attentionMask, cache: cache)
             }
         }
@@ -927,9 +902,10 @@ public class Qwen35TextModelInner: Module {
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
 
-        let segments = Self.decodeSchedule(for: layers)
+        let segments = CompiledDecodeSegment.schedule(
+            linearLayers: layers.map(\.isLinear))
         self.decodeSegments = segments
-        self.compiledSegments = Array(repeating: nil, count: segments.count)
+        self.compiledSegments = CompiledDecodeSegmentCache(count: segments.count)
 
         super.init()
     }
@@ -983,38 +959,8 @@ public class Qwen35TextModelInner: Module {
     /// One traced piece of a decode step: the tail of the previous
     /// full-attention layer, a run of GDN layers, then the head of the next
     /// one (whose SDPA runs between this segment and the next).
-    private struct DecodeSegment {
-        var attentionPostLayer: Int?
-        var linearLayers: [Int] = []
-        var attentionPreLayer: Int?
-
-        /// First conv/recurrent state slot in the input list (after `x` and
-        /// any [attention, gate] pair).
-        var stateInputOffset: Int { attentionPostLayer == nil ? 1 : 3 }
-        /// First [queries, gate, keys, values] slot in the output list.
-        var attentionOutputOffset: Int { 1 + 2 * linearLayers.count }
-    }
-
-    private let decodeSegments: [DecodeSegment]
-    // Lock rationale: see Qwen35SparseMoeBlock.compileLock.
-    private let compileLock = NSLock()
-    private var compiledSegments: [(([MLXArray]) -> [MLXArray])?]
-
-    private static func decodeSchedule(for layers: [Qwen35DecoderLayer]) -> [DecodeSegment] {
-        var segments: [DecodeSegment] = []
-        var current = DecodeSegment()
-        for (i, layer) in layers.enumerated() {
-            if layer.isLinear {
-                current.linearLayers.append(i)
-            } else {
-                current.attentionPreLayer = i
-                segments.append(current)
-                current = DecodeSegment(attentionPostLayer: i)
-            }
-        }
-        segments.append(current)
-        return segments
-    }
+    private let decodeSegments: [CompiledDecodeSegment]
+    private let compiledSegments: CompiledDecodeSegmentCache
 
     /// Flat argument/result lists because `compile` takes `[MLXArray]`.
     /// In: `[x]` (token ids for segment 0), then `[attention, gate]` when
@@ -1079,7 +1025,7 @@ public class Qwen35TextModelInner: Module {
                 else { return nil }
                 mambaCaches[i] = mambaCache
             } else {
-                guard let kv = cache[i], hasPlainAttentionRoute(kv) else { return nil }
+                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else { return nil }
             }
         }
 
@@ -1094,16 +1040,11 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
 
-            compileLock.lock()
-            if compiledSegments[segmentIndex] == nil {
-                // [unowned self]: see Qwen35SparseMoeBlock.callAsFunction.
-                compiledSegments[segmentIndex] = compile { [unowned self] segmentArgs in
-                    segmentBody(at: segmentIndex, segmentArgs)
-                }
+            let outputs = compiledSegments.call(
+                at: segmentIndex, arguments: args
+            ) { [unowned self] segmentArgs in
+                segmentBody(at: segmentIndex, segmentArgs)
             }
-            let fn = compiledSegments[segmentIndex]!
-            compileLock.unlock()
-            let outputs = fn(args)
 
             carry = outputs[0]
             for (i, layerIndex) in segment.linearLayers.enumerated() {
@@ -1200,6 +1141,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // Full-attention layers honor maxKVSize; GDN / linear layers keep
             // a fixed recurrent state that cannot be token-windowed.
             return try makeAttentionKVCache(parameters: parameters)
+        }
+    }
+
+    public func prepare() throws {
+        for layer in model.layers {
+            if let linearAttn = layer.linearAttn {
+                _ = try linearAttn.prepareFusedInputProjection()
+            }
         }
     }
 
@@ -1302,6 +1251,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

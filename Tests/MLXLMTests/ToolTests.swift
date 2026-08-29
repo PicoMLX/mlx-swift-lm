@@ -1364,6 +1364,69 @@ struct ToolTests {
         #expect(toolCall.function.arguments["urgent"] == .string("true"))
     }
 
+    @Test("Gemma reads a nested object whose keys are unquoted")
+    func testGemmaBareKeyObjectValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{city: "Paris", limit: 1}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // The dialect writes nested objects without quoting their keys, which strict JSON refuses.
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object(["city": .string("Paris"), "limit": .int(1)]))
+    }
+
+    @Test("Gemma reads a bare-key object into a parameter the schema declares an object")
+    func testGemmaBareKeyObjectValueWithSchema() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "filters": ["type": "object"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = #"<|tool_call>call:search{filters:{city: "Paris"}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        // Without the brace-form read the schema-typed conversion hands back the raw text, and the
+        // tool receives a string where it declared an object.
+        #expect(toolCall.function.arguments["filters"] == .object(["city": .string("Paris")]))
+    }
+
+    @Test("Gemma refuses to quote bare object values")
+    func testGemmaBareValueStaysLiteral() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{city: Paris}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // Quoting a bare value would invent meaning, so the literal text is kept instead.
+        #expect(toolCall.function.arguments["filters"] == .string("{city: Paris}"))
+    }
+
+    @Test("Gemma keeps an escaped value that resembles an object as a string")
+    func testGemmaEscapedObjectShapedValueStaysString() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:notify{note:<|"|>{city: "Paris"}<|"|>}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments["note"] == .string(#"{city: "Paris"}"#))
+    }
+
     @Test("Gemma escaped values may contain protocol punctuation")
     func testGemmaEscapedValuePunctuation() throws {
         let parser = GemmaFunctionParser(

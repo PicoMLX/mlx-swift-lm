@@ -13,6 +13,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     /// so both spans have to be opaque while the argument list is split.
     private let scanner: StructuredTextScanner
 
+    /// Nested objects and arrays are written in the dialect's brace form, whose keys are unquoted.
+    private let structuredValues = BareKeyJSONParser()
+
     public init(startTag: String, endTag: String, escapeMarker: String) {
         self.startTag = startTag
         self.endTag = endTag
@@ -69,6 +72,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     /// may contain protocol punctuation, so it is taken verbatim. Everything else
     /// is typed from the schema when the parameter is declared, and otherwise
     /// decoded as JSON, falling back to the literal text.
+    ///
+    /// A parameter the schema declares structured is read as a brace-form literal first: the
+    /// dialect writes those without quoting their keys, which strict JSON refuses.
     private func value(
         of rawValue: Substring,
         key: String,
@@ -87,10 +93,21 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         }
 
         let literal = String(rawValue)
-        if getParameterType(funcName: funcName, paramName: key, tools: tools) != nil {
-            return convertParameterValue(
-                literal, paramName: key, funcName: funcName, tools: tools)
+        guard let declaredType = getParameterType(funcName: funcName, paramName: key, tools: tools)
+        else {
+            return structuredValues.parse(literal) ?? literal
         }
-        return tryParseJSON(literal) ?? literal
+
+        if Self.isStructured(declaredType), let value = structuredValues.parse(literal) {
+            return value
+        }
+        return convertParameterValue(literal, paramName: key, funcName: funcName, tools: tools)
+    }
+
+    /// Whether a declared schema type is one the dialect writes in brace form.
+    private static func isStructured(_ type: String) -> Bool {
+        let type = type.lowercased()
+        return type == "object" || type == "array" || type.hasPrefix("dict")
+            || type.hasPrefix("list")
     }
 }

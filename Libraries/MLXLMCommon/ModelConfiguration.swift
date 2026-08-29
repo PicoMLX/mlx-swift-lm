@@ -121,6 +121,14 @@ public struct ModelConfiguration: Sendable {
     /// Reasoning (chain-of-thought) protocol for this model (nil = non-reasoning model)
     public var reasoningConfig: ReasoningConfig? = nil
 
+    /// How to choose which safetensors files in the model directory hold the model's weights.
+    ///
+    /// The default, ``WeightFileSelection/automatic``, handles a well-packaged checkpoint and
+    /// the common packaging mistakes. Set ``WeightFileSelection/allFilesPresent`` for a
+    /// checkpoint whose index is known to omit weights the model needs -- see the caveats on
+    /// that case before reaching for it.
+    public var weightFileSelection: WeightFileSelection = .automatic
+
     /// Overrides the ``MessageGenerator`` the model would otherwise supply.
     ///
     /// A model class is shared by every checkpoint of its model type, so a fine-tune that
@@ -192,7 +200,8 @@ public struct ModelConfiguration: Sendable {
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
             reasoningConfig: reasoningConfig,
-            messageGenerator: messageGenerator)
+            messageGenerator: messageGenerator,
+            weightFileSelection: weightFileSelection)
     }
 
 }
@@ -210,6 +219,7 @@ extension ModelConfiguration: Equatable {
             && lhs.eosTokenIds == rhs.eosTokenIds
             && lhs.toolCallFormat == rhs.toolCallFormat
             && lhs.reasoningConfig == rhs.reasoningConfig
+            && lhs.weightFileSelection == rhs.weightFileSelection
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
     }
 
