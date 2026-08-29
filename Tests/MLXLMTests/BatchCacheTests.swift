@@ -27,7 +27,10 @@ struct BatchKVCacheCoverageTests {
         #expect(cache.leftPadding[0].item(Int32.self) == 0)
 
         let extensionCache = BatchKVCache(leftPadding: [0])
-        let extensionKV = makeKV(batchSize: 1, heads: 2, seqLen: 2, headDim: 4, value: 4)
+        // Position-stamped: the appended row's assertion below compares against
+        // this tensor, so a uniform fill would let an extend that reversed or
+        // rotated the appended positions compare equal.
+        let extensionKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
         _ = extensionCache.update(keys: extensionKV.0, values: extensionKV.1)
         cache.extend(other: extensionCache)
 
@@ -116,7 +119,11 @@ struct BatchKVCacheCoverageTests {
     @Test("fromSingle/toSingle preserve cache data")
     func fromSingleRoundTripPreservesData() throws {
         let single = KVCacheSimple()
-        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 4, headDim: 4, value: 3)
+        // Position-stamped: with a uniform fill, a round trip that reversed,
+        // rolled, or duplicated a position across the sequence still satisfies
+        // `maxAbsDifference == 0` -- in the one test whose whole claim is that
+        // the data is preserved.
+        let kv = makePositionKV(positions: 0 ..< 4, heads: 2, headDim: 4)
         _ = single.update(keys: kv.0, values: kv.1)
 
         let batch = BatchKVCache.fromSingle(single)
@@ -258,7 +265,9 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.batchSize == 1)
 
         let extensionCache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0], keep: 2)
-        let extensionKV = makeKV(batchSize: 1, heads: 2, seqLen: 2, headDim: 4, value: 5)
+        // Position-stamped for the same reason as the non-rotating lifecycle
+        // test: the appended row is compared against this tensor by content.
+        let extensionKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
         _ = extensionCache.update(keys: extensionKV.0, values: extensionKV.1)
         cache.extend(other: extensionCache)
 
@@ -766,7 +775,9 @@ struct BatchedSSMCacheTests {
         let addition = try #require(factory([0]) as? BatchedCacheList)
         let additionAttention = try #require(addition[0] as? BatchKVCache)
         let additionRotating = try #require(addition[1] as? BatchRotatingKVCache)
-        let additionKV = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 9)
+        // Position-stamped: both children's appended state is compared against
+        // this tensor, and a uniform fill cannot see a reordering inside it.
+        let additionKV = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
         _ = additionAttention.update(keys: additionKV.0, values: additionKV.1)
         _ = additionRotating.update(keys: additionKV.0, values: additionKV.1)
 
@@ -1047,6 +1058,13 @@ struct BatchMaskingTests {
 
 // MARK: - Helpers
 
+/// Uniform KV: every position in every row holds the same value.
+///
+/// Use this only when the assertion is about shape, counters, or metadata. If
+/// the assertion is about *which* elements survive or *in what order* -- trims,
+/// round trips, window retention, appended rows -- reach for `makePositionKV`
+/// instead: a uniform fill makes an operation and its inverse produce identical
+/// tensors, so the test passes either way.
 private func makeKV(
     batchSize: Int,
     heads: Int,
