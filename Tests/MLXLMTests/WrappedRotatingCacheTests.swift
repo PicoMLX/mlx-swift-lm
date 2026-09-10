@@ -6,6 +6,46 @@ import Testing
 
 @Suite(.serialized)
 struct WrappedRotatingCacheTests {
+    @Test("Merged caches preserve their native allocation step", arguments: [false, true])
+    func mergedAllocationStep(populated: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let source = RotatingKVCache(maxSize: 8, step: 3)
+            if populated { append(0 ..< 3, to: source) }
+            let batch = BatchRotatingKVCache.merge([source])
+            try #require(batch.step == 3)
+            #expect(batch.toSingle().metaState[2] == "3")
+            if !populated { append(0 ..< 3, to: batch) }
+            let other = RotatingKVCache(maxSize: 8, step: 3)
+            append(10 ..< 13, to: other)
+            batch.extend(other: BatchRotatingKVCache.fromSingle(other))
+            #expect(batch.batchSize == 2)
+            for row in 0 ..< 2 {
+                let extracted = batch.extract(idx: row)
+                #expect(extracted.metaState[2] == "3")
+                let expected: [Float] = row == 0 ? [0, 1, 2] : [10, 11, 12]
+                let keys = try view(extracted).0
+                #expect(keys.asArray(Float.self) == expected)
+            }
+        }
+    }
+
+    @Test("Merging rejects different native allocation steps")
+    func mismatchedMergedAllocationSteps() async throws {
+        let result = try await #require(
+            processExitsWith: .failure, observing: [\.standardErrorContent]
+        ) {
+            Device.withDefaultDevice(.cpu) {
+                _ = BatchRotatingKVCache.merge([
+                    RotatingKVCache(maxSize: 8, step: 3),
+                    RotatingKVCache(maxSize: 8, step: 256),
+                ])
+            }
+        }
+        #expect(
+            String(decoding: result.standardErrorContent, as: UTF8.self).contains(
+                "can only merge caches with the same allocation step"))
+    }
+
     @Test("Extending rejects a different native allocation step")
     func mismatchedAllocationSteps() async throws {
         let result = try await #require(

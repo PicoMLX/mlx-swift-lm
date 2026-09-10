@@ -842,8 +842,8 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
     /// Create a BatchRotatingKVCache by merging multiple individual RotatingKVCache instances.
     ///
-    /// All caches must have the same `maxSize`. Shorter caches receive left-padding
-    /// to match the longest sequence.
+    /// All caches must share their window, kept prefix, allocation step and capacity
+    /// origin. Shorter caches receive left-padding to match the longest sequence.
     ///
     /// - Parameter caches: An array of `RotatingKVCache` instances.
     /// - Returns: A new `BatchRotatingKVCache` containing all sequences.
@@ -856,9 +856,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             !caches.isEmpty,
             "BatchRotatingKVCache.merge requires at least one cache"
         )
-        // Validate all caches have the same maxSize and keep
+        // Validate the common retention and allocation policy.
         var targetMaxSize: Int = 0
         var targetKeep: Int = -1
+        var targetStep = 256
         var targetOrigin = RotatingKVCache.CapacityOrigin.modelNative
         var sawFirst = false
         for cache in caches {
@@ -869,10 +870,12 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             let ms = rotCache.maxSize ?? 0
             // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
             let k = Int(rotCache.metaState.first ?? "0") ?? 0
+            let step = Int(rotCache.metaState[2]) ?? 256
             if !sawFirst {
                 sawFirst = true
                 targetMaxSize = ms
                 targetKeep = k
+                targetStep = step
                 targetOrigin = rotCache.capacityOrigin
             } else {
                 precondition(
@@ -882,6 +885,10 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 precondition(
                     k == targetKeep,
                     "BatchRotatingKVCache can only merge caches with the same keep value"
+                )
+                precondition(
+                    step == targetStep,
+                    "BatchRotatingKVCache can only merge caches with the same allocation step"
                 )
                 // Every merged row is governed by one window, so one provenance
                 // label has to describe all of them; extraction would otherwise
@@ -935,6 +942,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             let empty = BatchRotatingKVCache(
                 maxSize: targetMaxSize, leftPadding: padding, keep: max(targetKeep, 0))
             empty.capacityOrigin = targetOrigin
+            empty.step = targetStep
             return empty
         }
 
@@ -964,6 +972,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         let cache = BatchRotatingKVCache(
             maxSize: targetMaxSize, leftPadding: padding, keep: max(targetKeep, 0))
         cache.capacityOrigin = targetOrigin
+        cache.step = targetStep
         cache.keys = keysArr
         cache.values = valuesArr
         cache.batchOffsets = MLXArray(offsets.map { Int32($0) })
