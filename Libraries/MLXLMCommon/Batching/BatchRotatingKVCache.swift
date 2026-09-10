@@ -692,17 +692,14 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
                 + "prefilled (keys != nil) before extending; the engine prefills "
                 + "each admitted sub-batch before calling extend."
         )
-        // Same configuration contract `merge` enforces: after extending, every
-        // row is governed by the receiver's window and keep prefix, so rows
-        // built under a different configuration would retain the wrong window
-        // or overwrite positions their original cache had pinned.
+        // All rows share the receiver's retention and allocation policy.
         precondition(
             other.maxCacheSize == maxCacheSize && other.keep == keep
-                && other.capacityOrigin == capacityOrigin,
-            "BatchRotatingKVCache.extend requires matching maxSize, keep and "
+                && other.capacityOrigin == capacityOrigin && other.step == step,
+            "BatchRotatingKVCache.extend requires matching maxSize, keep, step and "
                 + "capacityOrigin (receiver: maxSize \(maxCacheSize), keep \(keep), "
-                + "origin \(capacityOrigin.rawValue); other: maxSize "
-                + "\(other.maxCacheSize), keep \(other.keep), "
+                + "step \(step), origin \(capacityOrigin.rawValue); other: maxSize "
+                + "\(other.maxCacheSize), keep \(other.keep), step \(other.step), "
                 + "origin \(other.capacityOrigin.rawValue))"
         )
         guard let selfKeys = self.keys, let otherKeys = other.keys else {

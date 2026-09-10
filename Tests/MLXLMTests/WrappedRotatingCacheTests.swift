@@ -6,6 +6,26 @@ import Testing
 
 @Suite(.serialized)
 struct WrappedRotatingCacheTests {
+    @Test("Extending rejects a different native allocation step")
+    func mismatchedAllocationSteps() async throws {
+        let result = try await #require(
+            processExitsWith: .failure, observing: [\.standardErrorContent]
+        ) {
+            Device.withDefaultDevice(.cpu) {
+                let receiver = RotatingKVCache(maxSize: 8, step: 3)
+                let other = RotatingKVCache(maxSize: 8, step: 256)
+                let kv = MLXArray.ones([1, 1, 1, 1])
+                _ = receiver.update(keys: kv, values: kv)
+                _ = other.update(keys: kv, values: kv)
+                let batch = BatchRotatingKVCache.fromSingle(receiver)
+                batch.extend(other: BatchRotatingKVCache.fromSingle(other))
+            }
+        }
+        #expect(
+            String(decoding: result.standardErrorContent, as: UTF8.self).contains(
+                "requires matching maxSize, keep, step and capacityOrigin"))
+    }
+
     @Test("Fresh batched caches preserve their native probe's allocation step")
     func factoryAllocationStep() throws {
         try Device.withDefaultDevice(.cpu) {
