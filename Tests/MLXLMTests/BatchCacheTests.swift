@@ -381,6 +381,70 @@ struct BatchRotatingKVCacheCoverageTests {
         let row1Values = try #require(row1.state.last)
         #expect(row1Values[0, 0, 0..., 0].asArray(Float.self) == [110, 111, 112, 113, 114])
     }
+    
+    @Test("One-token ragged prefill finalizes before decode")
+      func oneTokenRaggedPrefillFinalizesBeforeDecode() throws {
+          let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 0])
+          // The longest prefix has one token; the empty row fills that slot with padding.
+          cache.prepare(lengths: [1, 0], rightPadding: [0, 1])
+
+          let prefillKeys = MLXArray([Float(10), 99]).reshaped([2, 1, 1, 1])
+          _ = cache.update(keys: prefillKeys, values: prefillKeys + 100)
+          #expect(cache._lengths != nil)
+
+          cache.finalize()
+          #expect(cache._lengths == nil)
+
+          let firstPrefill = cache.extract(idx: 0)
+          #expect(firstPrefill.offset == 1)
+          #expect(try #require(firstPrefill.keys).asArray(Float.self) == [10])
+          #expect(try #require(firstPrefill.values).asArray(Float.self) == [110])
+
+          let secondPrefill = cache.extract(idx: 1)
+          #expect(secondPrefill.offset == 0)
+          #expect(try #require(secondPrefill.keys).size == 0)
+          #expect(try #require(secondPrefill.values).size == 0)
+
+          let decodeKeys = MLXArray([Float(20), 30]).reshaped([2, 1, 1, 1])
+          _ = cache.update(keys: decodeKeys, values: decodeKeys + 100)
+
+          let firstDecoded = cache.extract(idx: 0)
+          #expect(firstDecoded.offset == 2)
+          #expect(try #require(firstDecoded.keys).asArray(Float.self) == [10, 20])
+          #expect(try #require(firstDecoded.values).asArray(Float.self) == [110, 120])
+
+          let secondDecoded = cache.extract(idx: 1)
+          #expect(secondDecoded.offset == 1)
+          #expect(try #require(secondDecoded.keys).asArray(Float.self) == [30])
+          #expect(try #require(secondDecoded.values).asArray(Float.self) == [130])
+      }
+
+      @Test("Ragged prefill accepts a trailing one-token chunk")
+      func raggedPrefillAcceptsTrailingOneTokenChunk() throws {
+          let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 0])
+          cache.prepare(lengths: [2, 3], rightPadding: [1, 0])
+
+          let first = makePositionKV(
+              positions: 0 ..< 2, heads: 1, headDim: 1, batchSize: 2, rowStride: 10)
+          _ = cache.update(keys: first.0, values: first.1)
+
+          // Row 0 is already complete, so its final chunk entry is padding.
+          let finalKeys = MLXArray([Float(99), 12]).reshaped([2, 1, 1, 1])
+          _ = cache.update(keys: finalKeys, values: finalKeys + 100)
+          #expect(cache._lengths != nil)
+          cache.finalize()
+          #expect(cache._lengths == nil)
+
+          let firstRow = cache.extract(idx: 0)
+          #expect(firstRow.offset == 2)
+          #expect(try #require(firstRow.keys).asArray(Float.self) == [0, 1])
+          #expect(try #require(firstRow.values).asArray(Float.self) == [100, 101])
+
+          let secondRow = cache.extract(idx: 1)
+          #expect(secondRow.offset == 3)
+          #expect(try #require(secondRow.keys).asArray(Float.self) == [10, 11, 12])
+          #expect(try #require(secondRow.values).asArray(Float.self) == [110, 111, 112])
+      }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
     func fromSingleRoundTripKeepsRetainedWindow() throws {
