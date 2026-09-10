@@ -819,17 +819,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
             }
 
             cache.state = [extractedK, extractedV]
-            // Restore `idx` as the row's logical cache write position, not the
-            // padded tensor length. In the rotated path the slice keeps trailing
-            // padded slots beyond this row's `seqOffset` (a shorter/left-padded
-            // row in a globally-rotated batch), so `extractedK.dim(2)` would push
-            // the next write past those pad slots while `offset == seqOffset`,
-            // landing the next token outside the returned `..<(offset+1)` slice and
-            // losing the first post-extraction token. Clamp to the logical length
-            // (`min(seqOffset, maxCacheSize)`) and the physical tensor length so a
-            // full row still restores `idx == maxCacheSize` (wraps to `keep`) while
-            // a shorter row writes at its true logical position.
-            cacheIdx = min(cacheIdx, extractedK.dim(2))
+            // Concat may retain more than a window in chronological order.
+            // Restore its full write position, while excluding a short row's padding.
+            cacheIdx = min(max(0, seqOffset), extractedK.dim(2))
         }
 
         // Metadata is restored for every row, populated or not. A row extracted
@@ -844,7 +836,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // empty row's is <= 0; clamp rather than hand the setter a negative
         // offset it has no meaning for.
         cache.metaState = [
-            String(keep), String(maxCacheSize), "256", String(max(0, seqOffset)),
+            String(keep), String(maxCacheSize), String(step), String(max(0, seqOffset)),
             String(cacheIdx), capacityOrigin.rawValue,
         ]
 
@@ -985,6 +977,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     }
 
     /// Create a batch-1 BatchRotatingKVCache from a single RotatingKVCache.
+    /// Wrapped and over-long sources retain their newest window and kept prefix.
     ///
     /// - Parameter cache: A single `RotatingKVCache` to wrap.
     /// - Returns: A new `BatchRotatingKVCache` with batch size 1.
@@ -993,34 +986,15 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // RotatingKVCache.keep is private; read it via metaState[0] (= keep).
         let k = Int(cache.metaState.first ?? "0") ?? 0
 
-        // Same over-window rejection `merge` applies, for the same reason:
-        // `temporalState` is oldest-first, so adopting a source whose offset
-        // exceeds `maxSize` and then reporting `_idx = maxSize` would slice the
-        // OLDEST window out of an over-long buffer and drop the newest tokens.
-        // (`RotatingKVCache.updateConcat` deliberately permits temporary growth
-        // past `maxSize`, so an over-window source is ordinary, not exotic.)
-        //
-        // Rejecting it also restores this class's `_idx == keys.dim(2)` buffer
-        // invariant, which `makeMask` depends on: for a single-token decode it
-        // predicts the front trim as `_idx - maxCacheSize` while `updateInPlace`
-        // performs `keys.dim(2) - maxCacheSize`. An over-window `fromSingle` was
-        // the only path that could decouple the two, making the pre-update mask
-        // treat already-trimmed left padding as still present.
-        precondition(
-            cache.offset <= ms,
-            "BatchRotatingKVCache.fromSingle does not yet support a cache whose "
-                + "offset (\(cache.offset)) exceeds maxSize (\(ms)) "
-                + "(wrapped/over-window source)"
-        )
-
         let batchCache = BatchRotatingKVCache(maxSize: ms, leftPadding: [0], keep: k)
         batchCache.capacityOrigin = cache.capacityOrigin
+        batchCache.step = Int(cache.metaState[2]) ?? 256
 
-        let temporalData = cache.temporalState
-        if temporalData.count >= 2 {
-            batchCache.keys = temporalData[0]
-            batchCache.values = temporalData[1]
-            let seqLen = min(cache.offset, ms)
+        if let (keys, values) = cache.logicalView(tail: ms) {
+            // Snapshot the array objects so later in-place writes cannot mutate the source.
+            batchCache.keys = keys[.ellipsis]
+            batchCache.values = values[.ellipsis]
+            let seqLen = keys.dim(2)
             batchCache._idx = seqLen
             batchCache._scalarOffset = seqLen
             batchCache.batchOffsets = MLXArray([Int32(cache.offset)])
@@ -1070,20 +1044,22 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
         // Window mask: restrict attention to the window
         mask = mask & (linds .< rindsRow + Int32(effectiveWindowSize))
 
-        // Adjust left_padding for trimming during multi-token concat.
+        // Match update's concat path, including prepared one-token chunks.
+        let usesConcat = n != 1 || _lengths != nil
+        // Adjust left_padding for trimming during concat.
         // After the ring has wrapped, `_idx` is the circular write pointer,
         // not the temporal length: `updateConcat` first linearizes the buffer
         // (`temporalOrder` resets `_idx` to the full buffer length,
         // `maxCacheSize`) and then trims, so the predicted trim must be
         // computed from that linearized length.
-        let concatIdx = (n > 1 && rotated) ? maxCacheSize : _idx
-        let trimSize = concatIdx - maxCacheSize + (n > 1 ? 1 : 0)
+        let concatIdx = (usesConcat && rotated) ? maxCacheSize : _idx
+        let trimSize = concatIdx - maxCacheSize + (usesConcat ? 1 : 0)
         if trimSize > 0 {
             effectiveLeftPadding = effectiveLeftPadding - Int32(trimSize)
         }
 
         // Check if rotated during single-token decode
-        let isRotated = n == 1 && (rotated || _idx >= maxCacheSize)
+        let isRotated = !usesConcat && (rotated || _idx >= maxCacheSize)
         if isRotated {
             effectiveLeftPadding = effectiveLeftPadding - 1
         }
