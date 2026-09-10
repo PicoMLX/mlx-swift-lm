@@ -35,6 +35,11 @@ public struct PrefillParameters: Sendable {
     /// by a stored `GenerateParameters`) — capture weakly anything long-lived.
     public var progress: (@Sendable (_ processed: Int, _ total: Int) -> Void)?
 
+    /// Checks the admitted request's cancellation between chunks. When `nil`,
+    /// the current task is checked. Shared engines can supply the request's own
+    /// check when another consumer's task is driving its prefill.
+    public var cancellationCheck: (@Sendable () throws -> Void)? = nil
+
     /// Strategy dividing the prompt into prefill forwards.
     public enum Chunking: Sendable {
         /// The fewest equal chunks that respect the step-size ceiling, so no
@@ -134,7 +139,11 @@ public struct PrefillParameters: Sendable {
         let slack = min(reserving, 1)
         var processed = 0
         while total - processed > reserving {
-            try Task.checkCancellation()
+            if let cancellationCheck {
+                try cancellationCheck()
+            } else {
+                try Task.checkCancellation()
+            }
             autoreleasepool {
                 let n = min(chunkLength, total - processed - slack)
                 body(processed ..< processed + n)
