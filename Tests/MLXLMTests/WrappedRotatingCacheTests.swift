@@ -6,6 +6,20 @@ import Testing
 
 @Suite(.serialized)
 struct WrappedRotatingCacheTests {
+    @Test("Fresh batched caches preserve their native probe's allocation step")
+    func factoryAllocationStep() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let probe = RotatingKVCache(maxSize: 8, step: 3)
+            let factories = try makeBatchedCacheFactories(for: [probe])
+            let factory = try #require(factories.first)
+            let cache = try #require(factory([0]) as? BatchRotatingKVCache)
+            #expect(cache.step == 3)
+            #expect(cache.toSingle().metaState[2] == "3")
+            append(0 ..< 1, to: cache)
+            #expect(cache.toSingle().metaState[2] == "3")
+        }
+    }
+
     @Test("Converting a chronological full window leaves the source independently usable")
     func sourceIsolation() throws {
         try Device.withDefaultDevice(.cpu) {

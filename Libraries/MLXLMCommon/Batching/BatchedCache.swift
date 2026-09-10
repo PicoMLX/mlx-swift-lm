@@ -335,11 +335,13 @@ private func makeBatchedCacheFactory(
         // requested-capacity validation and making runtime status report its
         // limit as model-defined.
         let capacityOrigin = rotating.capacityOrigin
+        let step = Int(rotating.metaState[2]) ?? 256
 
         return { leftPadding in
             let cache = BatchRotatingKVCache(
                 maxSize: maxSize, leftPadding: leftPadding, keep: keep)
             cache.capacityOrigin = capacityOrigin
+            cache.step = step
             return cache
         }
     }
