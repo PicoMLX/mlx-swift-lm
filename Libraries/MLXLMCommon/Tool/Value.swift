@@ -119,7 +119,11 @@ public enum JSONValue: Hashable, Codable, Sendable {
         }
     }
 
-    var sendableValue: any Sendable {
+    /// Convert to a `Sendable`-typed value suitable for `[String: any Sendable]`
+    /// dictionaries such as ``ToolSpec``. The `Sendable` twin of ``anyValue``,
+    /// and the only way to build a `ToolSpec` from stored `JSONValue` schema
+    /// without re-implementing this recursion downstream.
+    public var sendableValue: any Sendable {
         switch self {
         case .null:
             return NSNull()

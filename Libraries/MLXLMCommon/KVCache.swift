@@ -271,7 +271,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -286,6 +287,13 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Mask out left-padded positions per sequence (continuous batching):
+    // row `b` may attend only to positions `>= leftPadding[b]`.
+    if let leftPadding {
+        let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
+        mask = mask & (rinds .>= lp)
     }
 
     return mask
@@ -1814,6 +1822,25 @@ struct KVCacheError: Error, LocalizedError {
 
 // MARK: - Utility Functions
 
+/// True when `cache` is (or, for a ``CacheList``, contains) a cache with no
+/// restorable serialized form: a `Batch*` attention cache (absent from the
+/// restore registry) or a zero-row array cache.
+private func containsBatchedRows(_ cache: KVCache) -> Bool {
+    if cache is BatchKVCache || cache is BatchRotatingKVCache { return true }
+    // ArraysCache/MambaCache snapshots are batch-aware in the serialized
+    // format (state, lengths and left padding all round-trip; see the
+    // ArraysCache/MambaCache round-trip tests), so multi-row instances stay
+    // saveable. Zero rows are still refused: a populated cache filtered with
+    // an empty index set keeps tensors with a batch dimension of 0, and
+    // restoring those against a real input fails later and less legibly
+    // than refusing the save here.
+    if let arrays = cache as? ArraysCache, arrays.batchSize == 0 { return true }
+    if let list = cache as? CacheList {
+        return list.children.contains(where: containsBatchedRows)
+    }
+    return false
+}
+
 /// Map a cache instance to its Python-compatible class name for serialization.
 private func cacheClassName(_ cache: KVCache) -> String {
     switch cache {
@@ -1883,6 +1910,17 @@ public func savePromptCache(
     let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
     guard stateArrays.isEmpty || !cache.isEmpty else {
         throw KVCacheError(message: "Model state requires at least one prompt cache")
+    }
+
+    // Batch* attention caches hold multi-row state (left padding, per-row
+    // offsets) that the restore path cannot reconstruct — `cacheClassName`
+    // would silently serialize them as "KVCache" — and a zero-row array cache
+    // restores into tensors no real input can use. Fail closed instead.
+    if let batched = cache.first(where: containsBatchedRows) {
+        throw KVCacheError(
+            message:
+                "\(type(of: batched)) holds batched state with no restorable single-cache form and cannot be saved as a prompt cache; extract individual rows first"
+        )
     }
 
     let cacheData = cache.map { $0.state }
