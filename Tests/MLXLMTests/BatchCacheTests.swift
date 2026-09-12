@@ -444,6 +444,17 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(secondRow.offset == 3)
         #expect(try #require(secondRow.state.first).asArray(Float.self) == [10, 11, 12])
         #expect(try #require(secondRow.state.last).asArray(Float.self) == [110, 111, 112])
+
+        let decodeKeys = MLXArray([Float(2), 13]).reshaped([2, 1, 1, 1])
+        _ = cache.update(keys: decodeKeys, values: decodeKeys + 100)
+        let firstDecoded = cache.extract(idx: 0)
+        #expect(firstDecoded.offset == 3)
+        #expect(try #require(firstDecoded.state.first).asArray(Float.self) == [0, 1, 2])
+        #expect(try #require(firstDecoded.state.last).asArray(Float.self) == [100, 101, 102])
+        let secondDecoded = cache.extract(idx: 1)
+        #expect(secondDecoded.offset == 4)
+        #expect(try #require(secondDecoded.state.first).asArray(Float.self) == [10, 11, 12, 13])
+        #expect(try #require(secondDecoded.state.last).asArray(Float.self) == [110, 111, 112, 113])
     }
 
     @Test("fromSingle/toSingle keep the retained window, not the oldest one")
@@ -483,6 +494,41 @@ struct BatchRotatingKVCacheCoverageTests {
         }
     }
 
+    @Test("A trimmed wrapped source preserves its retained rows through batching and decode")
+    func postWrapTrimSurvivesBatching() throws {
+        let single = RotatingKVCache(maxSize: 8, keep: 0)
+        for position in 0 ..< 17 {
+            let key = MLXArray([Float(position)]).reshaped([1, 1, 1, 1])
+            _ = single.update(keys: key, values: key + 100)
+        }
+        #expect(single.trim(2) == 2)
+        #expect(single.offset == 15)
+        #expect(single.metaState.last == "false")
+
+        let batch = BatchRotatingKVCache.fromSingle(single)
+        func checkRows(_ expected: [Float], offset: Int) throws {
+            let restored = batch.toSingle()
+            #expect(restored.offset == offset)
+            #expect(batch.batchOffsets.asArray(Int.self) == [offset])
+            #expect(try #require(restored.state.first).asArray(Float.self) == expected)
+            #expect(
+                try #require(restored.state.last).asArray(Float.self) == expected.map { $0 + 100 })
+            let native = BatchRotatingKVCache.fromSingle(single).toSingle()
+            #expect(native.offset == offset)
+            #expect(try #require(native.state.first).asArray(Float.self) == expected)
+            #expect(
+                try #require(native.state.last).asArray(Float.self) == expected.map { $0 + 100 })
+        }
+        try checkRows(Array(9 ..< 15).map(Float.init), offset: 15)
+        for position in 15 ..< 20 {
+            let key = MLXArray([Float(position)]).reshaped([1, 1, 1, 1])
+            _ = single.update(keys: key, values: key + 100)
+            _ = batch.update(keys: key, values: key + 100)
+            try checkRows(
+                Array(max(9, position - 7) ... position).map(Float.init), offset: position + 1)
+        }
+    }
+
     @Test("Requested-capacity provenance survives fromSingle and extract")
     func capacityOriginSurvivesBatching() throws {
         let single = RotatingKVCache(maxSize: 8, keep: 0)
@@ -494,7 +540,7 @@ struct BatchRotatingKVCacheCoverageTests {
         // #require rather than #expect: on a five-field regression the [5]
         // accesses below would trap and take the rest of the suite with them.
         var meta = single.metaState
-        try #require(meta.count == 6)
+        try #require(meta.count == 7)
         meta[5] = "requested"
         single.metaState = meta
 
@@ -502,16 +548,18 @@ struct BatchRotatingKVCacheCoverageTests {
         // to `modelNative`, which exempts it from requested-capacity validation
         // and makes runtime status report the limit as model-defined.
         let restored = BatchRotatingKVCache.fromSingle(single).extract(idx: 0)
-        try #require(restored.metaState.count == 6)
+        try #require(restored.metaState.count == 7)
         #expect(restored.metaState[5] == "requested")
+        #expect(restored.metaState[6] == "false")
 
         // A model-native window keeps its own label.
         let native = RotatingKVCache(maxSize: 8, keep: 0)
         _ = native.update(keys: kv.0, values: kv.1)
         let nativeRestored = BatchRotatingKVCache.fromSingle(native).extract(idx: 0)
         let nativeMeta = nativeRestored.metaState
-        try #require(nativeMeta.count == 6)
+        try #require(nativeMeta.count == 7)
         #expect(nativeMeta[5] == "modelNative")
+        #expect(nativeMeta[6] == "false")
     }
 
     @Test("Extracting a row that never prefilled still restores its metadata")
@@ -530,10 +578,11 @@ struct BatchRotatingKVCacheCoverageTests {
             let meta = extracted.metaState
             // #require: a shorter representation should fail the test, not
             // trap the suite on the subscripts below.
-            try #require(meta.count == 6)
+            try #require(meta.count == 7)
             #expect(meta[0] == "4")  // keep
             #expect(meta[1] == "16")  // maxSize
             #expect(meta[5] == "requested")
+            #expect(meta[6] == "false")
             // Nothing was written, so the row starts from zero rather than from
             // its negative pre-prefill batch offset.
             #expect(extracted.offset == 0)
@@ -590,20 +639,20 @@ struct BatchedCacheFactoryTests {
         var meta = probe.metaState
         // #require before every [5] access: a five-field regression should
         // fail this test, not trap the suite.
-        try #require(meta.count == 6)
+        try #require(meta.count == 7)
         meta[5] = "requested"
         probe.metaState = meta
 
         let factories = try makeBatchedCacheFactories(for: [probe])
         let factory = try #require(factories.first)
         let produced = try #require(factory([0]) as? BatchRotatingKVCache)
-        // `extract` only writes metaState for a populated cache, so fill one
-        // row before asking what provenance comes back.
+        // Exercise a populated row as well as the empty-row case above.
         let kv = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4, value: 1)
         _ = produced.update(keys: kv.0, values: kv.1)
         let producedMeta = produced.extract(idx: 0).metaState
-        try #require(producedMeta.count == 6)
+        try #require(producedMeta.count == 7)
         #expect(producedMeta[5] == "requested")
+        #expect(producedMeta[6] == "false")
 
         // A model-native probe still yields model-native rows.
         let native = try makeBatchedCacheFactories(for: [RotatingKVCache(maxSize: 16, keep: 0)])
@@ -611,8 +660,9 @@ struct BatchedCacheFactoryTests {
         let nativeProduced = try #require(nativeFactory([0]) as? BatchRotatingKVCache)
         _ = nativeProduced.update(keys: kv.0, values: kv.1)
         let nativeMeta = nativeProduced.extract(idx: 0).metaState
-        try #require(nativeMeta.count == 6)
+        try #require(nativeMeta.count == 7)
         #expect(nativeMeta[5] == "modelNative")
+        #expect(nativeMeta[6] == "false")
     }
 
     @Test("Rotating caches with keep > 0 are rejected (single-stream fallback)")
