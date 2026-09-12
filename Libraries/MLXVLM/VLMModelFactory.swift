@@ -360,6 +360,13 @@ public final class VLMModelFactory: GenericModelFactory {
     /// resolvers for processor metadata that is absent or incorrect in a checkpoint
     public let processorLoadingRegistry: VLMProcessorLoadingRegistry
 
+    /// Returns the model's LoRA metadata without loading checkpoint weights or a processor.
+    ///
+    /// Uses the registered model's `LoRAModel` conformance to select adapter targets.
+    public func loraMetadata(configurationData: Data) async throws -> LoRAModelMetadata? {
+        try await typeRegistry.loraMetadata(configurationData: configurationData)
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
@@ -444,7 +451,7 @@ public final class VLMModelFactory: GenericModelFactory {
             context: processorLoadingContext,
             registry: processorLoadingRegistry)
 
-        try loadWeights(
+        try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection)
