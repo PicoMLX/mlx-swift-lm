@@ -10,8 +10,10 @@ public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = com
     MLXNN.silu(gate) * up
 }
 
+// Singleton reductions can be simplified during tracing. Specialize shapes so
+// that trace is not reused when the routed expert count changes.
 public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
+    shapeless: false
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
 }
