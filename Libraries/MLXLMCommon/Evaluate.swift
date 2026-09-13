@@ -468,7 +468,9 @@ struct TokenRing {
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let promptTokens = prompt.asType(.int32).flattened()
+        // Image sentinels (for example FastVLM's -200) are not vocabulary IDs.
+        // Filter once at prompt setup; sampled-token updates stay GPU-only.
+        let promptTokens = MLXArray(prompt.asArray(Int32.self).filter { $0 >= 0 })
         let n = promptTokens.count
         if n <= capacity {
             if n < capacity {
@@ -2227,7 +2229,7 @@ package func generateProtocolTokensTask(
     )
 }
 
-/// Low-level raw token generation using a `TokenIterator`, returning an
+/// Low-level raw token generation using a `TokenIteratorProtocol` implementation, returning an
 /// `AsyncStream<TokenGeneration>` and a `Task`.
 ///
 /// This is useful for parsers that need access to token IDs directly, without
@@ -2243,11 +2245,11 @@ package func generateProtocolTokensTask(
 ///     concurrent tasks. This is opt-in and only applied on GPU devices that support wired
 ///     memory control (macOS 15 / iOS 18 / tvOS 18 or newer).
 /// - Returns: An `AsyncStream` that emits token IDs and a final `.info`, plus a `Task`.
-public func generateTokenTask(
+public func generateTokenTask<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
-    iterator: consuming TokenIterator,
+    iterator: consuming TOKEN,
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {

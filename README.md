@@ -43,6 +43,14 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 
 ## Installation
 
+> [!IMPORTANT]
+> The PicoMLX development fork currently requires a branch or revision dependency:
+> its MLX pin includes an upstream compilation fix that is not yet released.
+> Do not tag a stable release of this fork until that pin is replaced with a
+> released MLX version and downstream version resolution is verified ([release
+> prerequisite #43](https://github.com/PicoMLX/mlx-swift-lm/issues/43)). The version
+> examples below refer to the upstream repository, not this development fork.
+
 Add the core package to your `Package.swift`:
 
 ```swift

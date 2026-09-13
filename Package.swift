@@ -61,7 +61,10 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.6")),
+        // Upstream #461 fixes concurrent nested compilation; 0.31.6 predates it.
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift",
+            revision: "df9ae2623680ee644a9a532247bd60f5b0ccd5e8"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
