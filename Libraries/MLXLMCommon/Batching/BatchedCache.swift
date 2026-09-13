@@ -43,10 +43,15 @@ public protocol BatchedCache: KVCache {
 /// nested topology instead of treating the composite as full attention.
 public final class BatchedCacheList: CacheList, BatchedCache {
 
-    private let batchedCaches: [any BatchedCache]
+    private var batchedCaches: [any BatchedCache] {
+        guard let caches = children as? [any BatchedCache] else {
+            preconditionFailure(
+                "BatchedCacheList child rewrites must preserve BatchedCache conformance")
+        }
+        return caches
+    }
 
     internal init(caches: [any BatchedCache]) {
-        self.batchedCaches = caches
         super.init(caches: caches.map { $0 as any KVCache })
     }
 

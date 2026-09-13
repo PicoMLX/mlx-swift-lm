@@ -34,29 +34,8 @@ defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -boo
 # workflow variable described in ci_override.xcconfig.
 defaults write com.apple.dt.Xcode IDEPackageEnablePrebuilts -bool NO
 
-# Let the resolver actually run.
-#
-# Xcode Cloud sets both of these to true during "Configure Xcode", BEFORE this
-# script, to force builds to use a committed resolved file:
-#   IDEPackageOnlyUseVersionsFromResolvedFile = true
-#   IDEDisableAutomaticPackageResolution      = true
-# `xcodebuild -resolvePackageDependencies` honours them, so with no committed
-# file it does not resolve — it fails with the very error it was invoked to
-# prevent ("a resolved file is required when automatic dependency resolution
-# is disabled").
-#
-# This repo has no project-level resolved file and should not gain one:
-# IntegrationTesting.xcodeproj declares its own remote packages
-# (swift-huggingface, swift-transformers) on top of the local `..` package, so
-# its graph is a superset of the root Package.resolved and cannot be served by
-# it; and a committed file would sit in an upstream-owned directory and go
-# stale whenever upstream changes a dependency. Resolving here is the
-# alternative, so resolution has to be switched back on.
-#
-# Deliberately NOT restored afterwards: later phases (`xcodebuild
-# -describeSchemes`, the build itself) resolve again, and re-disabling would
-# reintroduce the same failure. Determinism for this build comes from the
-# single resolve below rather than from a checked-in file.
+# Keep package resolution enabled for the project graph throughout this build.
+# See ci_scripts/README.md for the Xcode Cloud defaults and lockfile rationale.
 defaults write com.apple.dt.Xcode IDEDisableAutomaticPackageResolution -bool NO
 defaults write com.apple.dt.Xcode IDEPackageOnlyUseVersionsFromResolvedFile -bool NO
 
