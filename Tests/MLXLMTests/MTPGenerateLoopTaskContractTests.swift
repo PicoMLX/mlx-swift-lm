@@ -1,36 +1,21 @@
 // Copyright © 2026 Apple Inc.
 
+import Dispatch
 import Foundation
-import MLXLMCommon
 import Testing
+import os
 
-// MARK: - Contract check for generateLoopTask's iterator consumption
-//
-// Catches the class of bug fixed in commit 25faa79 (Phase 4): when
-// `generateLoopTask` consumed its iterator via `for token in iterator` instead
-// of `while let token = iterator.next()`, the value-type iterator was forked
-// into a copy at the for-in expansion, and the outer binding observed at the
-// `.info` event's `mtpStats = iterator as? MTPStatsCollecting` downcast site
-// stayed at post-init zero — regardless of how many tokens the inner copy
-// yielded.
-//
-// The Phase 1 IntegrationTesting diagnostic test
-// (`MTPIteratorEndToEndDiagnosticTests`) catches the same class of bug at the
-// cost of full 31B weight loads. This file does it at unit-test / CI scope
-// using a mock iterator and a minimal reproduction of the loop pattern.
+@testable import MLXLMCommon
 
-// MARK: - Mock iterator
-
-/// Value-type iterator that yields a fixed token sequence, increments
-/// `MTPStatsCollecting` counters per call, and optionally records a
-/// passthrough reason. Conforms to both `TokenIteratorProtocol` and
-/// `MTPStatsCollecting` so it can be downcast through the same path as the
-/// real `MTPSpeculativeTokenIterator`.
-private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
+// Exercise the public raw-token task so the actual worker, stop handling,
+// iterator finalization and completion telemetry remain covered together.
+private struct MockMTPIterator: GenerationFinalizingTokenIterator, MTPStatsCollecting {
     let tokensToYield: [Int]
     let perTokenProposed: Int
     let perTokenAccepted: Int
     let finalPassthroughReason: String?
+    let onNext: @Sendable () -> Void
+    let onFinalize: @Sendable () -> Void
 
     var index = 0
     public var tokenCount = 0
@@ -44,12 +29,16 @@ private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
         tokensToYield: [Int],
         perTokenProposed: Int,
         perTokenAccepted: Int,
-        finalPassthroughReason: String?
+        finalPassthroughReason: String?,
+        onNext: @escaping @Sendable () -> Void = {},
+        onFinalize: @escaping @Sendable () -> Void = {}
     ) {
         self.tokensToYield = tokensToYield
         self.perTokenProposed = perTokenProposed
         self.perTokenAccepted = perTokenAccepted
         self.finalPassthroughReason = finalPassthroughReason
+        self.onNext = onNext
+        self.onFinalize = onFinalize
     }
 
     mutating func next() -> Int? {
@@ -57,6 +46,7 @@ private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
             passthroughReason = finalPassthroughReason
             return nil
         }
+        onNext()
         let token = tokensToYield[index]
         index += 1
         tokenCount += 1
@@ -64,49 +54,36 @@ private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
         acceptedDraftTokens += perTokenAccepted
         return token
     }
+
+    mutating func finalizeGeneration() { onFinalize() }
 }
 
-// MARK: - Minimal generateLoopTask reproduction
-//
-// The smallest faithful reproduction of the iterator-consuming pattern at
-// Evaluate.swift's `generateLoopTask` site. Mirrors the post-Phase-4 shape:
-// `var iterator = ...; while let token = iterator.next()`. Pre-Phase-4 this
-// helper used `for token in iterator`, and the counters on the outer
-// `iterator` binding stayed at zero because the for-in iterated a value-type
-// copy.
-private func consumeIteratorAndBuildInfo(
-    _ iterator: any TokenIteratorProtocol
-) -> (tokens: [Int], info: GenerateCompletionInfo) {
-    var iterator = iterator
+private func consumeIteratorAndBuildInfo<I: TokenIteratorProtocol>(
+    _ iterator: consuming I,
+    configuration: ModelConfiguration = .init(id: "test"),
+    includeStopToken: Bool = false
+) async throws -> (tokens: [Int], info: GenerateCompletionInfo) {
+    let (stream, task) = generateTokenTask(
+        promptTokenCount: 3, modelConfiguration: configuration,
+        tokenizer: RawTaskTokenizer(), iterator: iterator, includeStopToken: includeStopToken)
     var tokens: [Int] = []
-    while let token = iterator.next() {
-        tokens.append(token)
+    var completion: GenerateCompletionInfo?
+    for await event in stream {
+        switch event {
+        case .token(let token): tokens.append(token)
+        case .info(let info): completion = info
+        }
     }
-    let mtpStats = iterator as? MTPStatsCollecting
-    let info = GenerateCompletionInfo(
-        promptTokenCount: 0,
-        generationTokenCount: tokens.count,
-        promptTime: 0,
-        generationTime: 0,
-        stopReason: .stop,
-        proposedDraftTokens: mtpStats?.proposedDraftTokens,
-        acceptedDraftTokens: mtpStats?.acceptedDraftTokens,
-        passthroughReason: mtpStats?.passthroughReason
-    )
-    return (tokens, info)
+    await task.value
+    return (tokens, try #require(completion))
 }
 
 @Suite
 struct MTPGenerateLoopTaskContractTests {
 
-    /// Load-bearing regression check: the iterator's counters on the outer
-    /// binding must reflect the mutations performed by the consuming loop.
-    /// Pre-Phase-4 (with `for token in iterator` in `generateLoopTask`), the
-    /// counters on `iterator` stayed at the post-init zeros — the `for-in`
-    /// expansion mutated a value-type copy, and the outer binding never
-    /// observed the increments.
+    // A value-type iterator's counters must reflect the worker's mutations.
     @Test
-    func iteratorCountersOnOuterBindingReflectLoopMutations() {
+    func iteratorCountersOnOuterBindingReflectLoopMutations() async throws {
         let mock = MockMTPIterator(
             tokensToYield: [11, 22, 33, 44],
             perTokenProposed: 3,
@@ -114,7 +91,7 @@ struct MTPGenerateLoopTaskContractTests {
             finalPassthroughReason: nil
         )
 
-        let (tokens, info) = consumeIteratorAndBuildInfo(mock)
+        let (tokens, info) = try await consumeIteratorAndBuildInfo(mock)
 
         #expect(tokens == [11, 22, 33, 44])
         #expect(info.generationTokenCount == 4)
@@ -129,11 +106,9 @@ struct MTPGenerateLoopTaskContractTests {
         #expect(info.passthroughReason == nil)
     }
 
-    /// Passthrough-reason mutation on the iterator is also observed only via
-    /// the mutated outer binding. Mock latches the reason at end-of-stream;
-    /// the loop must reach next() returning nil for the reason to propagate.
+    // The worker must observe state set by the final next() call.
     @Test
-    func passthroughReasonObservedOnOuterBinding() {
+    func passthroughReasonObservedOnOuterBinding() async throws {
         let mock = MockMTPIterator(
             tokensToYield: [7, 8],
             perTokenProposed: 0,
@@ -141,7 +116,7 @@ struct MTPGenerateLoopTaskContractTests {
             finalPassthroughReason: "main model did not emit drafter state"
         )
 
-        let (tokens, info) = consumeIteratorAndBuildInfo(mock)
+        let (tokens, info) = try await consumeIteratorAndBuildInfo(mock)
 
         #expect(tokens == [7, 8])
         #expect(info.proposedDraftTokens == 0)
@@ -151,4 +126,75 @@ struct MTPGenerateLoopTaskContractTests {
             "outer-binding passthroughReason was \(info.passthroughReason ?? "nil"); regression of the for-in copy-semantics bug fixed in Phase 4"
         )
     }
+
+    @Test(
+        "Raw stop inclusion preserves EOS, extra EOS and unknown token IDs",
+        arguments: [101, 102, 103, 104], [false, true])
+    func stopTokens(stop: Int, include: Bool) async throws {
+        let finalized = OSAllocatedUnfairLock(initialState: false)
+        let iterator = MockMTPIterator(
+            tokensToYield: [11, 22, stop, 44], perTokenProposed: 3,
+            perTokenAccepted: 2, finalPassthroughReason: nil,
+            onFinalize: { finalized.withLock { $0 = true } })
+        let (tokens, info) = try await consumeIteratorAndBuildInfo(
+            iterator, configuration: .init(id: "test", extraEOSTokens: ["103"], eosTokenIds: [104]),
+            includeStopToken: include)
+        #expect(tokens == (include ? [11, 22, stop] : [11, 22]))
+        #expect(info.generationTokenCount == tokens.count)
+        #expect(info.promptTokenCount == 3)
+        #expect(info.stopReason == .stop)
+        #expect(info.proposedDraftTokens == 9)
+        #expect(info.acceptedDraftTokens == 6)
+        #expect(finalized.withLock { $0 })
+    }
+
+    @Test(
+        "Raw producer completion waits for finalization after cancellation",
+        arguments: [false, true])
+    func cancellation(throughConsumer: Bool) async {
+        let entered = AsyncStream<Void>.makeStream()
+        let resume = DispatchSemaphore(value: 0)
+        let finalized = OSAllocatedUnfairLock(initialState: false)
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let iterator = MockMTPIterator(
+            tokensToYield: [11, 22, 33], perTokenProposed: 3,
+            perTokenAccepted: 2, finalPassthroughReason: nil,
+            onNext: {
+                calls.withLock { $0 += 1 }
+                entered.continuation.yield(())
+                #expect(resume.wait(timeout: .now() + 5) == .success)
+            },
+            onFinalize: { finalized.withLock { $0 = true } })
+        let (stream, producer) = generateTokenTask(
+            promptTokenCount: 3, modelConfiguration: .init(id: "test"),
+            tokenizer: RawTaskTokenizer(), iterator: iterator)
+        let consumer = Task { for await _ in stream {} }
+        for await _ in entered.stream { break }
+        if throughConsumer { consumer.cancel() } else { producer.cancel() }
+        resume.signal()
+        await consumer.value
+        await producer.value
+        entered.continuation.finish()
+        #expect(calls.withLock { $0 } == 1)
+        #expect(finalized.withLock { $0 })
+    }
+
+}
+
+private struct RawTaskTokenizer: Tokenizer {
+    var bosToken: String? { nil }
+    var eosToken: String? { "101" }
+    var unknownToken: String? { "102" }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        text.split(separator: " ").compactMap { Int($0) }
+    }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(String.init).joined(separator: " ")
+    }
+    func convertTokenToId(_ token: String) -> Int? { Int(token) }
+    func convertIdToToken(_ id: Int) -> String? { String(id) }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { throw TokenizerError.missingChatTemplate }
 }

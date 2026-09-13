@@ -2245,11 +2245,11 @@ package func generateProtocolTokensTask(
 ///     concurrent tasks. This is opt-in and only applied on GPU devices that support wired
 ///     memory control (macOS 15 / iOS 18 / tvOS 18 or newer).
 /// - Returns: An `AsyncStream` that emits token IDs and a final `.info`, plus a `Task`.
-public func generateTokenTask(
+public func generateTokenTask<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
-    iterator: consuming TokenIterator,
+    iterator: consuming TOKEN,
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
