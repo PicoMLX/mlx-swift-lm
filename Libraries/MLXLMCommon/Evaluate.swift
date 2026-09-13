@@ -2229,7 +2229,7 @@ package func generateProtocolTokensTask(
     )
 }
 
-/// Low-level raw token generation using a `TokenIterator`, returning an
+/// Low-level raw token generation using a `TokenIteratorProtocol` implementation, returning an
 /// `AsyncStream<TokenGeneration>` and a `Task`.
 ///
 /// This is useful for parsers that need access to token IDs directly, without

@@ -176,12 +176,7 @@ public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        // `_idx` is the padded physical width, not every row's logical
-        // length: in an unequal batch a shorter row's length is its
-        // `batchOffsets` entry, and trimming past it drives that row's offset
-        // negative and its padding beyond `_idx`, so a later `extract` slices
-        // an invalid range. Clamp to the shortest row (non-negative: an
-        // admitted row that has not prefilled sits at `-leftPadding`).
+        // Clamp trimming to the shortest non-negative logical row length.
         let shortestRow = batchSize > 0 ? Int(batchOffsets.min().item(Int32.self)) : 0
         let trimmed = min(_idx, max(0, shortestRow), n)
         _idx -= trimmed

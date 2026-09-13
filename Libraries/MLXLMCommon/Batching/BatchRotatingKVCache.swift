@@ -506,12 +506,7 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        // `_scalarOffset` tracks the padded batch, not every row: in an
-        // unequal batch a shorter row's logical length is its `batchOffsets`
-        // entry, and trimming past it drives that row's offset negative and
-        // its padding beyond the buffer, so a later `extract` slices an
-        // invalid range. Clamp to the shortest row (non-negative: an admitted
-        // row that has not prefilled sits at `-leftPadding`).
+        // Clamp trimming to the shortest non-negative logical row length.
         let shortestRow = batchSize > 0 ? Int(batchOffsets.min().item(Int32.self)) : 0
         let trimmed = min(_scalarOffset, max(0, shortestRow), n)
         _scalarOffset -= trimmed
@@ -539,6 +534,9 @@ public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedC
     public func prepare(
         leftPadding: [Int]? = nil, lengths: [Int]? = nil, rightPadding: [Int]? = nil
     ) {
+        precondition(
+            rightPadding?.contains(where: { $0 > 0 }) != true || lengths != nil,
+            "Right-padded prefill requires per-sequence lengths")
         if let lp = leftPadding {
             precondition(
                 keys == nil, "Left padding can only be added to an empty BatchRotatingKVCache")
