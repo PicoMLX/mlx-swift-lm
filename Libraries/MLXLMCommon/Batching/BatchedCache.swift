@@ -38,9 +38,7 @@ public protocol BatchedCache: KVCache {
 
 // MARK: - BatchedCacheList
 
-/// Batched wrapper for composite per-layer caches. Some hybrid models keep
-/// multiple cache objects per logical layer, so batching has to preserve that
-/// nested topology instead of treating the composite as full attention.
+/// Batched wrapper that preserves nested caches within a logical layer.
 public final class BatchedCacheList: CacheList, BatchedCache {
 
     private var batchedCaches: [any BatchedCache] {
@@ -101,11 +99,7 @@ public final class BatchedCacheList: CacheList, BatchedCache {
         }
     }
 
-    /// Composite caches inherit `BaseKVCache.makeMask`, which knows nothing of
-    /// per-row left padding — but hybrid models pass the layer's `CacheList`
-    /// itself to `createAttentionMask` (e.g. Baichuan M1), so an unequal-length
-    /// batch would decode with `.none` and attend to padded KV positions.
-    /// Delegate to the first attention child, which tracks the padding.
+    /// Delegate to the first attention child so masks respect per-row padding.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
@@ -115,12 +109,7 @@ public final class BatchedCacheList: CacheList, BatchedCache {
         return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
     }
 
-    /// Deep-copy as a `BatchedCacheList`, preserving the `BatchedCache` wrapper.
-    ///
-    /// `CacheList.copy()` rebuilds a plain `CacheList` from copied children, which
-    /// would strip the continuous-batching protocol from a snapshot taken after the
-    /// factory builds a composite batched cache. Each batched child's `copy()`
-    /// returns the same concrete batched type, so it re-conforms to `BatchedCache`.
+    /// Deep-copy the children while preserving their batched wrapper.
     public override func copy() -> any KVCache {
         BatchedCacheList(
             caches: batchedCaches.map { child in
@@ -139,9 +128,7 @@ public final class BatchedCacheList: CacheList, BatchedCache {
 // MARK: - SSM cache conformance
 
 extension ArraysCache {
-    /// Extract one row as its own single-row cache, preserving the concrete
-    /// subtype (a ``MambaCache`` row stays a `MambaCache`, so downstream
-    /// `as? MambaCache` checks and speculative checkpoints keep working).
+    /// Extract one row, preserving ``MambaCache`` for downstream type checks.
     public func extract(_ idx: Int) -> ArraysCache {
         let extracted = self is MambaCache ? MambaCache() : ArraysCache(size: slotCount)
         for slot in 0 ..< slotCount {
@@ -179,28 +166,8 @@ extension ArraysCache: BatchedCache {
     }
 
     public func advanceBatched(_: Int) {
-        // Intentionally a no-op: the *model* owns advancement for recurrent
-        // caches, and it has already advanced this cache during the forward
-        // pass the engine is advancing after.
-        //
-        // Every mask-aware SSM mixer calls `cache.advance(...)` itself —
-        // Mamba2 (`Mamba2.swift`), FalconH1, GraniteMoeHybrid, LFM2MoE,
-        // Qwen3.5 and Qwen3Next are exactly the models that also call
-        // `createSSMMask`, i.e. the ones whose padding metadata is load
-        // bearing. Forwarding the engine's chunk hook to `advance` too
-        // subtracted `n` twice, so `lengths` and `leftPadding` ran a full
-        // chunk ahead and the next chunk's SSM mask could suppress valid
-        // tokens or admit padding.
-        //
-        // Models that never advance (BaichuanM1) or advance without masking
-        // (Jamba, LFM2) do not read this metadata, so leaving it untouched is
-        // equally correct for them — and they are single-stream anyway.
-        //
-        // ``BatchKVCache`` and ``BatchRotatingKVCache`` already no-op this for
-        // the same reason, which is what made the asymmetry a bug rather than
-        // a design. If a future batched cache genuinely needs engine-driven
-        // advancement, give it an owner explicitly rather than reinstating the
-        // blanket forward.
+        // The model advances recurrent caches during its forward pass.
+        // Advancing again here would shift the next chunk's padding mask.
     }
 }
 
@@ -209,17 +176,9 @@ extension ArraysCache: BatchedCache {
 /// A closure that allocates one batched cache for `leftPadding.count` rows.
 public typealias BatchedCacheFactory = (_ leftPadding: [Int]) -> any BatchedCache
 
-/// `ArraysCache.makeMask` treats a non-nil `leftPadding` as a left-padded
-/// layout: left padding becomes the only mask bound, and `prepare(lengths:)`
-/// no longer excludes right padding (`advance` turns `lengths` into a
-/// remaining-count, so it cannot double as an end bound). The batched engine
-/// prefills right-padded with no left padding, so an all-zero `leftPadding`
-/// must construct the cache with `nil` for the lengths bound to apply.
+/// Normalize all-zero padding to nil so SSM prefill uses its lengths mask.
 private func ssmLeftPadding(_ leftPadding: [Int]) -> [Int]? {
-    // An explicit empty array is preserved: mapping it to nil would let
-    // `ArraysCache.batchSize` fall back to 1, betraying the factory's
-    // `leftPadding.count`-rows promise for a zero-row batch (extend would
-    // then synthesize a phantom row when allocating missing state).
+    // Preserve zero-row cardinality; nil defaults to one row.
     if leftPadding.isEmpty { return leftPadding }
     return leftPadding.allSatisfy { $0 == 0 } ? nil : leftPadding
 }
@@ -320,27 +279,15 @@ private func makeBatchedCacheFactory(
         // [keep, maxCacheSize, step, offset, idx].
         let keep = Int(rotating.metaState.first ?? "0") ?? 0
 
-        // keep > 0 cannot currently be combined with per-row left padding: at
-        // the rotation wrap the keep prefix would either pin a padded row's
-        // pads or, rolled to the END of the buffer, leave them attendable —
-        // the prefix-only `leftPadding` mask cannot express trailing garbage.
-        // `BatchRotatingKVCache` fails closed at that wrap; until the mask
-        // model supports it, keep-prefix topologies fall back to
-        // single-stream (in-repo models all use keep == 0; keep == 4 arises
-        // only via `GenerateParameters.maxKVSize`).
+        // With keep > 0, rotation can move padding beyond the prefix mask.
+        // Keep these topologies on the single-stream path.
         guard keep == 0 else {
             throw unsupported(
                 "RotatingKVCache with keep > 0 is not supported by continuous batching."
             )
         }
 
-        // Carry the probe's provenance onto every produced cache. This is the
-        // path the engine actually builds caches through -- `fromSingle` and
-        // `merge` are conversion helpers -- so without this, `extract(idx:)`
-        // faithfully restores a `.modelNative` label that was never the
-        // source's, exempting a requested-capacity window from
-        // requested-capacity validation and making runtime status report its
-        // limit as model-defined.
+        // Preserve capacity provenance for validation and runtime reporting.
         let capacityOrigin = rotating.capacityOrigin
         let step = Int(rotating.metaState[2]) ?? 256
 
