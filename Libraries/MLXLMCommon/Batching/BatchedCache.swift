@@ -237,6 +237,8 @@ public enum BatchedCacheError: Error, CustomStringConvertible, Equatable {
 ///
 /// Validating the topology once at engine-construction time means per-admission
 /// allocation is a cheap closure call that cannot fail.
+/// This checks cache topology only; callers must separately validate the
+/// model's batched position and recurrent-state semantics.
 ///
 /// - Throws: ``BatchedCacheError`` if any layer's cache type has no batched
 ///   implementation (e.g. quantized or chunked caches).

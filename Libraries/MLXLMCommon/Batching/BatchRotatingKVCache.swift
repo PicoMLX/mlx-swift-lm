@@ -42,10 +42,7 @@ internal func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArra
     }
     let reshapedShifts = shifts.reshaped(shiftShape)
 
-    // Compute rolled indices: (indices - shifts) mod n
-    // Use ((x % n) + n) % n to ensure non-negative result (Python-style modulo)
-    // ((x % n) + n) % n keeps the result non-negative (Python-style modulo).
-    // Using `%` avoids any overload ambiguity with Foundation/Darwin `remainder`.
+    // Keep rolled indices non-negative, matching Python's modulo behavior.
     let nArr = MLXArray(Int32(n))
     let idx = ((reshapedIndices - reshapedShifts) % nArr + nArr) % nArr
 
