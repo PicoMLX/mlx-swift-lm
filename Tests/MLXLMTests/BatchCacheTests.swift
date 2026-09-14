@@ -134,6 +134,44 @@ struct BatchKVCacheCoverageTests {
         try expectRow(shortAllocation.extractBatched(1), positions: [20, 21, 22, 1000])
     }
 
+    @Test("Growing past spare capacity appends after the logical history")
+    func growingBufferDoesNotInsertUnusedPositions() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let first = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        _ = cache.update(keys: first.0, values: first.1)
+        let next = makePositionKV(positions: 13 ..< 270, heads: 1, headDim: 1)
+        _ = cache.update(keys: next.0, values: next.1)
+        try expectRow(cache.extractBatched(0), positions: (10 ..< 270).map(Float.init))
+    }
+
+    @Test("Merging ragged single caches preserves empty rows through decoding")
+    func mergingRaggedSinglesPreservesRows() throws {
+        let longer = KVCacheSimple()
+        let shorter = KVCacheSimple()
+        let first = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        let second = makePositionKV(positions: 20 ..< 21, heads: 1, headDim: 1)
+        _ = longer.update(keys: first.0, values: first.1)
+        _ = shorter.update(keys: second.0, values: second.1)
+        let merged = BatchKVCache.merge([longer, shorter, KVCacheSimple()])
+        #expect(merged.leftPadding.asArray(Int32.self) == [0, 2, 3])
+        #expect(merged.batchOffsets.asArray(Int32.self) == [3, 1, 0])
+        try expectRow(merged.extractBatched(0), positions: [10, 11, 12])
+        try expectRow(merged.extractBatched(1), positions: [20])
+        let next = MLXArray([Float(13), 21, 30], [3, 1, 1, 1])
+        _ = merged.update(keys: next, values: next + 100)
+        try expectRow(merged.extractBatched(0), positions: [10, 11, 12, 13])
+        try expectRow(merged.extractBatched(1), positions: [20, 21])
+        try expectRow(merged.extractBatched(2), positions: [30])
+
+        let empty = BatchKVCache.merge([KVCacheSimple(), KVCacheSimple()])
+        #expect(empty.isEmpty)
+        #expect(empty.batchSize == 2)
+        let initial = MLXArray([Float(40), 50], [2, 1, 1, 1])
+        _ = empty.update(keys: initial, values: initial + 100)
+        try expectRow(empty.extractBatched(0), positions: [40])
+        try expectRow(empty.extractBatched(1), positions: [50])
+    }
+
     private func expectRow(_ row: any KVCache, positions: [Float]) throws {
         #expect(row.offset == positions.count)
         let state = row.state
