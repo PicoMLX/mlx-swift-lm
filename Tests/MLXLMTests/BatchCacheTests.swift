@@ -13,6 +13,76 @@ import Testing
 @Suite(.serialized)
 struct BatchKVCacheCoverageTests {
 
+    @Test("Batched protocol preparation and finalization preserve ragged KV through decoding")
+    func protocolLifecyclePreservesRaggedKV() throws {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let batched: any BatchedCache = cache
+        #expect(cache.isEmpty)
+        batched.prepareBatched(leftPadding: [1, 0], lengths: nil, rightPadding: [1, 0])
+        #expect(cache.leftPadding.asArray(Int32.self) == [1, 0])
+        #expect(cache.batchOffsets.asArray(Int32.self) == [-1, 0])
+
+        let keys = MLXArray([Float(-100), 10, 11, 12, -200, 20, 21, 22, 23, 24], [2, 1, 5, 1])
+        _ = batched.update(keys: keys, values: keys + 100)
+        #expect(!cache.isEmpty)
+        batched.finalizeBatched()
+        #expect(cache.leftPadding.asArray(Int32.self) == [2, 0])
+        #expect(cache.batchOffsets.asArray(Int32.self) == [3, 5])
+        try expectRow(batched.extractBatched(0), positions: [10, 11, 12])
+        try expectRow(batched.extractBatched(1), positions: [20, 21, 22, 23, 24])
+
+        // A second finalize must not charge the padding or roll the buffers again.
+        batched.finalizeBatched()
+        let next = MLXArray([Float(13), 25], [2, 1, 1, 1])
+        _ = batched.update(keys: next, values: next + 100)
+        try expectRow(batched.extractBatched(0), positions: [10, 11, 12, 13])
+        try expectRow(batched.extractBatched(1), positions: [20, 21, 22, 23, 24, 25])
+        batched.filterBatched(batchIndices: MLXArray([Int32]()))
+        #expect(cache.isEmpty)
+        #expect(cache.batchSize == 0)
+    }
+
+    @Test("State and metadata round trip preserves the next decode position")
+    func stateMetadataRoundTripContinuesDecoding() throws {
+        let original = BatchKVCache(leftPadding: [0])
+        let input = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        _ = original.update(keys: input.0, values: input.1)
+        let restored = BatchKVCache(leftPadding: [])
+        restored.state = original.state
+        restored.metaState = original.metaState
+        #expect(restored.metaState == ["3"])
+        #expect(!restored.isEmpty)
+        let next = makePositionKV(positions: 13 ..< 14, heads: 1, headDim: 1)
+        _ = restored.update(keys: next.0, values: next.1)
+        try expectRow(restored.extract(idx: 0), positions: [10, 11, 12, 13])
+        #expect(restored.trim(1) == 1)
+        try expectRow(restored.extract(idx: 0), positions: [10, 11, 12])
+    }
+
+    @Test("Empty receiver adopts populated rows and empty additions preserve them")
+    func emptyExtensionPreservesRowsAndValues() throws {
+        let receiver = BatchKVCache(leftPadding: [])
+        let populated = BatchKVCache(leftPadding: [0])
+        let input = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        _ = populated.update(keys: input.0, values: input.1)
+        receiver.extendBatched(populated)
+        #expect(receiver.batchSize == 1)
+        try expectRow(receiver.extractBatched(0), positions: [10, 11, 12])
+        receiver.extendBatched(BatchKVCache(leftPadding: []))
+        #expect(receiver.batchSize == 1)
+        try expectRow(receiver.extractBatched(0), positions: [10, 11, 12])
+    }
+
+    private func expectRow(_ row: any KVCache, positions: [Float]) throws {
+        #expect(row.offset == positions.count)
+        let state = row.state
+        try #require(state.count == 2)
+        #expect(state[0].shape == [1, 1, positions.count, 1])
+        #expect(state[1].shape == [1, 1, positions.count, 1])
+        #expect(state[0].asArray(Float.self) == positions)
+        #expect(state[1].asArray(Float.self) == positions.map { $0 + 100 })
+    }
+
     @Test("Lifecycle covers update, filter, extend, and extract")
     func lifecycleRoundTrip() throws {
         // Zero-padding here so this test exercises lifecycle bookkeeping, not
