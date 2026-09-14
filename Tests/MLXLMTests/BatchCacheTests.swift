@@ -976,6 +976,58 @@ struct BatchRotatingKVCacheCoverageTests {
 @Suite(.serialized)
 struct BatchedCacheFactoryTests {
 
+    @Test("Composite ragged prefill preserves attention history and recurrent masks")
+    func compositeRaggedPrefillPreservesChildren() throws {
+        let factories = try makeBatchedCacheFactories(for: [
+            CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 8, keep: 0), MambaCache())
+        ])
+        let factory = try #require(factories.first)
+        let list = try #require(factory([0, 0]) as? BatchedCacheList)
+        try #require(list.children.count == 3)
+        let full = try #require(list[0] as? BatchKVCache)
+        let rotating = try #require(list[1] as? BatchRotatingKVCache)
+        let recurrent = try #require(list[2] as? MambaCache)
+        list.prepareBatched(leftPadding: [0, 0], lengths: [2, 3], rightPadding: [1, 0])
+        let mask = try #require(recurrent.makeMask(N: 3))
+        #expect(mask.shape == [2, 3])
+        #expect(mask.asArray(Bool.self) == [true, true, false, true, true, true])
+
+        let input = MLXArray([Float(10), 11, -99, 20, 21, 22], [2, 1, 3, 1])
+        _ = full.update(keys: input, values: input + 100)
+        _ = rotating.update(keys: input, values: input + 100)
+        // Stand-in final recurrent state: lifecycle operations must preserve each row.
+        recurrent[0] = MLXArray([Float(1), 2, 3, 4], [2, 2])
+        recurrent[1] = MLXArray([Float(5), 6, 7, 8], [2, 2])
+        recurrent.advance(3)
+        list.finalizeBatched()
+        #expect(recurrent.makeMask(N: 1) == nil)
+
+        func checkRow(_ index: Int, history: [Float], slots: [[Float]]) throws {
+            let row = try #require(list.extractBatched(index) as? CacheList)
+            try #require(row.children.count == 3)
+            for child in row.children.prefix(2) {
+                #expect(child.offset == history.count)
+                let state = child.state
+                try #require(state.count == 2)
+                #expect(state[0].asArray(Float.self) == history)
+                #expect(state[1].asArray(Float.self) == history.map { $0 + 100 })
+            }
+            let recurrentRow = try #require(row[2] as? MambaCache)
+            #expect(try #require(recurrentRow[0]).asArray(Float.self) == slots[0])
+            #expect(try #require(recurrentRow[1]).asArray(Float.self) == slots[1])
+        }
+
+        try checkRow(0, history: [10, 11], slots: [[1, 2], [5, 6]])
+        try checkRow(1, history: [20, 21, 22], slots: [[3, 4], [7, 8]])
+        let next = MLXArray([Float(12), 23], [2, 1, 1, 1])
+        _ = full.update(keys: next, values: next + 100)
+        _ = rotating.update(keys: next, values: next + 100)
+        try checkRow(0, history: [10, 11, 12], slots: [[1, 2], [5, 6]])
+        try checkRow(1, history: [20, 21, 22, 23], slots: [[3, 4], [7, 8]])
+        list.filterBatched(batchIndices: MLXArray([Int32(1)]))
+        try checkRow(0, history: [20, 21, 22, 23], slots: [[3, 4], [7, 8]])
+    }
+
     @Test("Factory routes supported cache types")
     func factoryRoutesSupportedTypes() throws {
         // #require on .first throughout: a factory array missing an entry
