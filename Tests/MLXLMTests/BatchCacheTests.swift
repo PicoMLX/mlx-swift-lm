@@ -424,6 +424,81 @@ struct BatchKVCacheCoverageTests {
 @Suite(.serialized)
 struct BatchRotatingKVCacheCoverageTests {
 
+    @Test("Batched rotating state restores spare and wrapped buffers through decoding")
+    func batchedStateRoundTripPreservesHistory() throws {
+        for count in [4, 11] {
+            let original = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+            for position in 0 ..< count {
+                let input = makePositionKV(
+                    positions: position ..< (position + 1), heads: 1, headDim: 1)
+                _ = original.update(keys: input.0, values: input.1)
+            }
+            let state = original.state
+            try #require(state.count == 4)
+            #expect(state[0].shape == [1, 1, min(count, 8), 1])
+            #expect(state[1].shape == [1, 1, min(count, 8), 1])
+            #expect(state[2].asArray(Int32.self) == [Int32(count)])
+            #expect(state[3].asArray(Int32.self) == original.leftPadding.asArray(Int32.self))
+
+            let restored = BatchRotatingKVCache(maxSize: 4, leftPadding: [], keep: 1)
+            restored.state = state.map { $0[.ellipsis] }
+            restored.metaState = original.metaState
+            #expect(restored.metaState == original.metaState)
+            #expect(
+                restored.leftPadding.asArray(Int32.self) == original.leftPadding.asArray(Int32.self)
+            )
+            let before = restored.extract(idx: 0)
+            #expect(before.offset == count)
+            let expectedBefore = (max(0, count - 8) ..< count).map(Float.init)
+            #expect(before.state[0].asArray(Float.self) == expectedBefore)
+            #expect(before.state[1].asArray(Float.self) == expectedBefore.map { $0 + 100 })
+
+            let next = makePositionKV(positions: count ..< (count + 1), heads: 1, headDim: 1)
+            _ = restored.update(keys: next.0, values: next.1)
+            let after = restored.extract(idx: 0)
+            #expect(after.offset == count + 1)
+            let expectedAfter = (max(0, count + 1 - 8) ..< (count + 1)).map(Float.init)
+            #expect(after.state[0].asArray(Float.self) == expectedAfter)
+            #expect(after.state[1].asArray(Float.self) == expectedAfter.map { $0 + 100 })
+        }
+    }
+
+    @Test("Returned KV matches complete masks across allocation, wrap and concat")
+    func returnedTensorsMatchAttentionMasks() throws {
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+
+        func checkUpdate(start: Int, count: Int) throws {
+            guard case .array(let mask) = cache.makeMask(n: count, windowSize: 3, returnArray: true)
+            else {
+                Issue.record("Expected an explicit rotating-cache mask")
+                return
+            }
+            let input = makePositionKV(positions: start ..< (start + count), heads: 1, headDim: 1)
+            let updated = cache.update(keys: input.0, values: input.1)
+            let width = min(7, start) + count
+            try #require(updated.0.shape == [1, 1, width, 1])
+            try #require(updated.1.shape == [1, 1, width, 1])
+            try #require(mask.shape == [1, 1, count, width])
+            let keys = updated.0.asArray(Float.self)
+            #expect(updated.1.asArray(Float.self) == keys.map { $0 + 100 })
+            // Raw ring order is internal; the mask must select the correct temporal window.
+            #expect(keys.sorted() == (max(0, start - 7) ..< (start + count)).map(Float.init))
+            for query in 0 ..< count {
+                let visible = mask[0, 0, query, 0...].asArray(Bool.self)
+                let attended = zip(keys, visible).compactMap { key, allowed in allowed ? key : nil }
+                    .sorted()
+                let expected = (max(0, start + query - 2) ..< (start + query + 1)).map(Float.init)
+                #expect(attended == expected)
+            }
+        }
+
+        for position in 0 ..< 11 {
+            try checkUpdate(start: position, count: 1)
+        }
+        try checkUpdate(start: 11, count: 3)
+        try checkUpdate(start: 14, count: 1)
+    }
+
     @Test("Lifecycle covers update, filter, extend, and extract with keep > 0")
     func lifecycleRoundTrip() throws {
         let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [0, 0], keep: 2)
