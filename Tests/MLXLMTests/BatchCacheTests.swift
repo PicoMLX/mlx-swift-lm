@@ -475,23 +475,27 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.keep == 2)
         #expect(extracted.maxSize == 4)
         #expect(keys.dim(2) <= 4)
-        // Each key is stamped with its absolute position, so the retained
-        // window is checkable by content: the pinned keep prefix (0, 1)
-        // plus the newest suffix (3, 4), with the oldest non-keep position
-        // (2) evicted. Compared as a sorted set because the ring's internal
-        // layout may rotate.
-        let retained = keys[0, 0, 0..., 0].asArray(Float.self).sorted()
+        // Extraction promises temporal order, including the pinned keep prefix.
+        let retained = keys[0, 0, 0..., 0].asArray(Float.self)
         #expect(retained == [0, 1, 3, 4])
         // Values ride the same eviction: a rotate that keeps the right keys
         // but leaves stale or misordered values feeds corrupted values to
         // attention (makePositionKV stamps them at +100).
         let values = try #require(extracted.state.last)
-        // Pairing first, then the set: sorting each side independently would
-        // accept a cache that retains the right values but permutes them
-        // differently from the keys, pairing every key with a wrong value.
         #expect(maxAbsDifference(values, keys + 100) == 0)
-        let retainedValues = values[0, 0, 0..., 0].asArray(Float.self).sorted()
+        let retainedValues = values[0, 0, 0..., 0].asArray(Float.self)
         #expect(retainedValues == [100, 101, 103, 104])
+
+        for position in 5 ..< 8 {
+            let next = makePositionKV(positions: position ..< (position + 1), heads: 2, headDim: 4)
+            _ = cache.update(keys: next.0, values: next.1)
+            let continued = cache.extract(idx: 0)
+            #expect(continued.offset == position + 1)
+            let expected = MLXArray(
+                [Float(0), 1, Float(position - 1), Float(position)], [1, 1, 4, 1])
+            #expect(maxAbsDifference(continued.state[0], expected) == 0)
+            #expect(maxAbsDifference(continued.state[1], expected + 100) == 0)
+        }
     }
 
     @Test("isTrimmable(after:) predicts window overflow")
