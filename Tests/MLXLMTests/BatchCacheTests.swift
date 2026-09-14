@@ -424,6 +424,139 @@ struct BatchKVCacheCoverageTests {
 @Suite(.serialized)
 struct BatchRotatingKVCacheCoverageTests {
 
+    @Test("Empty receiver adopts wrapped history and continues decoding")
+    func emptyReceiverPreservesWrappedHistory() throws {
+        let receiver = BatchRotatingKVCache(maxSize: 8, leftPadding: [])
+        let incoming = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        for position in 0 ..< 11 {
+            let input = makePositionKV(positions: position ..< (position + 1), heads: 1, headDim: 1)
+            _ = incoming.update(keys: input.0, values: input.1)
+        }
+        receiver.extendBatched(incoming)
+        try #require(receiver.batchSize == 1)
+        try expectRotatingRow(
+            receiver.extract(idx: 0), offset: 11, positions: (3 ..< 11).map(Float.init))
+        receiver.extendBatched(BatchRotatingKVCache(maxSize: 8, leftPadding: []))
+        try #require(receiver.batchSize == 1)
+        let next = makePositionKV(positions: 11 ..< 12, heads: 1, headDim: 1)
+        _ = receiver.update(keys: next.0, values: next.1)
+        try expectRotatingRow(
+            receiver.extract(idx: 0), offset: 12, positions: (4 ..< 12).map(Float.init))
+    }
+
+    @Test("Extension aligns different ring positions and allocation capacities")
+    func extensionPreservesIndependentlyAdvancedRows() throws {
+        for (leftCount, rightCount) in [(11, 5), (11, 9), (5, 11), (7, 3), (3, 7)] {
+            let left = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+            let right = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+            left.step = 4
+            right.step = 4
+            for (cache, count, start) in [(left, leftCount, 0), (right, rightCount, 100)] {
+                for position in start ..< (start + count) {
+                    let input = makePositionKV(
+                        positions: position ..< (position + 1), heads: 1, headDim: 1)
+                    _ = cache.update(keys: input.0, values: input.1)
+                }
+            }
+            left.extendBatched(right)
+            #expect(left.batchSize == 2)
+            #expect(left.batchOffsets.asArray(Int32.self) == [Int32(leftCount), Int32(rightCount)])
+            let retainedWidth = min(8, max(leftCount, rightCount))
+            #expect(
+                left.leftPadding.asArray(Int32.self).map { max(0, $0) }
+                    == [
+                        Int32(retainedWidth - min(8, leftCount)),
+                        Int32(retainedWidth - min(8, rightCount)),
+                    ])
+            try expectRotatingRow(
+                left.extract(idx: 0), offset: leftCount,
+                positions: (max(0, leftCount - 8) ..< leftCount).map(Float.init))
+            try expectRotatingRow(
+                left.extract(idx: 1), offset: rightCount,
+                positions: (max(100, 100 + rightCount - 8) ..< (100 + rightCount)).map(Float.init))
+
+            let next = MLXArray([Float(leftCount), Float(100 + rightCount)], [2, 1, 1, 1])
+            _ = left.update(keys: next, values: next + 100)
+            try expectRotatingRow(
+                left.extract(idx: 0), offset: leftCount + 1,
+                positions: (max(0, leftCount + 1 - 8) ..< (leftCount + 1)).map(Float.init))
+            try expectRotatingRow(
+                left.extract(idx: 1), offset: rightCount + 1,
+                positions: (max(100, 101 + rightCount - 8) ..< (101 + rightCount)).map(Float.init))
+        }
+    }
+
+    @Test("Extension pads spare capacity when logical lengths match")
+    func extensionAlignsSpareCapacityAtEqualOffsets() throws {
+        let receiver = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        let incoming = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        receiver.step = 4
+        incoming.step = 4
+        for position in 10 ..< 13 {
+            let input = makePositionKV(positions: position ..< (position + 1), heads: 1, headDim: 1)
+            _ = receiver.update(keys: input.0, values: input.1)
+        }
+        let input = makePositionKV(positions: 20 ..< 23, heads: 1, headDim: 1)
+        _ = incoming.update(keys: input.0, values: input.1)
+        receiver.extendBatched(incoming)
+        try #require(receiver.batchSize == 2)
+        #expect(receiver.leftPadding.asArray(Int32.self) == [0, 0])
+        try expectRotatingRow(receiver.extract(idx: 0), offset: 3, positions: [10, 11, 12])
+        try expectRotatingRow(receiver.extract(idx: 1), offset: 3, positions: [20, 21, 22])
+        let next = MLXArray([Float(13), 23], [2, 1, 1, 1])
+        _ = receiver.update(keys: next, values: next + 100)
+        try expectRotatingRow(receiver.extract(idx: 0), offset: 4, positions: [10, 11, 12, 13])
+        try expectRotatingRow(receiver.extract(idx: 1), offset: 4, positions: [20, 21, 22, 23])
+    }
+
+    @Test("Direct merge preserves ragged and empty rows through decoding")
+    func mergePreservesRaggedAndEmptyRows() throws {
+        let first = RotatingKVCache(maxSize: 8, keep: 0)
+        let second = RotatingKVCache(maxSize: 8, keep: 0)
+        let empty = RotatingKVCache(maxSize: 8, keep: 0)
+        for (cache, positions) in [(first, 10 ..< 13), (second, 20 ..< 25)] {
+            let input = makePositionKV(positions: positions, heads: 1, headDim: 1)
+            _ = cache.update(keys: input.0, values: input.1)
+        }
+        let merged = BatchRotatingKVCache.merge([first, second, empty])
+        #expect(merged.batchSize == 3)
+        #expect(merged.leftPadding.asArray(Int32.self) == [2, 0, 5])
+        #expect(merged.batchOffsets.asArray(Int32.self) == [3, 5, 0])
+        try expectRotatingRow(merged.extract(idx: 0), offset: 3, positions: [10, 11, 12])
+        try expectRotatingRow(merged.extract(idx: 1), offset: 5, positions: [20, 21, 22, 23, 24])
+        try expectRotatingRow(merged.extract(idx: 2), offset: 0, positions: [])
+        let next = MLXArray([Float(13), 25, 30], [3, 1, 1, 1])
+        _ = merged.update(keys: next, values: next + 100)
+        try expectRotatingRow(merged.extract(idx: 0), offset: 4, positions: [10, 11, 12, 13])
+        try expectRotatingRow(
+            merged.extract(idx: 1), offset: 6, positions: [20, 21, 22, 23, 24, 25])
+        try expectRotatingRow(merged.extract(idx: 2), offset: 1, positions: [30])
+
+        let allEmpty = BatchRotatingKVCache.merge([
+            RotatingKVCache(maxSize: 8, keep: 0), RotatingKVCache(maxSize: 8, keep: 0),
+        ])
+        #expect(allEmpty.batchSize == 2)
+        #expect(allEmpty.batchOffsets.asArray(Int32.self) == [0, 0])
+        let initial = MLXArray([Float(40), 50], [2, 1, 1, 1])
+        _ = allEmpty.update(keys: initial, values: initial + 100)
+        try expectRotatingRow(allEmpty.extract(idx: 0), offset: 1, positions: [40])
+        try expectRotatingRow(allEmpty.extract(idx: 1), offset: 1, positions: [50])
+    }
+
+    private func expectRotatingRow(_ row: RotatingKVCache, offset: Int, positions: [Float]) throws {
+        #expect(row.offset == offset)
+        #expect(row.maxSize == 8)
+        let state = row.state
+        try #require(state.count == 2)
+        if positions.isEmpty {
+            #expect(state[0].size == 0)
+            #expect(state[1].size == 0)
+            return
+        }
+        #expect(state[0].asArray(Float.self) == positions)
+        #expect(state[1].asArray(Float.self) == positions.map { $0 + 100 })
+    }
+
     @Test("Batched rotating state restores spare and wrapped buffers through decoding")
     func batchedStateRoundTripPreservesHistory() throws {
         for count in [4, 11] {
