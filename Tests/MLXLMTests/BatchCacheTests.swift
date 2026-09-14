@@ -73,6 +73,105 @@ struct BatchKVCacheCoverageTests {
         try expectRow(receiver.extractBatched(0), positions: [10, 11, 12])
     }
 
+    @Test("Serialized state excludes spare allocation before and after trimming")
+    func serializedStateContainsOnlyLogicalHistory() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let input = makePositionKV(positions: 10 ..< 15, heads: 1, headDim: 1)
+        _ = cache.update(keys: input.0, values: input.1)
+        let before = cache.state
+        try #require(before.count == 4)
+        #expect(before[0].shape == [1, 1, 5, 1])
+        #expect(before[1].shape == [1, 1, 5, 1])
+        #expect(before[0].asArray(Float.self) == [10, 11, 12, 13, 14])
+        #expect(before[1].asArray(Float.self) == [110, 111, 112, 113, 114])
+
+        #expect(cache.trim(2) == 2)
+        let after = cache.state
+        try #require(after.count == 4)
+        #expect(after[0].shape == [1, 1, 3, 1])
+        #expect(after[1].shape == [1, 1, 3, 1])
+        #expect(after[0].asArray(Float.self) == [10, 11, 12])
+        #expect(after[1].asArray(Float.self) == [110, 111, 112])
+        #expect(after[2].asArray(Int32.self) == [3])
+        #expect(after[3].asArray(Int32.self) == [0])
+    }
+
+    @Test("Filtering removes shared left padding without shifting retained KV")
+    func filteringNormalizesSharedPadding() throws {
+        let cache = BatchKVCache(leftPadding: [2, 1])
+        let input = makePositionKV(
+            positions: 0 ..< 5, heads: 1, headDim: 1, batchSize: 2, rowStride: 10)
+        _ = cache.update(keys: input.0, values: input.1)
+        cache.filterBatched(batchIndices: MLXArray([Int32(0)]))
+        #expect(cache.batchSize == 1)
+        #expect(cache.leftPadding.asArray(Int32.self) == [0])
+        #expect(cache.batchOffsets.asArray(Int32.self) == [3])
+        #expect(cache.state[0].shape == [1, 1, 3, 1])
+        try expectRow(cache.extractBatched(0), positions: [2, 3, 4])
+        let next = makePositionKV(positions: 5 ..< 6, heads: 1, headDim: 1)
+        _ = cache.update(keys: next.0, values: next.1)
+        try expectRow(cache.extractBatched(0), positions: [2, 3, 4, 5])
+    }
+
+    @Test("Equal-length rows with different allocated capacities extend and decode")
+    func extensionAlignsSpareCapacityAfterTrim() throws {
+        let shortAllocation = BatchKVCache(leftPadding: [0])
+        let shortInput = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        _ = shortAllocation.update(keys: shortInput.0, values: shortInput.1)
+        let largeAllocation = BatchKVCache(leftPadding: [0])
+        // Cross the 256-position allocation boundary, then keep only three tokens.
+        let largeInput = makePositionKV(positions: 20 ..< 280, heads: 1, headDim: 1)
+        _ = largeAllocation.update(keys: largeInput.0, values: largeInput.1)
+        #expect(largeAllocation.trim(257) == 257)
+        shortAllocation.extendBatched(largeAllocation)
+        #expect(shortAllocation.batchOffsets.asArray(Int32.self) == [3, 3])
+        #expect(shortAllocation.leftPadding.asArray(Int32.self) == [0, 0])
+        try expectRow(shortAllocation.extractBatched(0), positions: [10, 11, 12])
+        try expectRow(shortAllocation.extractBatched(1), positions: [20, 21, 22])
+        let next = MLXArray([Float(13), 1000], [2, 1, 1, 1])
+        _ = shortAllocation.update(keys: next, values: next + 100)
+        try expectRow(shortAllocation.extractBatched(0), positions: [10, 11, 12, 13])
+        try expectRow(shortAllocation.extractBatched(1), positions: [20, 21, 22, 1000])
+    }
+
+    @Test("Growing past spare capacity appends after the logical history")
+    func growingBufferDoesNotInsertUnusedPositions() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let first = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        _ = cache.update(keys: first.0, values: first.1)
+        let next = makePositionKV(positions: 13 ..< 270, heads: 1, headDim: 1)
+        _ = cache.update(keys: next.0, values: next.1)
+        try expectRow(cache.extractBatched(0), positions: (10 ..< 270).map(Float.init))
+    }
+
+    @Test("Merging ragged single caches preserves empty rows through decoding")
+    func mergingRaggedSinglesPreservesRows() throws {
+        let longer = KVCacheSimple()
+        let shorter = KVCacheSimple()
+        let first = makePositionKV(positions: 10 ..< 13, heads: 1, headDim: 1)
+        let second = makePositionKV(positions: 20 ..< 21, heads: 1, headDim: 1)
+        _ = longer.update(keys: first.0, values: first.1)
+        _ = shorter.update(keys: second.0, values: second.1)
+        let merged = BatchKVCache.merge([longer, shorter, KVCacheSimple()])
+        #expect(merged.leftPadding.asArray(Int32.self) == [0, 2, 3])
+        #expect(merged.batchOffsets.asArray(Int32.self) == [3, 1, 0])
+        try expectRow(merged.extractBatched(0), positions: [10, 11, 12])
+        try expectRow(merged.extractBatched(1), positions: [20])
+        let next = MLXArray([Float(13), 21, 30], [3, 1, 1, 1])
+        _ = merged.update(keys: next, values: next + 100)
+        try expectRow(merged.extractBatched(0), positions: [10, 11, 12, 13])
+        try expectRow(merged.extractBatched(1), positions: [20, 21])
+        try expectRow(merged.extractBatched(2), positions: [30])
+
+        let empty = BatchKVCache.merge([KVCacheSimple(), KVCacheSimple()])
+        #expect(empty.isEmpty)
+        #expect(empty.batchSize == 2)
+        let initial = MLXArray([Float(40), 50], [2, 1, 1, 1])
+        _ = empty.update(keys: initial, values: initial + 100)
+        try expectRow(empty.extractBatched(0), positions: [40])
+        try expectRow(empty.extractBatched(1), positions: [50])
+    }
+
     private func expectRow(_ row: any KVCache, positions: [Float]) throws {
         #expect(row.offset == positions.count)
         let state = row.state
@@ -376,23 +475,27 @@ struct BatchRotatingKVCacheCoverageTests {
         #expect(cache.keep == 2)
         #expect(extracted.maxSize == 4)
         #expect(keys.dim(2) <= 4)
-        // Each key is stamped with its absolute position, so the retained
-        // window is checkable by content: the pinned keep prefix (0, 1)
-        // plus the newest suffix (3, 4), with the oldest non-keep position
-        // (2) evicted. Compared as a sorted set because the ring's internal
-        // layout may rotate.
-        let retained = keys[0, 0, 0..., 0].asArray(Float.self).sorted()
+        // Extraction promises temporal order, including the pinned keep prefix.
+        let retained = keys[0, 0, 0..., 0].asArray(Float.self)
         #expect(retained == [0, 1, 3, 4])
         // Values ride the same eviction: a rotate that keeps the right keys
         // but leaves stale or misordered values feeds corrupted values to
         // attention (makePositionKV stamps them at +100).
         let values = try #require(extracted.state.last)
-        // Pairing first, then the set: sorting each side independently would
-        // accept a cache that retains the right values but permutes them
-        // differently from the keys, pairing every key with a wrong value.
         #expect(maxAbsDifference(values, keys + 100) == 0)
-        let retainedValues = values[0, 0, 0..., 0].asArray(Float.self).sorted()
+        let retainedValues = values[0, 0, 0..., 0].asArray(Float.self)
         #expect(retainedValues == [100, 101, 103, 104])
+
+        for position in 5 ..< 8 {
+            let next = makePositionKV(positions: position ..< (position + 1), heads: 2, headDim: 4)
+            _ = cache.update(keys: next.0, values: next.1)
+            let continued = cache.extract(idx: 0)
+            #expect(continued.offset == position + 1)
+            let expected = MLXArray(
+                [Float(0), 1, Float(position - 1), Float(position)], [1, 1, 4, 1])
+            #expect(maxAbsDifference(continued.state[0], expected) == 0)
+            #expect(maxAbsDifference(continued.state[1], expected + 100) == 0)
+        }
     }
 
     @Test("isTrimmable(after:) predicts window overflow")
