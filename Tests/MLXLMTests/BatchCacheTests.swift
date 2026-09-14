@@ -424,6 +424,46 @@ struct BatchKVCacheCoverageTests {
 @Suite(.serialized)
 struct BatchRotatingKVCacheCoverageTests {
 
+    @Test(
+        "Ragged decode masks select each row's real sliding window through wrap", arguments: [3, 8])
+    func raggedMasksPreserveEachRowsWindow(windowSize: Int) throws {
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [7, 0])
+        let prefill = MLXArray(
+            [Float(-99), -99, -99, -99, -99, -99, -99, 10, 20, 21, 22, 23, 24, 25, 26, 27],
+            [2, 1, 8, 1])
+        _ = cache.update(keys: prefill, values: prefill + 100)
+        var histories: [[Float]] = [[10], (20 ..< 28).map(Float.init)]
+
+        for step in 0 ..< 14 {
+            guard
+                case .array(let mask) = cache.makeMask(
+                    n: 1, windowSize: windowSize, returnArray: true)
+            else {
+                Issue.record("Expected an explicit per-row sliding-window mask")
+                return
+            }
+            let tokens = [Float(11 + step), Float(28 + step)]
+            let input = MLXArray(tokens, [2, 1, 1, 1])
+            let (keys, values) = cache.update(keys: input, values: input + 100)
+            try #require(keys.shape == [2, 1, 8, 1])
+            try #require(values.shape == keys.shape)
+            try #require(mask.shape == [2, 1, 1, 8])
+            for row in 0 ..< 2 {
+                histories[row].append(tokens[row])
+                let visible = mask[row, 0, 0, 0...].asArray(Bool.self)
+                let rowKeys = keys[row, 0, 0..., 0].asArray(Float.self)
+                let rowValues = values[row, 0, 0..., 0].asArray(Float.self)
+                let attendedKeys = zip(rowKeys, visible).compactMap { key, allowed in
+                    allowed ? key : nil
+                }.sorted()
+                let expected = Array(histories[row].suffix(windowSize))
+                #expect(attendedKeys == expected)
+                #expect(rowValues == rowKeys.map { $0 + 100 })
+            }
+            #expect(cache.batchOffsets.asArray(Int32.self) == histories.map { Int32($0.count) })
+        }
+    }
+
     @Test("Empty receiver adopts wrapped history and continues decoding")
     func emptyReceiverPreservesWrappedHistory() throws {
         let receiver = BatchRotatingKVCache(maxSize: 8, leftPadding: [])
