@@ -1564,3 +1564,49 @@ func testDiscardingAGeneratedTokenDoesNotMoveTheTimeline() throws {
     #expect(timeline >= prompt.count + emitted - 1)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
+
+@Suite
+struct MTPRawTaskIntegrationTests {
+    @Test(
+        "The public raw task runs MTP and finalizes unreturned lookahead", arguments: [false, true])
+    func testRawTaskRunsMTP(includeStop: Bool) async throws {
+        let prompt: [Int32] = [1, 2, 3]
+        let script = mixedAcceptanceScript(drafted: 7)
+        let parameters = GenerateParameters(maxTokens: 24, temperature: 0)
+        let ordinaryModel = PositionScriptedMainModel(script: script, slidingWindow: 8)
+        let ordinary = Array(
+            try TokenIterator(
+                input: LMInput(tokens: MLXArray(prompt)), model: ordinaryModel,
+                parameters: parameters))
+        let stop = try #require(ordinary.last)
+        let prefix = Array(ordinary.prefix { $0 != stop })
+        let model = PositionScriptedMainModel(script: script, slidingWindow: 8)
+        let caches = model.newCache(parameters: nil)
+        let iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)), mainModel: model,
+            drafter: MockDrafter(draftedTokenValue: 7), mainCache: caches,
+            parameters: parameters, blockSize: 4)
+        let (stream, task) = generateTokenTask(
+            promptTokenCount: prompt.count,
+            modelConfiguration: .init(id: "test", eosTokenIds: [stop]),
+            tokenizer: TestTokenizer(), iterator: iterator, includeStopToken: includeStop)
+        var tokens: [Int] = []
+        var info: GenerateCompletionInfo?
+        for await event in stream {
+            switch event {
+            case .token(let token): tokens.append(token)
+            case .info(let completion): info = completion
+            }
+        }
+        await task.value
+        #expect(tokens == prefix + (includeStop ? [stop] : []))
+        #expect(info?.stopReason == .stop)
+        #expect(info?.generationTokenCount == tokens.count)
+        #expect((info?.proposedDraftTokens ?? 0) > 0)
+        #expect(info?.passthroughReason == nil)
+        // Producer completion includes trimming unreturned speculative candidates.
+        let upperBound = prompt.count + tokens.count
+        #expect(caches.allSatisfy { (upperBound - 1 ... upperBound).contains($0.offset) })
+    }
+
+}
