@@ -29,6 +29,7 @@ final class GenerationExecutionTests: XCTestCase {
         var promptPrefillTime: TimeInterval { 0 }
         var onNext: @Sendable () -> Void = {}
         var onFinalize: @Sendable () -> Void = {}
+        var onSynchronize: @Sendable () -> Void = {}
 
         mutating func next() -> Int? {
             guard tokenCount < (maxTokens ?? Int.max) else { return nil }
@@ -37,8 +38,29 @@ final class GenerationExecutionTests: XCTestCase {
             return 42
         }
 
+        func synchronizeGeneration() {
+            onSynchronize()
+            GenerationStreamTracker().synchronize()
+        }
+
         mutating func finalizeGeneration() {
             onFinalize()
+        }
+    }
+
+    func testProducerSynchronizesIteratorBeforeCompleting() async {
+        for cancelled in [false, true] {
+            let synchronized = expectation(description: "iterator streams drained")
+            let (stream, task) = generateTaskRecordingTokens(
+                promptTokenCount: 1, modelConfiguration: .init(id: "test"),
+                tokenizer: TestTokenizer(),
+                iterator: Iterator(
+                    maxTokens: cancelled ? 0 : 1,
+                    onSynchronize: { synchronized.fulfill() }))
+            if cancelled { task.cancel() }
+            await task.value
+            await fulfillment(of: [synchronized], timeout: 0)
+            withExtendedLifetime(stream) {}
         }
     }
 
