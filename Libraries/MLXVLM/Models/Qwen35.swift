@@ -977,7 +977,7 @@ public enum Qwen35Language {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
 
-                    var delta = MLXArray(cacheOffset).asType(.int32)
+                    var delta = QwenVL.decodeOffsets(cache?[model.faIdx], batchSize: batchSize)
                     if let ropeDeltas {
                         delta = delta + ropeDeltas.asType(.int32)
                     }
@@ -993,7 +993,7 @@ public enum Qwen35Language {
                         delta = delta[0 ..< batchSize]
                     }
 
-                    base = base + delta[0..., .newAxis]
+                    base = base + delta.reshaped(batchSize, 1)
                     positionIds = broadcast(
                         base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
                 }
@@ -1510,4 +1510,22 @@ extension Qwen35 {
 extension Qwen35 {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+extension Qwen35: BatchedGenerationStateProviding {
+    public var generationStateBytesPerRow: Int { MemoryLayout<Int32>.size }
+
+    public func mergeGenerationStates(_ states: [LMOutput.State]) -> LMOutput.State {
+        QwenVL.mergeGenerationStates(states, key: ropeDeltasKey)
+    }
+
+    public func selectGenerationState(
+        _ state: LMOutput.State, batchIndices: [Int]
+    ) -> LMOutput.State {
+        QwenVL.selectGenerationState(state, key: ropeDeltasKey, batchIndices: batchIndices)
+    }
+
+    public func generationStateArrays(_ state: LMOutput.State) -> [MLXArray] {
+        [state[ropeDeltasKey]].compactMap { $0 }
+    }
 }

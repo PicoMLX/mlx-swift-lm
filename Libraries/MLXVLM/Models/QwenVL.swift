@@ -52,6 +52,51 @@ public struct QwenVL {
         return resumeState
     }
 
+    static func mergeGenerationStates(
+        _ states: [LMOutput.State], key: LMOutput.Key<MLXArray>
+    ) -> LMOutput.State {
+        let values = states.flatMap { state -> [Int32] in
+            guard let delta = state[key] else {
+                preconditionFailure("Prepared Qwen state is missing \(key.id)")
+            }
+            precondition(delta.ndim == 1)
+            return delta.asType(.int32).asArray(Int32.self)
+        }
+        var merged = LMOutput.State()
+        // Small position metadata owns fresh storage, including after row removal.
+        merged[key] = MLXArray(values)
+        return merged
+    }
+
+    static func selectGenerationState(
+        _ state: LMOutput.State, key: LMOutput.Key<MLXArray>, batchIndices: [Int]
+    ) -> LMOutput.State {
+        guard let delta = state[key] else {
+            preconditionFailure("Prepared Qwen state is missing \(key.id)")
+        }
+        let values = delta.asType(.int32).asArray(Int32.self)
+        var selected = LMOutput.State()
+        selected[key] = MLXArray(batchIndices.map { values[$0] })
+        return selected
+    }
+
+    static func decodeOffsets(_ cache: KVCache?, batchSize: Int) -> MLXArray {
+        if let batch = cache as? any BatchPositionedKVCache {
+            precondition(batch.batchOffset.size == batchSize)
+            return batch.batchOffset.asType(.int32)
+        }
+        return MLXArray(Int32(cache?.offset ?? 0))
+    }
+
+    static func attentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
+        if let first = cache?.first, first is any BatchPositionedKVCache,
+            case .array(let mask) = first.makeMask(n: h.dim(1), windowSize: nil, returnArray: true)
+        {
+            return mask
+        }
+        return createAttentionMask(h: h, cache: cache)
+    }
+
     /// Rotates half the hidden dims of the input
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let index = x.dim(-1) / 2
