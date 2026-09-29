@@ -377,6 +377,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache], state: state)
     let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_count"] = "2"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -399,6 +401,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache], state: state)
     let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_version"] = "999"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -423,6 +427,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache], state: state)
     let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_1_key"] = "test.first"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -445,6 +451,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache], state: state)
     let (storedArrays, metadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(storedArrays.values))
     var malformedArrays = storedArrays
     malformedArrays["__mlx_lm_state_tensor_99"] = MLXArray([Int32(99)])
     try save(arrays: malformedArrays, metadata: metadata, url: url)
@@ -467,6 +475,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache], state: state)
     let (arrays, storedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var malformedMetadata = storedMetadata
     malformedMetadata["2.0"] = "KVCache"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -486,6 +496,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     try savePromptCache(url: url, cache: [cache])
     let (arrays, storedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var malformedMetadata = storedMetadata
     malformedMetadata["2.0"] = "__mlx_lm_state_v1__:KVCache"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -2391,6 +2403,8 @@ func testRotatingTrimSurvivesPromptCachePersistenceAndCopy(metadataCount: Int) t
     try savePromptCache(url: url, cache: [source])
     // Exercise the real file loader with each historical metadata format.
     let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    // Materialize lazy file-backed tensors before truncating the source fixture.
+    eval(Array(arrays.values))
     var metadata = savedMetadata
     for index in metadataCount ..< 7 {
         metadata.removeValue(forKey: "0.0.\(index)")
