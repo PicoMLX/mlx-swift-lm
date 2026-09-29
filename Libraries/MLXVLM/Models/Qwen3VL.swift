@@ -1810,6 +1810,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
+        let input = QwenVL.normalizedInput(input)
         let inputIds = input.text.tokens
         // Text-only follow-up processors may return rank-1 tokens. The language
         // model and continuation slicers require [batch, sequence], so normalize

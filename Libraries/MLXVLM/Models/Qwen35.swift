@@ -1227,6 +1227,7 @@ public class Qwen35: Module, VLMModel {
         state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
+        let input = QwenVL.normalizedInput(input)
         let inputIds = input.text.tokens
         let inputIds2D = inputIds.ndim == 1 ? inputIds[.newAxis, 0...] : inputIds
         let cacheOffset = faCacheOffset(cache)

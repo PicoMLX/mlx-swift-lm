@@ -656,6 +656,7 @@ public final class Qwen3VLMoE: Module, VLMModel, KVCacheDimensionProvider {
         state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
+        let input = QwenVL.normalizedInput(input)
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?

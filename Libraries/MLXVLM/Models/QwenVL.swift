@@ -52,6 +52,14 @@ public struct QwenVL {
         return resumeState
     }
 
+    static func normalizedInput(_ input: LMInput) -> LMInput {
+        guard input.text.tokens.ndim == 1 else { return input }
+        let mask = input.text.mask.map { $0.ndim == 1 ? $0[.newAxis, 0...] : $0 }
+        return LMInput(
+            text: .init(tokens: input.text.tokens[.newAxis, 0...], mask: mask),
+            image: input.image, video: input.video, audio: input.audio)
+    }
+
     static func mergeGenerationStates(
         _ states: [LMOutput.State], key: LMOutput.Key<MLXArray>
     ) -> LMOutput.State {

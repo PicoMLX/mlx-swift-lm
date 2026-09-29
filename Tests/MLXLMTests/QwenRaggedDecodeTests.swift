@@ -12,6 +12,51 @@ struct QwenRaggedDecodeTests {
         (family == .hybridMoE ? [true] : [false, true]).map { (family, $0) }
     }
 
+    @Test(arguments: Family.allCases, [4, 16])
+    func rankOneColdPrefillMatchesBatchedInput(family: Family, stepSize: Int) throws {
+        try Device.withDefaultDevice(.gpu) {
+            try withRandomState(MLXRandom.RandomState(seed: 913)) {
+                let model = try makeModel(family)
+                eval(model)
+                for image in [false, true] {
+                    let tokens =
+                        image
+                        ? MLXArray([Int32(1), 502, 500, 500, 500, 500, 2, 3])
+                        : MLXArray([Int32(4), 5, 6])
+                    let media: LMInput.ProcessedImage? =
+                        image
+                        ? .init(
+                            pixels: MLXArray.ones([16, 3 * 2 * 16 * 16]), frames: [THW(1, 4, 4)])
+                        : nil
+                    let singleCache = try model.newCache(parameters: nil)
+                    let batchCache = try model.newCache(parameters: nil)
+                    let prefill = PrefillParameters(stepSize: stepSize)
+                    guard
+                        case .logits(let single) = try model.prepare(
+                            .init(text: .init(tokens: tokens), image: media),
+                            cache: singleCache, state: nil, prefill: prefill),
+                        case .logits(let batch) = try model.prepare(
+                            .init(
+                                text: .init(tokens: tokens.reshaped(1, tokens.size)), image: media),
+                            cache: batchCache, state: nil, prefill: prefill)
+                    else {
+                        Issue.record("Expected native logits")
+                        return
+                    }
+                    #expect(single.logits.shape == batch.logits.shape)
+                    #expect(abs(single.logits - batch.logits).max().item(Float.self) < 0.0001)
+                    for (a, b) in zip(singleCache, batchCache) {
+                        #expect(a.offset == b.offset)
+                        for (x, y) in zip(a.state, b.state) {
+                            #expect(x.shape == y.shape)
+                            #expect(abs(x - y).max().item(Float.self) < 0.0001)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test(arguments: cases)
     func raggedDecodeMatchesIndependentRows(family: Family, gpu: Bool) throws {
         try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
