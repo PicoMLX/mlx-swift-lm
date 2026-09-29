@@ -669,6 +669,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var state: LMOutput.State? { get }
     var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { get }
     mutating func discardGeneratedToken()
+    func synchronizeGeneration()
 }
 
 /// Internal lifecycle capability for iterators that retain generation work
@@ -681,6 +682,11 @@ extension TokenIteratorProtocol {
     public var state: LMOutput.State? { nil }
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
     public mutating func discardGeneratedToken() {}
+
+    /// Custom iterators using other task-local streams must synchronize those streams here.
+    public func synchronizeGeneration() {
+        GenerationStreamTracker().synchronize()
+    }
 }
 
 /// Generator of tokens.
@@ -707,6 +713,13 @@ extension TokenIteratorProtocol {
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
 public struct TokenIterator: TokenIteratorProtocol {
+    private let generationStreams = GenerationStreamTracker()
+
+    public func synchronizeGeneration() {
+        generationStreams.capture()
+        generationStreams.synchronize()
+    }
+
     let model: any LanguageModel
 
     /// Per-call model state (e.g. M-RoPE rope deltas), seeded from the
@@ -924,6 +937,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -986,6 +1000,12 @@ public struct TokenIterator: TokenIteratorProtocol {
 ///
 /// Port of `speculative_generate_step()` from https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 public struct SpeculativeTokenIterator: TokenIteratorProtocol {
+    private let generationStreams = GenerationStreamTracker()
+
+    public func synchronizeGeneration() {
+        generationStreams.capture()
+        generationStreams.synchronize()
+    }
 
     var y: LMInput.Text
     var draftY: LMInput.Text
@@ -1294,6 +1314,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
+        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1518,7 +1539,7 @@ private func runSynchronousGenerationLoop(
     // exits the program right away, those tasks will still be executing and will
     // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
     // to make sure it is complete.
-    Stream().synchronize()
+    iterator.synchronizeGeneration()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -2351,7 +2372,7 @@ private func generateLoopTask<
             // `while let token = iterator.next()` form) allowed one extra asyncEval to be
             // submitted post-cancellation, which faults if the app has backgrounded
             // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
-            // post-loop block below assigns `.cancelled`; Stream().synchronize() still
+            // post-loop block below assigns `.cancelled`; iterator.synchronizeGeneration() still
             // settles any in-flight evaluation at the end of the task body.
             tokenLoop: while !Task.isCancelled {
                 guard let token = autoreleasepool(invoking: { iterator.next() }) else { break }
@@ -2446,7 +2467,7 @@ private func generateLoopTask<
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+            iterator.synchronizeGeneration()
 
             // Finalize the stream
             continuation.finish()
