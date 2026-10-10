@@ -386,7 +386,14 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Internal variant that keeps an in-flight load of an already-present
     /// model out of the `.downloading` availability signal.
     func loadContainer(suppressDownloadingState: Bool) async throws -> ModelContainer {
-        try await Self.cache.load(
+        // The cache is keyed by model ID alone, so a sharded container would be handed to a
+        // caller that asked for the whole model, or the reverse. This adapter also has no
+        // way to drive the other processes of the group.
+        if configuration.tensorParallelGroup != nil {
+            throw ModelFactoryError.invalidConfiguration(
+                "MLXLanguageModel cannot run a model split across a distributed group")
+        }
+        return try await Self.cache.load(
             modelID: modelID,
             suppressDownloadingState: suppressDownloadingState,
             loader: makeContainerLoader())

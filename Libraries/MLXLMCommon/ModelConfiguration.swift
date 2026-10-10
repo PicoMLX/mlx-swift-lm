@@ -135,6 +135,11 @@ public struct ModelConfiguration: Sendable {
     /// When set, the model is sharded before its weights are read, so this process only
     /// ever holds its share of them -- see `loadShardedWeights`. Loading fails for a model
     /// that cannot be sharded. `nil`, the default, loads the whole model.
+    ///
+    /// Only a text model can be sharded. The vision factory refuses a group, so the generic
+    /// loaders (`loadModelContainer(from:using:configuration:)`) fall back to the text
+    /// factory, as they do whenever the vision factory fails: a multimodal checkpoint then
+    /// loads as its text model, without image or video input.
     public var tensorParallelGroup: MLXDistributed.Group? = nil
 
     /// Overrides the ``MessageGenerator`` the model would otherwise supply.
