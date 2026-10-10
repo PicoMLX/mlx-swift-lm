@@ -168,16 +168,24 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// Why a Qwen 3.5 model cannot be sharded for tensor parallelism.
+public enum Qwen35ShardingError: Error {
+    /// Mixture-of-experts layers are not sharded yet.
+    case mixtureOfExpertsNotSupported
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
-    let numVHeads: Int
-    let numKHeads: Int
     let headKDim: Int
     let headVDim: Int
-    let keyDim: Int
-    let valueDim: Int
     let convKernelSize: Int
-    let convDim: Int
+
+    // Sharding divides these by the group size.
+    private(set) var numVHeads: Int
+    private(set) var numKHeads: Int
+    private(set) var keyDim: Int
+    private(set) var valueDim: Int
+    private(set) var convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -276,6 +284,54 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+    /// Keep this process' share of the heads for tensor parallelism. The heads
+    /// stay independent until `out_proj`, which sums the partial results.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard numKHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "linear attention key heads", of: numKHeads, across: size)
+        }
+        // q, k and v share one projection and one conv; each is sharded on its own.
+        let qkv = Segments.indices([keyDim, 2 * keyDim])
+
+        try shardInPlace(conv1d, predicate: { _, _ in (0, qkv) }, group: group)
+        // `groups` is fixed at init, so the sharded weight needs a new layer.
+        let conv = Conv1d(
+            inputChannels: convDim / size, outputChannels: convDim / size,
+            kernelSize: convKernelSize, groups: convDim / size, bias: false)
+        conv.update(parameters: conv1d.parameters())
+
+        // The fused projection was built for the whole layer.
+        fusedInputProjectionEnabled = false
+        try update(
+            modules: ModuleChildren(values: [
+                "conv1d": .value(conv),
+                "in_proj_qkv": .value(
+                    try shardLinear(
+                        inProjQKV, sharding: .allToSharded, segments: qkv, group: group)),
+                "in_proj_z": .value(
+                    try shardLinear(inProjZ, sharding: .allToSharded, group: group)),
+                "in_proj_b": .value(
+                    try shardLinear(inProjB, sharding: .allToSharded, group: group)),
+                "in_proj_a": .value(
+                    try shardLinear(inProjA, sharding: .allToSharded, group: group)),
+                "out_proj": .value(
+                    try shardLinear(outProj, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        update(
+            parameters: ModuleParameters.unflattened([
+                "dt_bias": contiguous(dtBias.split(parts: size)[group.rank]),
+                "A_log": contiguous(aLog.split(parts: size)[group.rank]),
+            ]))
+
+        numKHeads /= size
+        numVHeads /= size
+        keyDim /= size
+        valueDim /= size
+        convDim /= size
+    }
 
     /// Build one physical quantized projection while retaining the four named
     /// module paths as storage-sharing views. This runs at most once between
@@ -506,8 +562,9 @@ final class Qwen35GatedDeltaNet: Module {
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
-    let attentionHeads: Int
-    let kvHeads: Int
+    // Sharding divides these by the group size.
+    private(set) var attentionHeads: Int
+    private(set) var kvHeads: Int
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
@@ -548,6 +605,25 @@ final class Qwen35Attention: Module {
         )
 
         super.init()
+    }
+
+    /// Keep this process' share of the heads for tensor parallelism. `o_proj`
+    /// sums the partial results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard kvHeads % size == 0, attentionHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "attention key-value heads", of: kvHeads, across: size)
+        }
+        try update(
+            modules: ModuleChildren(values: [
+                "q_proj": .value(try shardLinear(qProj, sharding: .allToSharded, group: group)),
+                "k_proj": .value(try shardLinear(kProj, sharding: .allToSharded, group: group)),
+                "v_proj": .value(try shardLinear(vProj, sharding: .allToSharded, group: group)),
+                "o_proj": .value(try shardLinear(oProj, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        attentionHeads /= size
+        kvHeads /= size
     }
 
     func callAsFunction(
@@ -729,9 +805,9 @@ final class Qwen35DecoderLayer: Module {
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
-        // (two for full attention, split at the KV write). Everything else
-        // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        // (two for full attention, split at the KV write). Everything else,
+        // including a sharded layer, takes the general body below.
+        if !isSharded, x.dim(1) == 1, ssmMask == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -753,6 +829,29 @@ final class Qwen35DecoderLayer: Module {
 
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    /// Set once the layer holds a shard. The traced decode paths were built
+    /// and verified for the whole layer, so a sharded layer skips them.
+    private(set) var isSharded = false
+
+    /// Keep this process' share of the layer: its heads and its MLP width.
+    func shard(group: MLXDistributed.Group) throws {
+        guard let mlp = mlp as? Qwen3NextMLP else {
+            throw Qwen35ShardingError.mixtureOfExpertsNotSupported
+        }
+        try linearAttn?.shard(group: group)
+        try selfAttn?.shard(group: group)
+        try mlp.update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(
+                    try shardLinear(mlp.gateProj, sharding: .allToSharded, group: group)),
+                "up_proj": .value(
+                    try shardLinear(mlp.upProj, sharding: .allToSharded, group: group)),
+                "down_proj": .value(
+                    try shardLinear(mlp.downProj, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        isSharded = true
     }
 
     // MARK: - Compiled decode blocks
@@ -909,6 +1008,16 @@ public class Qwen35TextModelInner: Module {
         forward(inputs, cache: cache, applyFinalNorm: true)
     }
 
+    /// Set once the layers hold shards; the compiled decode schedule is then skipped.
+    private(set) var isSharded = false
+
+    func shard(group: MLXDistributed.Group) throws {
+        for layer in layers {
+            try layer.shard(group: group)
+        }
+        isSharded = true
+    }
+
     /// Backbone hidden states with optional final normalization.
     ///
     /// MTP state emission needs access to both the residual and the final
@@ -920,7 +1029,7 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+        if !isSharded, applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
@@ -1146,6 +1255,24 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Keep this process' share of the model for tensor parallelism.
+    ///
+    /// Every process in `group` loads the same weights and calls this before
+    /// its first forward pass. Attention heads, gated delta heads and MLP
+    /// widths are divided across the group; embeddings, norms and `lm_head`
+    /// stay whole. The processes must then run the same forward passes in the
+    /// same order. A group of one changes nothing.
+    ///
+    /// Throws when a dimension does not divide by the group size, or the model
+    /// is mixture-of-experts. Discard a model that failed to shard.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        let group = try group ?? MLXDistributed.initialize()
+        guard group.size > 1 else { return }
+        try model.shard(group: group)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
@@ -1255,6 +1382,12 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func prepare() throws {
         try languageModel.prepare()
+    }
+
+    /// Keep this process' share of the model for tensor parallelism; see
+    /// ``Qwen35TextModel/shard(group:)``.
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        try languageModel.shard(group: group)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
