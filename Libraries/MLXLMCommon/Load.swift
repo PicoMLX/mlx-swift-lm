@@ -372,17 +372,31 @@ public func loadWeights(
     weightFileSelection: WeightFileSelection = .automatic
 ) throws {
     // load the weights and collect metadata from the first safetensor file
-    var weights = [String: MLXArray]()
-    var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+    let (weights, metadata) = try loadWeightArrays(urls: weightURLs)
 
+    try attach(
+        weights, metadata: metadata, to: model, quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
+
+    // Build derived inference-only state and realize the model while the loader
+    // still has exclusive access. Forward passes must remain read-only.
+    materializeModelForInference(model)
+}
+
+/// Sanitize `weights`, quantize the layers they hold quantized weights for, and set them
+/// on `model`. Reads no tensor data, so it works on arrays that are still unread.
+private func attach(
+    _ weights: [String: MLXArray], metadata: [String: String], to model: BaseLanguageModel,
+    quantization: BaseConfiguration.Quantization?,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+) throws {
     // per-model cleanup (models can inspect metadata to customize behavior)
-    weights = model.sanitize(weights: weights, metadata: metadata)
+    let weights = model.sanitize(weights: weights, metadata: metadata)
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
@@ -402,10 +416,98 @@ public func loadWeights(
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
+}
 
-    // Build derived inference-only state and realize the model while the loader
-    // still has exclusive access. Forward passes must remain read-only.
+/// The weights of every file in `urls`, still unread: only each file's header is read.
+///
+/// Merged like `loadWeightArrays(urls:)`: a later file overwrites a duplicate name, and
+/// the metadata is the first file's.
+func openWeightArrays(urls: [URL]) throws -> (
+    weights: [String: MLXArray], metadata: [String: String]
+) {
+    var weights = [String: MLXArray]()
+    var metadata = [String: String]()
+    for url in urls {
+        let (arrays, fileMetadata) = try loadArraysAndMetadata(url: url, stream: .cpu)
+        weights.merge(arrays) { _, new in new }
+        if metadata.isEmpty { metadata = fileMetadata }
+    }
+    return (weights, metadata)
+}
+
+/// Load model weights for tensor parallelism, keeping only this process' share in memory.
+///
+/// The steps are those of
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``
+/// in a different order. The weight files are opened without reading them, the unread
+/// tensors are set on the model, the model is sharded, and only then are the weights read,
+/// one tensor at a time. Each tensor is read whole, this process' part is kept, and the rest
+/// is released before the next one is read, so the whole model is never in memory. A model
+/// that cannot be sharded fails before anything is read.
+///
+/// Every process in `group` calls this with the same model files. It does not communicate;
+/// run a collective such as `MLXDistributed.allSum` afterwards to confirm that every process
+/// loaded.
+///
+/// - Parameters:
+///   - modelDirectory: directory holding the weight files
+///   - model: the model to load into
+///   - group: the group to shard across. A group of one loads the whole model.
+///   - quantization: quantization to apply to the layers the checkpoint quantized
+///   - perLayerQuantization: per-layer quantization, taking precedence over `quantization`
+///   - weightFileSelection: how to choose the weight files
+public func loadShardedWeights(
+    modelDirectory: URL, model: any BaseLanguageModel & TensorParallelModel,
+    group: MLXDistributed.Group,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) throws {
+    let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
+    let weightURLs = try safetensorWeightURLs(
+        in: modelDirectory,
+        selection: weightFileSelection,
+        additionalFiles: additionalFiles ?? [])
+    do {
+        // Scoped: a reference left on an unread tensor would keep it whole once it is read.
+        let (weights, metadata) = try openWeightArrays(urls: weightURLs)
+        try attach(
+            weights, metadata: metadata, to: model, quantization: quantization,
+            perLayerQuantization: perLayerQuantization)
+    }
+    try model.shard(group: group)
+
+    // One tensor per eval: a single eval of the model keeps whole tensors alive longer.
+    for (_, parameter) in model.parameters().flattened() {
+        eval(parameter)
+    }
     materializeModelForInference(model)
+}
+
+/// Async variant of `loadShardedWeights`, for the same reason
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``
+/// has one: the load blocks its thread, so it runs on a global queue.
+public func loadShardedWeights(
+    modelDirectory: URL, model: any BaseLanguageModel & TensorParallelModel,
+    group: MLXDistributed.Group,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) async throws {
+    let model = SendableBox(model)
+    try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, any Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(
+                with: Result {
+                    try loadShardedWeights(
+                        modelDirectory: modelDirectory, model: model.consume(), group: group,
+                        quantization: quantization,
+                        perLayerQuantization: perLayerQuantization,
+                        weightFileSelection: weightFileSelection)
+                })
+        }
+    }
 }
 
 /// Async variant of

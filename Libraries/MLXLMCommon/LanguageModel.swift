@@ -37,6 +37,17 @@ public protocol AdditionalWeightFilesProviding {
     var additionalWeightFiles: [String] { get }
 }
 
+/// A model that can keep only its share of the weights, so a group of processes
+/// runs it together with tensor parallelism.
+///
+/// `loadShardedWeights` shards a model through this protocol before it reads the weights.
+public protocol TensorParallelModel {
+    /// Keep this process' share of the model.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    func shard(group: MLXDistributed.Group?) throws
+}
+
 /// Optional metadata a model wants written into converted safetensors.
 ///
 /// Model-specific metadata lets future loaders distinguish transformed MLX-native
