@@ -172,6 +172,13 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 public enum Qwen35ShardingError: Error {
     /// Mixture-of-experts layers are not sharded yet.
     case mixtureOfExpertsNotSupported
+
+    /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
+    /// Fuse the adapter into the model first.
+    case unfusedAdapters
+
+    /// The model already holds shards and cannot be sharded again.
+    case alreadySharded
 }
 
 final class Qwen35GatedDeltaNet: Module {
@@ -835,11 +842,25 @@ final class Qwen35DecoderLayer: Module {
     /// and verified for the whole layer, so a sharded layer skips them.
     private(set) var isSharded = false
 
+    /// Throws when sharding could not split part of the layer, or would drop it.
+    func validateShardable() throws {
+        guard mlp is Qwen3NextMLP else {
+            throw Qwen35ShardingError.mixtureOfExpertsNotSupported
+        }
+        // `shardLinear` rebuilds a projection from its base weights alone.
+        guard !modules().contains(where: { $0 is LoRALayer }) else {
+            throw Qwen35ShardingError.unfusedAdapters
+        }
+    }
+
     /// Keep this process' share of the layer: its heads and its MLP width.
+    /// Call ``validateShardable()`` first.
     func shard(group: MLXDistributed.Group) throws {
         guard let mlp = mlp as? Qwen3NextMLP else {
             throw Qwen35ShardingError.mixtureOfExpertsNotSupported
         }
+        // Set first: a layer that fails part-way must still skip the traced paths.
+        isSharded = true
         try linearAttn?.shard(group: group)
         try selfAttn?.shard(group: group)
         try mlp.update(
@@ -851,7 +872,6 @@ final class Qwen35DecoderLayer: Module {
                 "down_proj": .value(
                     try shardLinear(mlp.downProj, sharding: .shardedToAll, group: group)),
             ]), verify: [])
-        isSharded = true
     }
 
     // MARK: - Compiled decode blocks
@@ -1012,10 +1032,16 @@ public class Qwen35TextModelInner: Module {
     private(set) var isSharded = false
 
     func shard(group: MLXDistributed.Group) throws {
+        // Refuse before changing anything, so a refused model stays whole.
+        guard !isSharded else { throw Qwen35ShardingError.alreadySharded }
+        for layer in layers {
+            try layer.validateShardable()
+        }
+        // Set first: a model that fails part-way holds shards and cannot be sharded again.
+        isSharded = true
         for layer in layers {
             try layer.shard(group: group)
         }
-        isSharded = true
     }
 
     /// Backbone hidden states with optional final normalization.
@@ -1263,8 +1289,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// stay whole. The processes must then run the same forward passes in the
     /// same order. A group of one changes nothing.
     ///
-    /// Throws when a dimension does not divide by the group size, or the model
-    /// is mixture-of-experts. Discard a model that failed to shard.
+    /// Throws, leaving the model unchanged, when it is mixture-of-experts, holds
+    /// unfused adapters, or was sharded before. Also throws when a dimension
+    /// does not divide by the group size; discard the model then.
     ///
     /// - Parameter group: the group to shard across, or `nil` for the global group
     public func shard(group: MLXDistributed.Group? = nil) throws {

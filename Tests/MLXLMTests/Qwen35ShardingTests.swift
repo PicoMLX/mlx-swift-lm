@@ -125,6 +125,45 @@ final class Qwen35ShardingTests: XCTestCase {
         }
     }
 
+    /// Sharding again would split the shards a second time.
+    func testRepeatedShardingIsRejected() throws {
+        let model = try makeModel(quantized: false)
+        let group = try MLXDistributed.initialize()
+        try model.model.shard(group: group)
+        let sharded = try logits(model)
+
+        XCTAssertThrowsError(try model.model.shard(group: group)) { error in
+            XCTAssertEqual(error as? Qwen35ShardingError, .alreadySharded)
+        }
+        XCTAssertTrue(model.model.isSharded)
+        assertClose(try logits(model), sharded, tolerance: 0, "after the refused call")
+    }
+
+    /// A sharded projection is rebuilt from its base weights, so an unfused
+    /// adapter would be dropped without a trace. The model must be refused whole.
+    func testModelWithUnfusedAdapterIsRejectedAndLeftWhole() throws {
+        let model = try makeModel(quantized: false)
+        let rank = 4
+        let adapter = LoRAContainer(
+            configuration: .init(
+                numLayers: 4,
+                loraParameters: .init(rank: rank, scale: 1.0, keys: ["self_attn.q_proj"])),
+            parameters: ModuleParameters.unflattened([
+                "model.layers.1.self_attn.q_proj.lora_a": MLXRandom.normal([64, rank]),
+                "model.layers.1.self_attn.q_proj.lora_b": MLXRandom.normal([rank, 128]),
+                "model.layers.3.self_attn.q_proj.lora_a": MLXRandom.normal([64, rank]),
+                "model.layers.3.self_attn.q_proj.lora_b": MLXRandom.normal([rank, 128]),
+            ]))
+        try adapter.load(into: model)
+        let adapted = try logits(model)
+
+        XCTAssertThrowsError(try model.model.shard(group: MLXDistributed.initialize())) { error in
+            XCTAssertEqual(error as? Qwen35ShardingError, .unfusedAdapters)
+        }
+        XCTAssertFalse(model.model.isSharded)
+        assertClose(try logits(model), adapted, tolerance: 0, "after the refused call")
+    }
+
     func testMixtureOfExpertsModelIsRejected() throws {
         let model = Qwen35TextModel(try configuration(experts: 4))
 
