@@ -1438,6 +1438,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
+extension Qwen35TextModel: TensorParallelModel {}
+
+extension Qwen35Model: TensorParallelModel {}
+
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
