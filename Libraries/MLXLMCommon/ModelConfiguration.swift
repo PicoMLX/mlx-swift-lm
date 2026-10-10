@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import MLX
 
 /// Configuration for a given model:  at least an org/name identifier or a directory with the model files.
 ///
@@ -129,6 +130,13 @@ public struct ModelConfiguration: Sendable {
     /// that case before reaching for it.
     public var weightFileSelection: WeightFileSelection = .automatic
 
+    /// The distributed group to split the model's weights across, for tensor parallelism.
+    ///
+    /// When set, the model is sharded before its weights are read, so this process only
+    /// ever holds its share of them -- see `loadShardedWeights`. Loading fails for a model
+    /// that cannot be sharded. `nil`, the default, loads the whole model.
+    public var tensorParallelGroup: MLXDistributed.Group? = nil
+
     /// Overrides the ``MessageGenerator`` the model would otherwise supply.
     ///
     /// A model class is shared by every checkpoint of its model type, so a fine-tune that
@@ -201,7 +209,8 @@ public struct ModelConfiguration: Sendable {
             toolCallFormat: toolCallFormat,
             reasoningConfig: reasoningConfig,
             messageGenerator: messageGenerator,
-            weightFileSelection: weightFileSelection)
+            weightFileSelection: weightFileSelection,
+            tensorParallelGroup: tensorParallelGroup)
     }
 
 }
@@ -220,6 +229,7 @@ extension ModelConfiguration: Equatable {
             && lhs.toolCallFormat == rhs.toolCallFormat
             && lhs.reasoningConfig == rhs.reasoningConfig
             && lhs.weightFileSelection == rhs.weightFileSelection
+            && lhs.tensorParallelGroup === rhs.tensorParallelGroup
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
     }
 
