@@ -738,10 +738,21 @@ public final class LLMModelFactory: GenericModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+        if let group = configuration.tensorParallelGroup {
+            guard let shardable = model as? any (BaseLanguageModel & TensorParallelModel) else {
+                throw ModelFactoryError.invalidConfiguration(
+                    "\(baseConfig.modelType) models cannot be split across a distributed group")
+            }
+            try await loadShardedWeights(
+                modelDirectory: modelDirectory, model: shardable, group: group,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        }
 
         let tokenizer = try await tokenizerTask
 
@@ -758,7 +769,7 @@ public final class LLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -768,6 +779,8 @@ public final class LLMModelFactory: GenericModelFactory {
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
+        // Kept on the loaded model's configuration so a caller can tell it holds a share.
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

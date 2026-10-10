@@ -2,6 +2,7 @@
 
 import Foundation
 import FoundationModels
+import MLX
 import MLXLLM
 import MLXLMCommon
 import Testing
@@ -164,6 +165,28 @@ extension FoundationModelsCacheTests {
 
             let lastError = await MLXLanguageModel.lastLoadErrorInCache(modelID: id)
             #expect(lastError == nil, "a superseded load must not re-populate cache state")
+        }
+
+        // The cache is keyed by model ID alone, so a sharded container must never enter it.
+        @Test("a configuration naming a distributed group is refused before anything loads")
+        func tensorParallelConfigurationIsRefused() async throws {
+            guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+            var configuration = ModelConfiguration(id: "org/sharded-\(UUID().uuidString)")
+            configuration.tensorParallelGroup = try MLXDistributed.initialize()
+            let model = MLXLanguageModel(
+                configuration: configuration,
+                capabilities: [],
+                weightsLocation: { _ in URL(fileURLWithPath: "/no/such/path") },
+                // Reaching the loader would surface this error instead of the refusal.
+                load: { _, _ in throw BlockingDownloaderReleased() })
+
+            do {
+                _ = try await model.loadContainer()
+                Issue.record("expected the load to be refused")
+            } catch ModelFactoryError.invalidConfiguration {
+                // expected
+            }
         }
     }
 }
