@@ -61,11 +61,12 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // mlx-swift 0.32.3 with MLX v0.32.3 (the ReduceScatter and JACCL ring fixes) and the
-        // JACCL backend (ml-explore/mlx-swift#502). PicoCore must name the same URL and branch.
+        // mlx-swift with MLX v0.32.4 (the ReduceScatter, JACCL ring and stream fixes, plus the
+        // Metal fence and eval-cleanup deadlock fixes) and the JACCL backend
+        // (ml-explore/mlx-swift#502). PicoCore must name the same URL and branch.
         .package(
             url: "https://github.com/PicoMLX/mlx-swift",
-            branch: "pico/0.32.3-jaccl"),
+            branch: "pico/0.32.4-jaccl"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
