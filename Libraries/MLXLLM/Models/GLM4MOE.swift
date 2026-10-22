@@ -11,9 +11,23 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Why a GLM-4 MoE model cannot be sharded for tensor parallelism.
+public enum GLM4MoEShardingError: Error {
+    /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
+    /// Fuse the adapter into the model first.
+    case unfusedAdapters
+
+    /// The model already holds shards and cannot be sharded again.
+    case alreadySharded
+}
+
 class GLM4MoEAttention: Module {
     let args: GLM4MoEConfiguration
     let scale: Float
+
+    // Sharding divides these by the group size.
+    private(set) var attentionHeads: Int
+    private(set) var kvHeads: Int
 
     @ModuleInfo(key: "q_proj") var wq: Linear
     @ModuleInfo(key: "k_proj") var wk: Linear
@@ -27,6 +41,8 @@ class GLM4MoEAttention: Module {
 
     init(_ args: GLM4MoEConfiguration) {
         self.args = args
+        self.attentionHeads = args.attentionHeads
+        self.kvHeads = args.kvHeads
 
         let headDim = args.headDim > 0 ? args.headDim : args.hiddenSize / args.attentionHeads
         self.scale = pow(Float(headDim), -0.5)
@@ -58,8 +74,8 @@ class GLM4MoEAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        queries = queries.reshaped(B, L, args.attentionHeads, -1)
-        keys = keys.reshaped(B, L, args.kvHeads, -1)
+        queries = queries.reshaped(B, L, attentionHeads, -1)
+        keys = keys.reshaped(B, L, kvHeads, -1)
 
         if let qNorm, let kNorm {
             queries = qNorm(queries)
@@ -68,7 +84,7 @@ class GLM4MoEAttention: Module {
 
         queries = queries.transposed(0, 2, 1, 3)
         keys = keys.transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -86,6 +102,25 @@ class GLM4MoEAttention: Module {
         .reshaped(B, L, -1)
 
         return wo(output)
+    }
+
+    /// Keep this process' share of the heads. The query and key norms are per
+    /// head, so they stay whole.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard attentionHeads % size == 0, kvHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "attention key-value heads", of: kvHeads, across: size)
+        }
+        try update(
+            modules: ModuleChildren(values: [
+                "q_proj": .value(try shardLinear(wq, sharding: .allToSharded, group: group)),
+                "k_proj": .value(try shardLinear(wk, sharding: .allToSharded, group: group)),
+                "v_proj": .value(try shardLinear(wv, sharding: .allToSharded, group: group)),
+                "o_proj": .value(try shardLinear(wo, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        attentionHeads /= size
+        kvHeads /= size
     }
 }
 
@@ -108,6 +143,20 @@ class GLM4MoEMLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         downProj(silu(gateProj(x)) * upProj(x))
+    }
+
+    /// Keep this process' share of the hidden width; `down_proj` sums the
+    /// partial results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        try update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(
+                    try shardLinear(gateProj, sharding: .allToSharded, group: group)),
+                "up_proj": .value(
+                    try shardLinear(upProj, sharding: .allToSharded, group: group)),
+                "down_proj": .value(
+                    try shardLinear(downProj, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
     }
 }
 
@@ -218,8 +267,37 @@ class GLM4MoE: Module, UnaryLayer {
         if let sharedExperts {
             y = y + sharedExperts(x)
         }
+        // Each shard computes part of every expert, so the block sums once.
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
+        }
         return y
     }
+
+    /// The group the experts are split across, once the block holds a shard.
+    private(set) var shardingGroup: MLXDistributed.Group?
+
+    /// Keep this process' share of every expert's hidden width, routed and
+    /// shared. The router stays whole.
+    func shard(group: MLXDistributed.Group) throws {
+        shardingGroup = group
+        try shardInPlace(switchMLP, predicate: expertSharding, group: group)
+        if let sharedExperts {
+            try shardInPlace(sharedExperts, predicate: expertSharding, group: group)
+        }
+    }
+}
+
+/// Splits an expert's hidden width: the gate and up projections by output row,
+/// the down projection by input column. The down projection's affine bias
+/// applies to the summed result, so it stays whole.
+private func expertSharding(_ path: String, _ weight: MLXArray) -> (
+    axis: Int, segments: Segments
+)? {
+    if path.hasPrefix("down_proj.") {
+        return path.hasSuffix(".bias") ? nil : (-1, .count(1))
+    }
+    return path.hasSuffix(".bias") ? (-1, .count(1)) : (weight.ndim - 2, .count(1))
 }
 
 class GLM4MoEDecoderLayer: Module {
@@ -251,6 +329,15 @@ class GLM4MoEDecoderLayer: Module {
         let h = x + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
+    }
+
+    func shard(group: MLXDistributed.Group) throws {
+        try attention.shard(group: group)
+        switch mlp {
+        case let moe as GLM4MoE: try moe.shard(group: group)
+        case let dense as GLM4MoEMLP: try dense.shard(group: group)
+        default: break
+        }
     }
 }
 
@@ -284,6 +371,22 @@ public class GLM4MoEModelInner: Module {
 
         return norm(h)
     }
+
+    /// Set once the layers hold shards.
+    private(set) var isSharded = false
+
+    func shard(group: MLXDistributed.Group) throws {
+        // Refuse before changing anything, so a refused model stays whole.
+        guard !isSharded else { throw GLM4MoEShardingError.alreadySharded }
+        // `shardLinear` rebuilds a projection from its base weights alone.
+        guard !modules().contains(where: { $0 is LoRALayer }) else {
+            throw GLM4MoEShardingError.unfusedAdapters
+        }
+        isSharded = true
+        for layer in layers {
+            try layer.shard(group: group)
+        }
+    }
 }
 
 public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -312,6 +415,26 @@ public class GLM4MoEModel: Module, LLMModel, KVCacheDimensionProvider {
             return lmHead(out)
         }
         return model.embedTokens.asLinear(out)
+    }
+
+    /// Keep this process' share of the model for tensor parallelism.
+    ///
+    /// Every process in `group` loads the same weights and calls this before
+    /// its first forward pass. Attention heads, dense MLP widths and every
+    /// expert's width are divided across the group; embeddings, the expert
+    /// routers, norms and `lm_head` stay whole. The processes must then run
+    /// the same forward passes in the same order. A group of one changes
+    /// nothing.
+    ///
+    /// Throws, leaving the model unchanged, when it holds unfused adapters or
+    /// was sharded before. Also throws when a dimension does not divide by the
+    /// group size; discard the model then.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        let group = try group ?? MLXDistributed.initialize()
+        guard group.size > 1 else { return }
+        try model.shard(group: group)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -446,6 +569,8 @@ extension GLM4MoEModel: LoRAModel {
         model.layers
     }
 }
+
+extension GLM4MoEModel: TensorParallelModel {}
 
 // MARK: - Chat conventions
 
