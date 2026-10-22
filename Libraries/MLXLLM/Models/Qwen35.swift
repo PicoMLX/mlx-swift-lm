@@ -170,9 +170,6 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 /// Why a Qwen 3.5 model cannot be sharded for tensor parallelism.
 public enum Qwen35ShardingError: Error {
-    /// Mixture-of-experts layers are not sharded yet.
-    case mixtureOfExpertsNotSupported
-
     /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
     /// Fuse the adapter into the model first.
     case unfusedAdapters
@@ -719,11 +716,15 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
     }
 
+    /// The group the experts are split across, once the block holds a shard.
+    private(set) var shardingGroup: MLXDistributed.Group?
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // Decode (S == 1) runs through a compiled trace: fusion merges the
         // elementwise chains into fewer kernels, bit-identically. Prefill
         // stays unfused — it is GEMM-bound and would pay a trace per shape.
-        if x.dim(1) != 1 {
+        // The trace was verified for the whole block, so a shard skips it.
+        if x.dim(1) != 1 || shardingGroup != nil {
             return forward(x)
         }
         return compiledForward(self, x)
@@ -755,8 +756,32 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
 
+        // Each shard computes part of every expert, so the block sums once.
+        if let shardingGroup {
+            return MLXDistributed.allSum(combined + sharedY, group: shardingGroup)
+        }
         return combined + sharedY
     }
+
+    /// Keep this process' share of every expert's hidden width, routed and
+    /// shared. The router and the shared expert's gate stay whole.
+    func shard(group: MLXDistributed.Group) throws {
+        shardingGroup = group
+        try shardInPlace(switchMLP, predicate: expertSharding, group: group)
+        try shardInPlace(sharedExpert, predicate: expertSharding, group: group)
+    }
+}
+
+/// Splits an expert's hidden width: the gate and up projections by output row,
+/// the down projection by input column. The down projection's affine bias
+/// applies to the summed result, so it stays whole.
+private func expertSharding(_ path: String, _ weight: MLXArray) -> (
+    axis: Int, segments: Segments
+)? {
+    if path.hasPrefix("down_proj.") {
+        return path.hasSuffix(".bias") ? nil : (-1, .count(1))
+    }
+    return path.hasSuffix(".bias") ? (-1, .count(1)) : (weight.ndim - 2, .count(1))
 }
 
 // MARK: - Decoder Layer
@@ -844,25 +869,24 @@ final class Qwen35DecoderLayer: Module {
 
     /// Throws when sharding could not split part of the layer, or would drop it.
     func validateShardable() throws {
-        guard mlp is Qwen3NextMLP else {
-            throw Qwen35ShardingError.mixtureOfExpertsNotSupported
-        }
         // `shardLinear` rebuilds a projection from its base weights alone.
         guard !modules().contains(where: { $0 is LoRALayer }) else {
             throw Qwen35ShardingError.unfusedAdapters
         }
     }
 
-    /// Keep this process' share of the layer: its heads and its MLP width.
-    /// Call ``validateShardable()`` first.
+    /// Keep this process' share of the layer: its heads and its MLP or expert
+    /// width. Call ``validateShardable()`` first.
     func shard(group: MLXDistributed.Group) throws {
-        guard let mlp = mlp as? Qwen3NextMLP else {
-            throw Qwen35ShardingError.mixtureOfExpertsNotSupported
-        }
         // Set first: a layer that fails part-way must still skip the traced paths.
         isSharded = true
         try linearAttn?.shard(group: group)
         try selfAttn?.shard(group: group)
+        if let moe = mlp as? Qwen35SparseMoeBlock {
+            try moe.shard(group: group)
+            return
+        }
+        let mlp = mlp as! Qwen3NextMLP
         try mlp.update(
             modules: ModuleChildren(values: [
                 "gate_proj": .value(
@@ -1284,14 +1308,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Keep this process' share of the model for tensor parallelism.
     ///
     /// Every process in `group` loads the same weights and calls this before
-    /// its first forward pass. Attention heads, gated delta heads and MLP
-    /// widths are divided across the group; embeddings, norms and `lm_head`
-    /// stay whole. The processes must then run the same forward passes in the
-    /// same order. A group of one changes nothing.
+    /// its first forward pass. Attention heads, gated delta heads, MLP widths
+    /// and every expert's width are divided across the group; embeddings,
+    /// norms, expert routers and `lm_head` stay whole. The processes must then
+    /// run the same forward passes in the same order. A group of one changes
+    /// nothing.
     ///
-    /// Throws, leaving the model unchanged, when it is mixture-of-experts, holds
-    /// unfused adapters, or was sharded before. Also throws when a dimension
-    /// does not divide by the group size; discard the model then.
+    /// Throws, leaving the model unchanged, when it holds unfused adapters or
+    /// was sharded before. Also throws when a dimension does not divide by the
+    /// group size; discard the model then.
     ///
     /// - Parameter group: the group to shard across, or `nil` for the global group
     public func shard(group: MLXDistributed.Group? = nil) throws {

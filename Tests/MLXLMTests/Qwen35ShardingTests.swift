@@ -41,9 +41,9 @@ final class Qwen35ShardingTests: XCTestCase {
         return try JSONDecoder().decode(Qwen35TextConfiguration.self, from: Data(json.utf8))
     }
 
-    private func makeModel(quantized: Bool) throws -> Qwen35TextModel {
+    private func makeModel(quantized: Bool, experts: Int = 0) throws -> Qwen35TextModel {
         MLXRandom.seed(11)
-        let model = Qwen35TextModel(try configuration())
+        let model = Qwen35TextModel(try configuration(experts: experts))
         if quantized {
             quantize(model: model, groupSize: 64, bits: 4)
         }
@@ -164,12 +164,23 @@ final class Qwen35ShardingTests: XCTestCase {
         assertClose(try logits(model), adapted, tolerance: 0, "after the refused call")
     }
 
-    func testMixtureOfExpertsModelIsRejected() throws {
-        let model = Qwen35TextModel(try configuration(experts: 4))
+    /// The expert blocks shard too: in a group of one every expert keeps its
+    /// whole width, so the sharded blocks must give the whole model's logits.
+    func testShardedMixtureOfExpertsReproducesTheWholeModel() throws {
+        for quantized in [false, true] {
+            let label = quantized ? "4-bit MoE" : "float MoE"
+            let model = try makeModel(quantized: quantized, experts: 4)
+            let whole = try logits(model)
 
-        XCTAssertThrowsError(try model.model.shard(group: MLXDistributed.initialize())) { error in
-            XCTAssertEqual(error as? Qwen35ShardingError, .mixtureOfExpertsNotSupported)
+            let group = try MLXDistributed.initialize()
+            try model.model.shard(group: group)
+
+            XCTAssertTrue(model.model.isSharded, label)
+            assertClose(try logits(model), whole, tolerance: 1e-3, label)
+            // A second pass would split every expert again.
+            XCTAssertThrowsError(try model.model.shard(group: group), label) { error in
+                XCTAssertEqual(error as? Qwen35ShardingError, .alreadySharded, label)
+            }
         }
-        XCTAssertFalse(model.model.isSharded)
     }
 }
