@@ -156,6 +156,17 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+        // One rank of the two-rank check in Qwen35ShardedDecodeTests, which launches two.
+        .executableTarget(
+            name: "ShardedDecodeParity",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                "MLXLMCommon",
+                "MLXLLM",
+            ],
+            path: "Tests/ShardedDecodeParity"
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -167,6 +178,7 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                "ShardedDecodeParity",
             ],
             path: "Tests/MLXLMTests",
             exclude: [

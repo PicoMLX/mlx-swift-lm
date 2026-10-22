@@ -812,9 +812,9 @@ final class Qwen35DecoderLayer: Module {
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
-        // (two for full attention, split at the KV write). Everything else,
-        // including a sharded layer, takes the general body below.
-        if !isSharded, x.dim(1) == 1, ssmMask == nil {
+        // (two for full attention, split at the KV write), a sharded layer's
+        // collectives included. Everything else takes the general body below.
+        if !isSharded || Qwen35TextModelInner.tracesShardedLayers, x.dim(1) == 1, ssmMask == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -838,8 +838,7 @@ final class Qwen35DecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
-    /// Set once the layer holds a shard. The traced decode paths were built
-    /// and verified for the whole layer, so a sharded layer skips them.
+    /// Set once the layer holds a shard.
     private(set) var isSharded = false
 
     /// Throws when sharding could not split part of the layer, or would drop it.
@@ -859,7 +858,7 @@ final class Qwen35DecoderLayer: Module {
         guard let mlp = mlp as? Qwen3NextMLP else {
             throw Qwen35ShardingError.mixtureOfExpertsNotSupported
         }
-        // Set first: a layer that fails part-way must still skip the traced paths.
+        // Set first: a layer that fails part-way still counts as sharded.
         isSharded = true
         try linearAttn?.shard(group: group)
         try selfAttn?.shard(group: group)
@@ -974,6 +973,12 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
+    /// Whether sharded layers decode through the traced layer functions and the compiled
+    /// decode step, as whole ones do. Two ranks match the general sharded path with them
+    /// (`Qwen35ShardedDecodeTests`), which turns them off for its reference.
+    @_spi(Testing) public nonisolated(unsafe) static var tracesShardedLayers = true
+    @_spi(Testing) public nonisolated(unsafe) static var compilesShardedDecodeStep = true
+
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
@@ -1028,7 +1033,7 @@ public class Qwen35TextModelInner: Module {
         forward(inputs, cache: cache, applyFinalNorm: true)
     }
 
-    /// Set once the layers hold shards; the compiled decode schedule is then skipped.
+    /// Set once the layers hold shards.
     private(set) var isSharded = false
 
     func shard(group: MLXDistributed.Group) throws {
@@ -1055,8 +1060,8 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        if !isSharded, applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
-            let step = decodeStep(inputs, caches)
+        if !isSharded || Self.compilesShardedDecodeStep, applyFinalNorm, inputs.dim(1) == 1,
+            let caches = cache, let step = decodeStep(inputs, caches)
         {
             return step
         }
