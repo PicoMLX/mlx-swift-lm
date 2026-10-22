@@ -7,10 +7,24 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/llama.py
 
+/// Why a Llama model cannot be sharded for tensor parallelism.
+public enum LlamaShardingError: Error {
+    /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
+    /// Fuse the adapter into the model first.
+    case unfusedAdapters
+
+    /// The model already holds shards and cannot be sharded again.
+    case alreadySharded
+}
+
 class LlamaAttention: Module {
 
     let args: LlamaConfiguration
     let scale: Float
+
+    // Sharding divides these by the group size.
+    private(set) var attentionHeads: Int
+    private(set) var kvHeads: Int
 
     @ModuleInfo(key: "q_proj") var wq: Linear
     @ModuleInfo(key: "k_proj") var wk: Linear
@@ -21,6 +35,8 @@ class LlamaAttention: Module {
 
     init(_ args: LlamaConfiguration) {
         self.args = args
+        self.attentionHeads = args.attentionHeads
+        self.kvHeads = args.kvHeads
 
         let dim = args.hiddenSize
         let heads = args.attentionHeads
@@ -51,9 +67,9 @@ class LlamaAttention: Module {
         var values = wv(x)
 
         // Prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        queries = queries.reshaped(B, L, attentionHeads, -1).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -72,6 +88,25 @@ class LlamaAttention: Module {
 
         return wo(output)
     }
+
+    /// Keep this process' share of the heads; `o_proj` sums the partial
+    /// results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard attentionHeads % size == 0, kvHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "attention key-value heads", of: kvHeads, across: size)
+        }
+        try update(
+            modules: ModuleChildren(values: [
+                "q_proj": .value(try shardLinear(wq, sharding: .allToSharded, group: group)),
+                "k_proj": .value(try shardLinear(wk, sharding: .allToSharded, group: group)),
+                "v_proj": .value(try shardLinear(wv, sharding: .allToSharded, group: group)),
+                "o_proj": .value(try shardLinear(wo, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        attentionHeads /= size
+        kvHeads /= size
+    }
 }
 
 class LlamaMLP: Module, UnaryLayer {
@@ -89,6 +124,17 @@ class LlamaMLP: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let activation = silu(gate(x))
         return down(activation * up(x))
+    }
+
+    /// Keep this process' share of the hidden width; `down_proj` sums the
+    /// partial results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        try update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(try shardLinear(gate, sharding: .allToSharded, group: group)),
+                "up_proj": .value(try shardLinear(up, sharding: .allToSharded, group: group)),
+                "down_proj": .value(try shardLinear(down, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
     }
 }
 
@@ -116,6 +162,11 @@ class LlamaTransformerBlock: Module {
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
         return out
+    }
+
+    func shard(group: MLXDistributed.Group) throws {
+        try attention.shard(group: group)
+        try mlp.shard(group: group)
     }
 }
 
@@ -146,6 +197,22 @@ public class LlamaModelInner: Module {
         }
 
         return norm(h)
+    }
+
+    /// Set once the layers hold shards.
+    private(set) var isSharded = false
+
+    func shard(group: MLXDistributed.Group) throws {
+        // Refuse before changing anything, so a refused model stays whole.
+        guard !isSharded else { throw LlamaShardingError.alreadySharded }
+        // `shardLinear` rebuilds a projection from its base weights alone.
+        guard !modules().contains(where: { $0 is LoRALayer }) else {
+            throw LlamaShardingError.unfusedAdapters
+        }
+        isSharded = true
+        for layer in layers {
+            try layer.shard(group: group)
+        }
     }
 }
 
@@ -178,6 +245,25 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             return model.embedTokens.asLinear(out)
         }
+    }
+
+    /// Keep this process' share of the model for tensor parallelism.
+    ///
+    /// Every process in `group` loads the same weights and calls this before
+    /// its first forward pass. Attention heads and MLP widths are divided
+    /// across the group; embeddings, norms and `lm_head` stay whole. The
+    /// processes must then run the same forward passes in the same order. A
+    /// group of one changes nothing.
+    ///
+    /// Throws, leaving the model unchanged, when it holds unfused adapters or
+    /// was sharded before. Also throws when a dimension does not divide by the
+    /// group size; discard the model then.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        let group = try group ?? MLXDistributed.initialize()
+        guard group.size > 1 else { return }
+        try model.shard(group: group)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -350,6 +436,8 @@ extension LlamaModel: LoRAModel {
         model.layers
     }
 }
+
+extension LlamaModel: TensorParallelModel {}
 
 // MARK: - Chat conventions
 

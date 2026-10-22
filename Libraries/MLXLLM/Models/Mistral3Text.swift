@@ -27,12 +27,23 @@ private func getLlama4AttentionScale(
     return scaling[0..., .newAxis]
 }
 
+/// Why a Mistral 3 text model cannot be sharded for tensor parallelism.
+public enum Mistral3ShardingError: Error {
+    /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
+    /// Fuse the adapter into the model first.
+    case unfusedAdapters
+
+    /// The model already holds shards and cannot be sharded again.
+    case alreadySharded
+}
+
 // MARK: - Attention
 
 class Mistral3Attention: Module {
     let args: Mistral3TextConfiguration
-    let nHeads: Int
-    let nKVHeads: Int
+    // Sharding divides these by the group size.
+    private(set) var nHeads: Int
+    private(set) var nKVHeads: Int
     let headDim: Int
     let scale: Float
 
@@ -107,6 +118,25 @@ class Mistral3Attention: Module {
         .reshaped(B, L, -1)
         return wo(output)
     }
+
+    /// Keep this process' share of the heads; `o_proj` sums the partial
+    /// results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard nHeads % size == 0, nKVHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "attention key-value heads", of: nKVHeads, across: size)
+        }
+        try update(
+            modules: ModuleChildren(values: [
+                "q_proj": .value(try shardLinear(wq, sharding: .allToSharded, group: group)),
+                "k_proj": .value(try shardLinear(wk, sharding: .allToSharded, group: group)),
+                "v_proj": .value(try shardLinear(wv, sharding: .allToSharded, group: group)),
+                "o_proj": .value(try shardLinear(wo, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
+        nHeads /= size
+        nKVHeads /= size
+    }
 }
 
 // MARK: - MLP
@@ -127,6 +157,17 @@ class Mistral3MLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         return down(silu(gate(x)) * up(x))
+    }
+
+    /// Keep this process' share of the hidden width; `down_proj` sums the
+    /// partial results across the group.
+    func shard(group: MLXDistributed.Group) throws {
+        try update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(try shardLinear(gate, sharding: .allToSharded, group: group)),
+                "up_proj": .value(try shardLinear(up, sharding: .allToSharded, group: group)),
+                "down_proj": .value(try shardLinear(down, sharding: .shardedToAll, group: group)),
+            ]), verify: [])
     }
 }
 
@@ -164,6 +205,11 @@ class Mistral3TextTransformerBlock: Module {
         let mlpOut = mlp(postAttentionLayerNorm(h))
         let out = h + mlpOut
         return out
+    }
+
+    func shard(group: MLXDistributed.Group) throws {
+        try attention.shard(group: group)
+        try mlp.shard(group: group)
     }
 }
 
@@ -267,6 +313,22 @@ public class Mistral3TextModelInner: Module {
 
         return norm(h)
     }
+
+    /// Set once the layers hold shards.
+    private(set) var isSharded = false
+
+    func shard(group: MLXDistributed.Group) throws {
+        // Refuse before changing anything, so a refused model stays whole.
+        guard !isSharded else { throw Mistral3ShardingError.alreadySharded }
+        // `shardLinear` rebuilds a projection from its base weights alone.
+        guard !modules().contains(where: { $0 is LoRALayer }) else {
+            throw Mistral3ShardingError.unfusedAdapters
+        }
+        isSharded = true
+        for layer in layers {
+            try layer.shard(group: group)
+        }
+    }
 }
 
 // MARK: - Model
@@ -294,6 +356,25 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         callAsFunction(inputs, cache: cache, inputEmbeddings: nil)
+    }
+
+    /// Keep this process' share of the model for tensor parallelism.
+    ///
+    /// Every process in `group` loads the same weights and calls this before
+    /// its first forward pass. Attention heads and MLP widths are divided
+    /// across the group; embeddings, norms and `lm_head` stay whole. The
+    /// processes must then run the same forward passes in the same order. A
+    /// group of one changes nothing.
+    ///
+    /// Throws, leaving the model unchanged, when it holds unfused adapters or
+    /// was sharded before. Also throws when a dimension does not divide by the
+    /// group size; discard the model then.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        let group = try group ?? MLXDistributed.initialize()
+        guard group.size > 1 else { return }
+        try model.shard(group: group)
     }
 
     public func callAsFunction(
@@ -490,6 +571,8 @@ extension Mistral3TextModel: LoRAModel {
         model.layers
     }
 }
+
+extension Mistral3TextModel: TensorParallelModel {}
 
 // MARK: - Chat conventions
 
