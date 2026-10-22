@@ -11,12 +11,46 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Why a MiniMax model cannot be sharded for tensor parallelism.
+public enum MiniMaxShardingError: Error {
+    /// The model holds unfused LoRA or DoRA layers, which sharding would drop.
+    /// Fuse the adapter into the model first.
+    case unfusedAdapters
+
+    /// The model already holds shards and cannot be sharded again.
+    case alreadySharded
+}
+
+/// RMS normalization over a width split across a group. Each process holds its
+/// slice of the input and of the weight; the squares are summed across the
+/// group, so every slice is scaled as the whole would be.
+final class MiniMaxShardedRMSNorm: RMSNorm {
+    let group: MLXDistributed.Group
+
+    init(_ norm: RMSNorm, group: MLXDistributed.Group) {
+        self.group = group
+        super.init(dimensions: norm.weight.dim(0) / group.size, eps: norm.eps)
+        update(
+            parameters: ModuleParameters.unflattened([
+                "weight": contiguous(norm.weight.split(parts: group.size)[group.rank])
+            ]))
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let squares = MLXDistributed.allSum(
+            x.asType(.float32).square().sum(axis: -1, keepDims: true), group: group)
+        let scale = rsqrt(squares / Float(x.dim(-1) * group.size) + eps)
+        return (x.asType(.float32) * scale * weight).asType(x.dtype)
+    }
+}
+
 class MiniMaxAttention: Module {
     let args: MiniMaxConfiguration
     let scale: Float
 
-    let numAttentionHeads: Int
-    let numKeyValueHeads: Int
+    // Sharding divides these by the group size.
+    private(set) var numAttentionHeads: Int
+    private(set) var numKeyValueHeads: Int
     let headDim: Int
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -94,6 +128,29 @@ class MiniMaxAttention: Module {
 
         return wo(output)
     }
+
+    /// Keep this process' share of the heads. The query and key norms span all
+    /// heads, so they become norms over a split width.
+    func shard(group: MLXDistributed.Group) throws {
+        let size = group.size
+        guard numAttentionHeads % size == 0, numKeyValueHeads % size == 0 else {
+            throw ShardingError.indivisible(
+                dimension: "attention key-value heads", of: numKeyValueHeads, across: size)
+        }
+        var modules: [String: NestedItem<String, Module>] = [
+            "q_proj": .value(try shardLinear(wq, sharding: .allToSharded, group: group)),
+            "k_proj": .value(try shardLinear(wk, sharding: .allToSharded, group: group)),
+            "v_proj": .value(try shardLinear(wv, sharding: .allToSharded, group: group)),
+            "o_proj": .value(try shardLinear(wo, sharding: .shardedToAll, group: group)),
+        ]
+        if let qNorm, let kNorm {
+            modules["q_norm"] = .value(MiniMaxShardedRMSNorm(qNorm, group: group))
+            modules["k_norm"] = .value(MiniMaxShardedRMSNorm(kNorm, group: group))
+        }
+        try update(modules: ModuleChildren(values: modules), verify: [])
+        numAttentionHeads /= size
+        numKeyValueHeads /= size
+    }
 }
 
 class MiniMaxSparseMoeBlock: Module {
@@ -129,9 +186,35 @@ class MiniMaxSparseMoeBlock: Module {
         scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-20)
         scores = scores.asType(x.dtype)
 
-        let y = switchMLP(x, inds)
-        return weightedExpertSum(y, scores)
+        let y = weightedExpertSum(switchMLP(x, inds), scores)
+        // Each shard computes part of every expert, so the block sums once.
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
+        }
+        return y
     }
+
+    /// The group the experts are split across, once the block holds a shard.
+    private(set) var shardingGroup: MLXDistributed.Group?
+
+    /// Keep this process' share of every expert's hidden width. The router
+    /// stays whole.
+    func shard(group: MLXDistributed.Group) throws {
+        shardingGroup = group
+        try shardInPlace(switchMLP, predicate: expertSharding, group: group)
+    }
+}
+
+/// Splits an expert's hidden width: the gate and up projections by output row,
+/// the down projection by input column. The down projection's affine bias
+/// applies to the summed result, so it stays whole.
+private func expertSharding(_ path: String, _ weight: MLXArray) -> (
+    axis: Int, segments: Segments
+)? {
+    if path.hasPrefix("down_proj.") {
+        return path.hasSuffix(".bias") ? nil : (-1, .count(1))
+    }
+    return path.hasSuffix(".bias") ? (-1, .count(1)) : (weight.ndim - 2, .count(1))
 }
 
 class MiniMaxDecoderLayer: Module {
@@ -156,6 +239,11 @@ class MiniMaxDecoderLayer: Module {
         var hidden = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         hidden = hidden + blockSparseMoe(postAttentionLayerNorm(hidden))
         return hidden
+    }
+
+    func shard(group: MLXDistributed.Group) throws {
+        try selfAttn.shard(group: group)
+        try blockSparseMoe.shard(group: group)
     }
 }
 
@@ -186,6 +274,22 @@ public class MiniMaxModelInner: Module {
 
         return norm(h)
     }
+
+    /// Set once the layers hold shards.
+    private(set) var isSharded = false
+
+    func shard(group: MLXDistributed.Group) throws {
+        // Refuse before changing anything, so a refused model stays whole.
+        guard !isSharded else { throw MiniMaxShardingError.alreadySharded }
+        // `shardLinear` rebuilds a projection from its base weights alone.
+        guard !modules().contains(where: { $0 is LoRALayer }) else {
+            throw MiniMaxShardingError.unfusedAdapters
+        }
+        isSharded = true
+        for layer in layers {
+            try layer.shard(group: group)
+        }
+    }
 }
 
 public class MiniMaxModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -208,6 +312,25 @@ public class MiniMaxModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    /// Keep this process' share of the model for tensor parallelism.
+    ///
+    /// Every process in `group` loads the same weights and calls this before
+    /// its first forward pass. Attention heads and every expert's width are
+    /// divided across the group; embeddings, the expert routers, the layer
+    /// norms and `lm_head` stay whole. The processes must then run the same
+    /// forward passes in the same order. A group of one changes nothing.
+    ///
+    /// Throws, leaving the model unchanged, when it holds unfused adapters or
+    /// was sharded before. Also throws when a dimension does not divide by the
+    /// group size; discard the model then.
+    ///
+    /// - Parameter group: the group to shard across, or `nil` for the global group
+    public func shard(group: MLXDistributed.Group? = nil) throws {
+        let group = try group ?? MLXDistributed.initialize()
+        guard group.size > 1 else { return }
+        try model.shard(group: group)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -333,3 +456,5 @@ extension MiniMaxModel: LoRAModel {
         model.layers
     }
 }
+
+extension MiniMaxModel: TensorParallelModel {}
