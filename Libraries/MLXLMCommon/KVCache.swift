@@ -2102,6 +2102,13 @@ public struct PromptCacheSnapshot {
     }
 }
 
+/// Whether `cache` is, or holds, a recurrent cache with zero rows.
+private func holdsZeroRows(_ cache: KVCache) -> Bool {
+    if let arrays = cache as? ArraysCache { return arrays.batchSize == 0 }
+    if let list = cache as? CacheList { return list.children.contains(where: holdsZeroRows) }
+    return false
+}
+
 /// Save a pre-computed prompt cache to a file.
 ///
 /// - Parameters:
@@ -2118,6 +2125,10 @@ public func savePromptCache(
     let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
     guard stateArrays.isEmpty || !cache.isEmpty else {
         throw KVCacheError(message: "Model state requires at least one prompt cache")
+    }
+    // A recurrent cache filtered to zero rows holds arrays no input can continue from.
+    guard !cache.contains(where: holdsZeroRows) else {
+        throw KVCacheError(message: "A cache filtered to zero rows cannot be saved")
     }
 
     let cacheClasses = try cache.map {

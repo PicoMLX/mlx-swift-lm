@@ -57,9 +57,113 @@ private func makeBatchedCacheFactory(
             reason: reason)
     }
 
+    if let list = cache as? CacheList {
+        let children = try list.children.enumerated().map { index, child in
+            try makeBatchedCacheFactory(
+                for: child, layer: layer, path: "\(path).children[\(index)]")
+        }
+        return { leftPadding in BatchedCacheList(caches: children.map { $0(leftPadding) }) }
+    }
+
     // Exact types: subclasses such as ChunkedKVCache behave differently.
     if type(of: cache) == KVCacheSimple.self {
         return { BatchKVCache(leftPadding: $0) }
     }
+    if type(of: cache) == MambaCache.self {
+        return { MambaCache(leftPadding: recurrentLeftPadding($0)) }
+    }
+    if type(of: cache) == ArraysCache.self, let arrays = cache as? ArraysCache {
+        let slotCount = arrays.slotCount
+        return { ArraysCache(size: slotCount, leftPadding: recurrentLeftPadding($0)) }
+    }
     throw unsupported("No batched cache implementation exists for this cache type.")
+}
+
+/// `nil` for an all-zero left padding, so a recurrent cache masks with the lengths
+/// `prepare(lengths:)` sets. An empty batch keeps its zero rows.
+private func recurrentLeftPadding(_ leftPadding: [Int]) -> [Int]? {
+    leftPadding.isEmpty || leftPadding.contains { $0 != 0 } ? leftPadding : nil
+}
+
+// MARK: - Composite and recurrent caches
+
+/// A ``CacheList`` whose children are batched caches, for layers that hold several caches.
+public final class BatchedCacheList: CacheList, BatchedCache {
+    /// A batch cannot be restored from a prompt cache file.
+    public override class var serializedClassName: String? { nil }
+
+    init(caches: [any BatchedCache]) {
+        super.init(caches: caches)
+    }
+
+    private var batchedChildren: [any BatchedCache] {
+        children.map { child in
+            guard let child = child as? any BatchedCache else {
+                preconditionFailure("A BatchedCacheList child must stay a BatchedCache")
+            }
+            return child
+        }
+    }
+
+    public func filter(batchIndices: MLXArray) {
+        for child in batchedChildren {
+            child.filter(batchIndices: batchIndices)
+        }
+    }
+
+    public func extend(other: any BatchedCache) {
+        guard let other = other as? BatchedCacheList, other.children.count == children.count
+        else {
+            preconditionFailure(
+                "BatchedCacheList can only be extended with a BatchedCacheList of the same layout")
+        }
+        for (child, added) in zip(batchedChildren, other.batchedChildren) {
+            child.extend(other: added)
+        }
+    }
+
+    public func extract(_ index: Int) -> any KVCache {
+        CacheList(caches: batchedChildren.map { $0.extract(index) })
+    }
+
+    /// The mask of the first child with per-row positions, so it excludes left padding.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if let child = batchedChildren.first(where: { $0 is any BatchPositionedKVCache }) {
+            return child.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    public override func copy() -> any KVCache {
+        BatchedCacheList(
+            caches: batchedChildren.map { child in
+                guard let copy = child.copy() as? any BatchedCache else {
+                    preconditionFailure("A BatchedCache copy must stay a BatchedCache")
+                }
+                return copy
+            })
+    }
+}
+
+extension ArraysCache: BatchedCache {
+    public func extend(other: any BatchedCache) {
+        guard let other = other as? ArraysCache else {
+            preconditionFailure("ArraysCache can only be extended with an ArraysCache")
+        }
+        extend(other: other)
+    }
+
+    /// The row at `index`, as a ``MambaCache`` when this is one.
+    public func extract(_ index: Int) -> any KVCache {
+        let row = self is MambaCache ? MambaCache() : ArraysCache(size: slotCount)
+        for slot in 0 ..< slotCount {
+            row[slot] = self[slot]?[index ..< index + 1]
+        }
+        row.offset = offset
+        row.leftPadding = leftPadding?[index ..< index + 1]
+        row.lengths = lengths?[index ..< index + 1]
+        return row
+    }
 }
