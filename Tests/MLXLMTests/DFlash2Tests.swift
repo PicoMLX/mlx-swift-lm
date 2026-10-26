@@ -491,18 +491,21 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
             keys: kv, values: kv, position: request.position,
             visibleLength: request.positionUpperBound + positions)
         let mamba = cache[1] as! MambaCache
-        MLXRandom.seed(UInt64(1000 + verifyCalls))
-        let capture = GatedDeltaCapture(
-            convInput: MLXRandom.normal([1, Self.K - 1 + positions, Self.convDim])
-                .asType(.bfloat16),
-            q: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
-            k: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
-            v: MLXRandom.normal([1, positions, Self.Hv, Self.Dv]).asType(.bfloat16),
-            a: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
-            b: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
-            aLog: MLXRandom.normal([Self.Hv]).asType(.float32),
-            dtBias: MLXRandom.normal([Self.Hv]).asType(.float32),
-            initialState: mamba[1]!)
+        // Deterministic captures from a private state, so the mock never
+        // touches the global random state a test may be watching.
+        let capture = withRandomState(MLXRandom.RandomState(seed: UInt64(1000 + verifyCalls))) {
+            GatedDeltaCapture(
+                convInput: MLXRandom.normal([1, Self.K - 1 + positions, Self.convDim])
+                    .asType(.bfloat16),
+                q: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
+                k: MLXRandom.normal([1, positions, Self.Hk, Self.Dk]).asType(.bfloat16),
+                v: MLXRandom.normal([1, positions, Self.Hv, Self.Dv]).asType(.bfloat16),
+                a: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
+                b: MLXRandom.normal([1, positions, Self.Hv]).asType(.bfloat16),
+                aLog: MLXRandom.normal([Self.Hv]).asType(.float32),
+                dtBias: MLXRandom.normal([Self.Hv]).asType(.float32),
+                initialState: mamba[1]!)
+        }
         return DFlash2VerifyResult(
             logits: logits(for: request.tokens),
             hidden: request.captureLayers.map { _ in
@@ -523,6 +526,10 @@ private final class MockDrafter: Module, DFlash2DrafterModel {
     /// Committed context rows visible at each proposal, before its append.
     private(set) var committedRows: [Int] = []
     private(set) var sawSuppressedTokens = false
+    /// Above temperature 0, draw each draft from a flat candidate row with
+    /// `categorical`, as the real selector does, and record the draws.
+    var samplesDrafts = false
+    private(set) var sampledDrafts: [[Int32]] = []
     var geometry = DFlash2Geometry(
         layerCount: 4, hiddenSize: MockTarget.hidden, vocabularySize: MockTarget.vocab)
 
@@ -576,9 +583,18 @@ private final class MockDrafter: Module, DFlash2DrafterModel {
         }
         let candidates: [Int32] = tokens.flatMap { [$0, 30, 31, 29] }
         let probabilities: [Float] = tokens.flatMap { _ in [0.9, 0.05, 0.025, 0.025] }
+        let candidateRows = MLXArray(candidates, [1, width, 4])
+        if samplesDrafts, request.temperature > 0 {
+            let flat = MLXArray([Float](repeating: 0.25, count: width * 4), [1, width, 4])
+            let chosen = categorical(log(flat))
+            let drafts = takeAlong(candidateRows, chosen[.ellipsis, .newAxis], axis: -1)[
+                .ellipsis, 0]
+            sampledDrafts.append(drafts.flattened().asArray(Int32.self))
+            return DFlash2Proposal(tokens: drafts, candidates: candidateRows, probabilities: flat)
+        }
         return DFlash2Proposal(
             tokens: MLXArray(tokens).expandedDimensions(axis: 0),
-            candidates: MLXArray(candidates, [1, width, 4]),
+            candidates: candidateRows,
             probabilities: MLXArray(probabilities, [1, width, 4]))
     }
 }
@@ -706,6 +722,35 @@ func testDFlash2IteratorContinuesAfterCachedPrefix() throws {
     // 30 sits at position 7, so the cache holds 8 positions and nothing rewinds.
     #expect(cache[0].offset == 8)
     #expect(cache[1].offset == 8)
+}
+
+@Test
+func testDFlash2SeededSamplingIgnoresGlobalRandomState() throws {
+    // With a seed, the drafts are drawn from the iterator's random state as
+    // the bonus tokens are, so neither they nor the stream depend on the
+    // global one.
+    func run(globalSeed: UInt64) throws -> (tokens: [Int], drafts: [[Int32]]) {
+        MLXRandom.seed(globalSeed)
+        var parameters = GenerateParameters(maxTokens: 24)
+        parameters.temperature = 0.9
+        parameters.seed = 5
+        let drafter = MockDrafter()
+        drafter.samplesDrafts = true
+        var iterator = try DFlash2SpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])), mainModel: MockTarget(),
+            drafter: drafter, parameters: parameters)
+        var produced: [Int] = []
+        while let token = iterator.next() {
+            produced.append(token)
+        }
+        return (produced, drafter.sampledDrafts)
+    }
+    let first = try run(globalSeed: 1)
+    let second = try run(globalSeed: 2)
+    #expect(first.tokens.count == 24)
+    #expect(first.drafts.count >= 6)
+    #expect(second.drafts == first.drafts)
+    #expect(second.tokens == first.tokens)
 }
 
 @Test

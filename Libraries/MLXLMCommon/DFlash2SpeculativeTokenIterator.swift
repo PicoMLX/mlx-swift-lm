@@ -261,11 +261,15 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         }
         let masks = MLXArray(Array(repeating: Int32(drafter.maskTokenId), count: drafts))
         let block = concatenated([anchor.asType(.int32), masks]).expandedDimensions(axis: 0)
-        let proposal = drafter.propose(
-            DFlash2ProposalRequest(
-                block: block, targetHidden: targetHidden, contextPosition: contextPosition,
-                validRows: validRows, temperature: temperature, suppressedTokens: draftSuppressor),
-            target: target, state: &drafterState)
+        // Sampled drafts draw from the seeded state too, so a seed reproduces the stream.
+        let proposal = withRandomState(randomState) {
+            drafter.propose(
+                DFlash2ProposalRequest(
+                    block: block, targetHidden: targetHidden, contextPosition: contextPosition,
+                    validRows: validRows, temperature: temperature,
+                    suppressedTokens: draftSuppressor),
+                target: target, state: &drafterState)
+        }
         let draftTokens = proposal.tokens.flattened().asType(.int32)
         let request = DFlash2VerifyRequest(
             tokens: concatenated([anchor.asType(.int32), draftTokens]).expandedDimensions(axis: 0),
