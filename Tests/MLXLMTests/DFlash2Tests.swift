@@ -248,6 +248,57 @@ func testDFlash2ConfigurationDecodesTheZLabV1Checkpoint() throws {
 }
 
 @Test
+func testDFlash2ProgrammaticConfigurationKeepsSlidingDefaults() throws {
+    // A configuration built in code has no layer types: every layer slides and,
+    // for DFlash2, the block sees itself in full, as before v1 support.
+    let defaults = DFlash2Configuration()
+    #expect(defaults.layerTypes.isEmpty)
+    #expect(defaults.contextWindow == 2047)
+    #expect(defaults.contextWindow(forLayer: 4) == 2047)
+    #expect(defaults.attentionWindow(forLayer: 0) == 2048)
+    #expect(!defaults.attendsCausally(layer: 0))
+
+    var config = DFlash2Configuration()
+    config.hiddenSize = 64
+    config.hiddenLayers = 2
+    config.attentionHeads = 4
+    config.kvHeads = 2
+    config.headDim = 16
+    config.intermediateSize = 96
+    config.vocabularySize = MockTarget.vocab
+    config.ropeTheta = 10_000
+    config.ropeScaling = tinyConfig().ropeScaling
+    config.maxPositionEmbeddings = 1024
+    config.slidingWindow = 24
+    config.dflash.blockSize = 5
+    config.dflash.maskTokenId = MockTarget.vocab - 2
+    config.dflash.selectorTopK = 4
+    config.dflash.selectorRank = 8
+    config.dflash.targetLayerIds = [1, 3]
+    MLXRandom.seed(12)
+    let programmatic = DFlash2DraftModel(config)
+    #expect(programmatic.layers.allSatisfy { !$0.causalBlock })
+    #expect(programmatic.contextWindow == 23)
+
+    // It proposes exactly as the same drafter decoded from JSON does.
+    let decoded = DFlash2DraftModel(tinyConfig(window: 24, vocab: MockTarget.vocab))
+    try decoded.update(parameters: programmatic.parameters(), verify: [.all])
+    let request = DFlash2ProposalRequest(
+        block: MLXArray(
+            [Int32(7)] + Array(repeating: Int32(config.dflash.maskTokenId), count: 4)
+        ).expandedDimensions(axis: 0),
+        targetHidden: MLXRandom.normal([1, 6, 2 * 64]), contextPosition: 0,
+        validRows: MLXArray(Int32(6)), temperature: 0)
+    let target = MockTarget()
+    var stateA = programmatic.makeState()
+    var stateB = decoded.makeState()
+    let a = programmatic.propose(request, target: target, state: &stateA)
+    let b = decoded.propose(request, target: target, state: &stateB)
+    #expect(a.tokens.asArray(Int32.self) == b.tokens.asArray(Int32.self))
+    #expect(a.candidates.asArray(Int32.self) == b.candidates.asArray(Int32.self))
+}
+
+@Test
 func testDFlash2RegistrationRecognizesV1Checkpoints() async throws {
     await DFlash2Registration.register()
     let registry = DFlash2DrafterTypeRegistry.shared

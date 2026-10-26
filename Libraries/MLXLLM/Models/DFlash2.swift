@@ -103,9 +103,11 @@ public struct DFlash2Configuration: Decodable, Sendable {
     public var dflash: DFlash2SpecConfiguration = .init()
     /// `true` for DFlash2 (dynamic convolution and candidate selector), `false` for v1.
     public var isDFlash2: Bool = true
-    /// `sliding_attention` or `full_attention`, one per layer.
+    /// `sliding_attention` or `full_attention`, one per layer. Empty means every
+    /// layer slides, as a DFlash2 drafter's do.
     public var layerTypes: [String] = []
-    /// Whether block positions attend causally; `nil` lets the layer type decide.
+    /// Whether block positions attend causally; `nil` lets the variant and layer
+    /// type decide.
     public var isCausal: Bool?
 
     enum CodingKeys: String, CodingKey {
@@ -227,10 +229,14 @@ public struct DFlash2Configuration: Decodable, Sendable {
         }
     }
 
+    private func slides(_ index: Int) -> Bool {
+        layerTypes.isEmpty || layerTypes[index] == "sliding_attention"
+    }
+
     /// Context rows layer `index` can see: the window minus the block's own
     /// anchor, or every row (`Int.max`) for a full-attention layer.
     public func contextWindow(forLayer index: Int) -> Int {
-        layerTypes[index] == "sliding_attention" ? slidingWindow - 1 : .max
+        slides(index) ? slidingWindow - 1 : .max
     }
 
     /// Context rows the drafter keeps: as many as its widest layer can see.
@@ -241,12 +247,14 @@ public struct DFlash2Configuration: Decodable, Sendable {
     /// How far back a block position in layer `index` attends: the sliding
     /// window, or without bound (`Int.max`) for a full-attention layer.
     public func attentionWindow(forLayer index: Int) -> Int {
-        layerTypes[index] == "sliding_attention" ? slidingWindow : .max
+        slides(index) ? slidingWindow : .max
     }
 
     /// Whether block positions in layer `index` see only earlier block positions.
+    /// A DFlash2 block never does; a v1 sliding layer's does unless `isCausal`
+    /// says otherwise, as the reference reads a missing `is_causal`.
     public func attendsCausally(layer index: Int) -> Bool {
-        isCausal ?? (layerTypes[index] == "sliding_attention")
+        isCausal ?? (!isDFlash2 && slides(index))
     }
 }
 
