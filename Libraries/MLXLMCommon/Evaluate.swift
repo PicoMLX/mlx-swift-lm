@@ -533,7 +533,8 @@ struct TokenRing {
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let promptTokens = prompt.asType(.int32).flattened()
+        // Image sentinels (such as FastVLM's -200) are not vocabulary IDs.
+        let promptTokens = MLXArray(prompt.asArray(Int32.self).filter { $0 >= 0 })
         let n = promptTokens.count
         if n <= capacity {
             if n < capacity {
