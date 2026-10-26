@@ -181,9 +181,13 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "Resources/generate_dflash_v1_fixture.py",
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/dflash-v1-reference.safetensors"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

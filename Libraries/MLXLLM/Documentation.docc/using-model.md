@@ -110,7 +110,13 @@ let stream = try generate(
 
 `DFlash2DrafterRegistry.qwen38_27B_dflash2` names the Qwen3.8-27B drafter. Greedy and
 sampled decoding both work. Quantized or bounded KV caches are not supported, and a drafter
-trained for a target of another shape fails before prefill.
+trained for a target of another shape fails before prefill, as does a `blockSize` below 2 or
+above the drafter's.
+
+DFlash v1 checkpoints (`architectures: ["DFlashDraftModel"]`, such as
+`DFlash2DrafterRegistry.qwen35_4B_dflash` for Qwen3.5-4B) load through the same factory and
+registration. A v1 drafter has no dynamic convolution or candidate selector: it drafts the
+argmax at every masked position, and its layers may mix sliding-window and full attention.
 
 ## Evaluation Flow
 

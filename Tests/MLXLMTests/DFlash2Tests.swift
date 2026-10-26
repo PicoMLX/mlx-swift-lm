@@ -58,6 +58,45 @@ private func tinyConfig(window: Int = 8, vocab: Int = 64) -> DFlash2Configuratio
         DFlash2Configuration.self, from: Data(configJSON(vocab: vocab, window: window).utf8))
 }
 
+/// A DFlash v1 configuration in MockTarget's shape: no convolution or selector keys.
+private func configJSONV1(
+    layerTypes: [String] = ["sliding_attention", "full_attention"], window: Int? = 8,
+    blockSize: Int = 4, architectures: String = "[\"DFlashDraftModel\"]"
+) -> String {
+    let types = layerTypes.map { "\"\($0)\"" }.joined(separator: ", ")
+    let windowLine = window.map { "\"sliding_window\": \($0)," } ?? ""
+    return """
+        {
+          "architectures": \(architectures),
+          "dflash_config": {
+            "block_size": \(blockSize),
+            "mask_token_id": 126,
+            "target_layer_ids": [1, 3]
+          },
+          "head_dim": 16,
+          "hidden_size": 64,
+          "intermediate_size": 96,
+          "layer_types": [\(types)],
+          "max_position_embeddings": 1024,
+          "model_type": "qwen3",
+          "num_attention_heads": 4,
+          "num_hidden_layers": \(layerTypes.count),
+          "num_key_value_heads": 2,
+          "num_target_layers": 4,
+          "rms_norm_eps": 1e-06,
+          "rope_parameters": { "rope_theta": 10000.0, "rope_type": "default" },
+          \(windowLine)
+          "tie_word_embeddings": true,
+          "vocab_size": 128
+        }
+        """
+}
+
+private func tinyV1Config(blockSize: Int = 4) -> DFlash2Configuration {
+    try! JSONDecoder.json5().decode(
+        DFlash2Configuration.self, from: Data(configJSONV1(blockSize: blockSize).utf8))
+}
+
 @Test
 func testDFlash2ConfigurationDecodesReleaseCheckpoint() throws {
     // Mirrors incoai/Qwen3.8-27B-DFlash2's config.json.
@@ -117,6 +156,224 @@ func testDFlash2ConfigurationRejectsUnsupportedShapes() {
     #expect(throws: DecodingError.self) {
         try JSONDecoder.json5().decode(DFlash2Configuration.self, from: full)
     }
+    // v1 may mix layer types, but every type must be known and sliding needs a window.
+    let unknown = Data(configJSONV1(layerTypes: ["sliding_attention", "linear_attention"]).utf8)
+    #expect(throws: DecodingError.self) {
+        try JSONDecoder.json5().decode(DFlash2Configuration.self, from: unknown)
+    }
+    let noWindow = Data(configJSONV1(window: nil).utf8)
+    #expect(throws: DecodingError.self) {
+        try JSONDecoder.json5().decode(DFlash2Configuration.self, from: noWindow)
+    }
+    let short = Data(configJSONV1(layerTypes: ["sliding_attention"]).utf8)
+    #expect(throws: DecodingError.self) {
+        try JSONDecoder.json5().decode(
+            DFlash2Configuration.self,
+            from: Data(
+                String(decoding: short, as: UTF8.self)
+                    .replacingOccurrences(
+                        of: "\"num_hidden_layers\": 1", with: "\"num_hidden_layers\": 2"
+                    ).utf8))
+    }
+}
+
+@Test
+func testDFlash2ConfigurationDecodesTheZLabV1Checkpoint() throws {
+    // Mirrors z-lab/Qwen3.5-4B-DFlash at revision 1905b5a0, a DFlash v1 drafter.
+    let json = """
+        {
+          "architectures": ["DFlashDraftModel"],
+          "attention_bias": false,
+          "dflash_config": {
+            "block_size": 16,
+            "mask_token_id": 248077,
+            "target_layer_ids": [1, 5, 9, 13, 17, 21, 25, 29]
+          },
+          "dtype": "bfloat16",
+          "eos_token_id": 248044,
+          "head_dim": 128,
+          "hidden_act": "silu",
+          "hidden_size": 2560,
+          "intermediate_size": 9216,
+          "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention",
+            "sliding_attention", "sliding_attention", "full_attention"],
+          "max_position_embeddings": 262144,
+          "max_window_layers": 6,
+          "model_type": "qwen3",
+          "num_attention_heads": 32,
+          "num_hidden_layers": 6,
+          "num_key_value_heads": 8,
+          "num_target_layers": 32,
+          "rms_norm_eps": 1e-06,
+          "rope_parameters": { "rope_theta": 10000000, "rope_type": "default" },
+          "sliding_window": 4096,
+          "tie_word_embeddings": true,
+          "use_sliding_window": true,
+          "vocab_size": 248320
+        }
+        """
+    let config = try JSONDecoder.json5().decode(
+        DFlash2Configuration.self, from: Data(json.utf8))
+    #expect(config.isDFlash2 == false)
+    #expect(config.dflash.describesDFlash2 == false)
+    #expect(config.hiddenSize == 2560)
+    #expect(config.hiddenLayers == 6)
+    #expect(config.attentionHeads == 32)
+    #expect(config.kvHeads == 8)
+    #expect(config.headDim == 128)
+    #expect(config.intermediateSize == 9216)
+    #expect(config.vocabularySize == 248320)
+    #expect(config.ropeTheta == 10_000_000)
+    #expect(config.numTargetLayers == 32)
+    #expect(
+        config.layerTypes == Array(repeating: "sliding_attention", count: 5) + ["full_attention"])
+    #expect(config.slidingWindow == 4096)
+    #expect(config.contextWindow(forLayer: 0) == 4095)
+    #expect(config.contextWindow(forLayer: 5) == .max)
+    #expect(config.contextWindow == .max)
+    #expect(config.attentionWindow(forLayer: 0) == 4096)
+    #expect(config.attentionWindow(forLayer: 5) == .max)
+    #expect(config.isCausal == nil)
+    #expect(config.attendsCausally(layer: 0))
+    #expect(!config.attendsCausally(layer: 5))
+    #expect(config.dflash.blockSize == 16)
+    #expect(config.dflash.maskTokenId == 248077)
+    #expect(config.dflash.targetLayerIds == [1, 5, 9, 13, 17, 21, 25, 29])
+
+    // Without `architectures`, the convolution and selector keys decide.
+    let unnamed = Data(configJSONV1(architectures: "[]").utf8)
+    let inferred = try JSONDecoder.json5().decode(DFlash2Configuration.self, from: unnamed)
+    #expect(inferred.isDFlash2 == false)
+    #expect(tinyConfig().isDFlash2)
+}
+
+@Test
+func testDFlash2ProgrammaticConfigurationKeepsSlidingDefaults() throws {
+    // A configuration built in code has no layer types: every layer slides and,
+    // for DFlash2, the block sees itself in full, as before v1 support.
+    let defaults = DFlash2Configuration()
+    #expect(defaults.layerTypes.isEmpty)
+    #expect(defaults.contextWindow == 2047)
+    #expect(defaults.contextWindow(forLayer: 4) == 2047)
+    #expect(defaults.attentionWindow(forLayer: 0) == 2048)
+    #expect(!defaults.attendsCausally(layer: 0))
+
+    var config = DFlash2Configuration()
+    config.hiddenSize = 64
+    config.hiddenLayers = 2
+    config.attentionHeads = 4
+    config.kvHeads = 2
+    config.headDim = 16
+    config.intermediateSize = 96
+    config.vocabularySize = MockTarget.vocab
+    config.ropeTheta = 10_000
+    config.ropeScaling = tinyConfig().ropeScaling
+    config.maxPositionEmbeddings = 1024
+    config.slidingWindow = 24
+    config.dflash.blockSize = 5
+    config.dflash.maskTokenId = MockTarget.vocab - 2
+    config.dflash.selectorTopK = 4
+    config.dflash.selectorRank = 8
+    config.dflash.targetLayerIds = [1, 3]
+    MLXRandom.seed(12)
+    let programmatic = DFlash2DraftModel(config)
+    #expect(programmatic.layers.allSatisfy { !$0.causalBlock })
+    #expect(programmatic.contextWindow == 23)
+
+    // It proposes exactly as the same drafter decoded from JSON does.
+    let decoded = DFlash2DraftModel(tinyConfig(window: 24, vocab: MockTarget.vocab))
+    try decoded.update(parameters: programmatic.parameters(), verify: [.all])
+    let request = DFlash2ProposalRequest(
+        block: MLXArray(
+            [Int32(7)] + Array(repeating: Int32(config.dflash.maskTokenId), count: 4)
+        ).expandedDimensions(axis: 0),
+        targetHidden: MLXRandom.normal([1, 6, 2 * 64]), contextPosition: 0,
+        validRows: MLXArray(Int32(6)), temperature: 0)
+    let target = MockTarget()
+    var stateA = programmatic.makeState()
+    var stateB = decoded.makeState()
+    let a = programmatic.propose(request, target: target, state: &stateA)
+    let b = decoded.propose(request, target: target, state: &stateB)
+    #expect(a.tokens.asArray(Int32.self) == b.tokens.asArray(Int32.self))
+    #expect(a.candidates.asArray(Int32.self) == b.candidates.asArray(Int32.self))
+}
+
+@Test
+func testDFlash2RegistrationRecognizesV1Checkpoints() async throws {
+    await DFlash2Registration.register()
+    let registry = DFlash2DrafterTypeRegistry.shared
+    let v1 = try await registry.createModel(
+        configuration: Data(configJSONV1().utf8), modelType: "qwen3")
+    #expect((v1 as? DFlash2DraftModel)?.config.isDFlash2 == false)
+    #expect(v1.blockSize == 4)
+    #expect((v1 as? DFlash2DraftModel)?.candidateSelector == nil)
+    #expect(((v1 as? DFlash2DraftModel)?.layers.first?.attentionConv) == nil)
+    let v2 = try await registry.createModel(
+        configuration: Data(configJSON().utf8), modelType: "qwen3")
+    #expect((v2 as? DFlash2DraftModel)?.config.isDFlash2 == true)
+    // A Qwen3 language model is not a drafter.
+    let plain = Data(#"{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 1}"#.utf8)
+    await #expect(throws: (any Error).self) {
+        try await registry.createModel(configuration: plain, modelType: "qwen3")
+    }
+}
+
+private struct NoTokenizerLoader: TokenizerLoader {
+    struct Unavailable: Error {}
+    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        throw Unavailable()
+    }
+}
+
+/// Writes `config.json` and `model.safetensors` for a tiny v1 drafter.
+private func writeV1Checkpoint(weights: [String: MLXArray]) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dflash-v1-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try Data(configJSONV1().utf8).write(to: directory.appendingPathComponent("config.json"))
+    try save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
+    return directory
+}
+
+@Test
+func testDFlash2V1LoadsEveryTensorAndNamesAStray() async throws {
+    await DFlash2Registration.register()
+    MLXRandom.seed(9)
+    let weights = Dictionary(
+        uniqueKeysWithValues: DFlash2DraftModel(tinyV1Config()).parameters().flattened())
+    #expect(weights.count == 25)
+
+    let loaded = try await DFlash2DrafterModelFactory.shared.load(
+        from: try writeV1Checkpoint(weights: weights), using: NoTokenizerLoader())
+    let drafter = try #require(loaded.model as? DFlash2DraftModel)
+    #expect(drafter.config.isDFlash2 == false)
+    #expect(drafter.parameters().flattened().count == 25)
+
+    func loadError(_ weights: [String: MLXArray]) async throws -> DFlash2DrafterLoadError? {
+        do {
+            _ = try await DFlash2DrafterModelFactory.shared.load(
+                from: try writeV1Checkpoint(weights: weights), using: NoTokenizerLoader())
+            return nil
+        } catch let error as DFlash2DrafterLoadError {
+            return error
+        }
+    }
+
+    // One renamed tensor fails, and the error names the parameter it left unset.
+    var renamed = weights
+    let stray = "layers.0.self_attn.q_proj.weight"
+    renamed["layers.0.self_attn.q_proj.weights"] = renamed.removeValue(forKey: stray)
+    #expect(try await loadError(renamed) == .missingTensor(stray))
+
+    // A missing tensor fails by name, and so does a tensor the model has no place for.
+    var missing = weights
+    missing.removeValue(forKey: "norm.weight")
+    #expect(try await loadError(missing) == .missingTensor("norm.weight"))
+    var extra = weights
+    extra["extra.weight"] = MLXArray.zeros([2])
+    let unexpected = try await loadError(extra)
+    #expect(unexpected != nil)
+    #expect("\(unexpected.map { "\($0)" } ?? "")".contains("extra"))
 }
 
 @Test
@@ -862,6 +1119,44 @@ func testDFlash2IteratorRejectsUnsupportedInputs() throws {
 }
 
 @Test
+func testDFlash2IteratorRejectsBlockSizesOutsideTheDrafters() throws {
+    let target = MockTarget()
+    let cache = target.newCache(parameters: nil)
+    var parameters = GenerateParameters(maxTokens: 4)
+    parameters.temperature = 0
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    for requested in [1, 17] {
+        #expect(
+            throws: DFlash2SpeculationError.unsupportedBlockSize(requested: requested, maximum: 4)
+        ) {
+            _ = try DFlash2SpeculativeTokenIterator(
+                input: input, mainModel: target, drafter: MockDrafter(), mainCache: cache,
+                parameters: parameters, blockSize: requested)
+        }
+    }
+    // Rejected before any model work: nothing was prefilled or verified.
+    #expect(target.verifyCalls == 0)
+    #expect(cache[0].offset == 0)
+
+    // A v1 drafter trained for 16 takes 16, not 17.
+    MLXRandom.seed(4)
+    let drafter = DFlash2DraftModel(tinyV1Config(blockSize: 16))
+    #expect(throws: DFlash2SpeculationError.unsupportedBlockSize(requested: 17, maximum: 16)) {
+        _ = try DFlash2SpeculativeTokenIterator(
+            input: input, mainModel: target, drafter: drafter, parameters: parameters,
+            blockSize: 17)
+    }
+    #expect(target.verifyCalls == 0)
+    let iterator = try DFlash2SpeculativeTokenIterator(
+        input: input, mainModel: target, drafter: drafter, parameters: parameters, blockSize: 16)
+    #expect(iterator.blockSize == 16)
+    #expect(
+        try DFlash2SpeculativeTokenIterator(
+            input: input, mainModel: MockTarget(), drafter: drafter, parameters: parameters
+        ).blockSize == 16)
+}
+
+@Test
 func testDFlash2IteratorNeverEmitsSuppressedTokens() throws {
     // The prompt ends in 3, so the target's argmax runs 24, 43, 48, ... Suppressing
     // 43 makes the processed argmax take the runner-up, as TokenIterator does.
@@ -1138,6 +1433,94 @@ func testDFlash2DrafterSkipsSuppressedTokens() throws {
     let proposal = drafter.propose(request, target: MockTarget(), state: &state)
     #expect(Set(proposal.candidates.asArray(Int32.self).map(Int.init)).isSubset(of: allowed))
     #expect(Set(proposal.tokens.asArray(Int32.self).map(Int.init)).isSubset(of: allowed))
+}
+
+// MARK: - DFlash v1 against the Python reference
+
+@Test
+func testDFlash2V1MatchesPythonReference() throws {
+    // Three proposal rounds of a tiny v1 drafter (one sliding, one full
+    // attention layer) recorded from z-lab's `dflash/model_mlx.py`; see
+    // Resources/generate_dflash_v1_fixture.py.
+    let url = try #require(
+        Bundle.module.url(forResource: "dflash-v1-reference", withExtension: "safetensors"))
+    let (arrays, metadata) = try loadArraysAndMetadata(url: url)
+    let config = try JSONDecoder.json5().decode(
+        DFlash2Configuration.self, from: Data(try #require(metadata["config"]).utf8))
+    #expect(config.isDFlash2 == false)
+    #expect(config.layerTypes == ["sliding_attention", "full_attention"])
+
+    let drafter = DFlash2DraftModel(config)
+    drafter.compiledTracesEnabled = false
+    drafter.recordsIntermediates = true
+    var weights: [String: MLXArray] = [:]
+    for (key, value) in arrays where key.hasPrefix("weights.") {
+        weights[String(key.dropFirst("weights.".count))] = value
+    }
+    try drafter.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+    let target = MockTarget()
+    try target.embedding.update(
+        parameters: ModuleParameters.unflattened([
+            "weight": try #require(arrays["target.embed_tokens.weight"])
+        ]), verify: [.all])
+
+    var state = drafter.makeState()
+    let width = config.dflash.blockSize
+    for round in 0 ..< 3 {
+        func tensor(_ name: String) throws -> MLXArray {
+            try #require(arrays["round\(round).\(name)"], "round\(round).\(name)")
+        }
+        let hidden = try tensor("target_hidden")
+        let rows = hidden.dim(1)
+        let offset = Int(try tensor("context_offset")[0].item(Int32.self))
+        let request = DFlash2ProposalRequest(
+            block: try tensor("block"), targetHidden: hidden, contextPosition: offset,
+            validRows: MLXArray(Int32(rows)), temperature: 0)
+        let proposal = drafter.propose(request, target: target, state: &state)
+        eval(proposal.tokens)
+
+        let fused = drafter.hiddenNorm(drafter.fc(hidden))
+        #expect(maxDifference(fused, try tensor("fused_context")) < 1e-3, "round \(round)")
+        for layer in 0 ..< 2 {
+            #expect(
+                maxDifference(drafter.lastLayerOutputs[layer], try tensor("layer\(layer).output"))
+                    < 1e-3, "round \(round) layer \(layer)")
+
+            // The reference keeps at most its window plus a block of rows and the
+            // mask hides the rest; the Swift cache keeps every row and hides more.
+            let expected = try tensor("layer\(layer).mask")
+            let contextLength = expected.dim(1) - width
+            let cache = state.contextCaches[layer]
+            let mask = DFlash2DraftModel.visibilityMask(
+                cache: cache, appended: rows, validRows: MLXArray(Int32(rows)),
+                blockPosition: MLXArray([Int32(offset + rows)]), width: width,
+                window: config.attentionWindow(forLayer: layer),
+                causalBlock: drafter.layers[layer].causalBlock)
+            #expect(cache.count >= contextLength)
+            let older = cache.count - contextLength
+            if older > 0 {
+                #expect(
+                    mask[0..., ..<older].asArray(Bool.self).allSatisfy { !$0 },
+                    "round \(round) layer \(layer) sees rows the reference dropped")
+            }
+            #expect(
+                mask[0..., older...].asArray(Bool.self) == expected.asArray(Bool.self),
+                "round \(round) layer \(layer) mask")
+        }
+        #expect(maxDifference(try #require(drafter.lastLogits), try tensor("logits")) < 1e-3)
+        #expect(
+            proposal.tokens.asArray(Int32.self) == (try tensor("proposal")).asArray(Int32.self),
+            "round \(round) proposal")
+        #expect(proposal.candidates.shape == [1, width - 1, 1])
+        #expect(proposal.probabilities == nil)
+        for cache in state.contextCaches {
+            cache.resolve(newest: rows, valid: rows)
+        }
+    }
+    // The full-attention layer kept every row; the sliding layer's cache is bounded.
+    #expect(state.contextCaches[1].count == 12)
+    #expect(state.contextCaches[1].window == .max)
+    #expect(state.contextCaches[0].window == 7)
 }
 
 // MARK: - Qwen 3.5 verify pass
