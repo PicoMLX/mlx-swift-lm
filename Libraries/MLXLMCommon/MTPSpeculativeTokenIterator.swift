@@ -34,6 +34,13 @@ import MLX
 /// per-stream drafter cache are passed as parameters to `draftBlock(...)` so
 /// drafter instances are safe to share across iterators).
 public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
+    /// The streams prefill and decode ran on, which can differ from the loop's.
+    private let generationStreams = GenerationStreamTracker()
+
+    public func synchronizeGeneration() {
+        generationStreams.capture()
+        generationStreams.synchronize()
+    }
 
     var y: LMInput.Text
 
@@ -675,6 +682,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     public mutating func next() -> Int? {
+        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -728,6 +736,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        generationStreams.capture()
         defer { processor?.finalizeGeneration() }
         // A fully consumed all-accepted round can still retain the recurrent
         // checkpoint used for early-finalization rollback. Release it even
