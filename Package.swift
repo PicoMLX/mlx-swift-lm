@@ -172,6 +172,19 @@ let package = Package(
             path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
         ),
+        // PicoMLX fork only: one rank of the two-rank tensor-parallel decode check that
+        // Tests/ShardedDecodeParity/run.sh launches.
+        .executableTarget(
+            name: "ShardedDecodeParity",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/ShardedDecodeParity",
+            exclude: ["run.sh"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
