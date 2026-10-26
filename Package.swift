@@ -64,7 +64,13 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.32.3")),
+        // PicoMLX fork only: upstream mlx-swift main with the distributed functions of
+        // ml-explore/mlx-swift#512, the ring's source-IP binding, and a fix that lets
+        // Module.update(parameters:) reach a child's override again (lost in
+        // ml-explore/mlx-swift#418). PicoCore must name the same URL and branch.
+        .package(
+            url: "https://github.com/PicoMLX/mlx-swift",
+            branch: "pico/0.32.4-upstream"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.

@@ -47,6 +47,12 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 
 ## Installation
 
+> [!IMPORTANT]
+> This is the PicoMLX development fork. It depends on a branch of PicoMLX's
+> mlx-swift fork (MLX v0.32.4 with the JACCL backend), so do not tag a stable
+> release of it ([release prerequisite #43](https://github.com/PicoMLX/mlx-swift-lm/issues/43)).
+> The version examples below refer to the upstream repository.
+
 Add the core package to your `Package.swift`:
 
 ```swift
