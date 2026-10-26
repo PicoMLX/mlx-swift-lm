@@ -17,6 +17,8 @@ public enum DFlash2SpeculationError: Error, Equatable {
     case textOnly
     /// `prefilledPrefixTokens` must leave at least one prompt token.
     case promptTooShort
+    /// The block size is below 2 or above the drafter's.
+    case unsupportedBlockSize(requested: Int, maximum: Int)
 }
 
 /// Token iterator for DFlash2 block speculative decoding.
@@ -94,7 +96,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     ///   - prefilledPrefixTokens: leading positions of `input` that `mainCache`
     ///     already holds; only the rest is prefilled.
     ///   - parameters: sampling and generation limits.
-    ///   - blockSize: tokens per verify pass; `nil` uses the drafter's.
+    ///   - blockSize: tokens per verify pass, 2 through the drafter's; `nil` uses the drafter's.
     ///   - components: generation hooks such as a custom logit processor.
     public init(
         input: LMInput,
@@ -114,6 +116,11 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         else {
             throw DFlash2SpeculationError.geometryMismatch(
                 drafter: drafter.targetGeometry, target: target.dflash2Geometry)
+        }
+        let blockSize = blockSize ?? drafter.blockSize
+        guard blockSize >= 2, blockSize <= drafter.blockSize else {
+            throw DFlash2SpeculationError.unsupportedBlockSize(
+                requested: blockSize, maximum: drafter.blockSize)
         }
         guard input.image == nil, input.video == nil, input.audio == nil else {
             throw DFlash2SpeculationError.textOnly
@@ -148,7 +155,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         self.randomState =
             parameters.seed.map { MLXRandom.RandomState(seed: $0) } ?? MLXRandom.RandomState()
         self.maxTokens = parameters.maxTokens
-        self.blockSize = Swift.max(2, blockSize ?? drafter.blockSize)
+        self.blockSize = blockSize
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         try prepare(

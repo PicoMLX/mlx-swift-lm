@@ -1,12 +1,15 @@
 // Copyright © 2026 Apple Inc.
 
 // DFlash2 block drafter (https://inco.ai/blog/dflash2/), a port of the reference
-// `dflash/model_mlx.py` (https://github.com/z-lab/dflash).
+// `dflash/model_mlx.py` (https://github.com/z-lab/dflash), which also serves
+// DFlash v1 checkpoints.
 //
 // The drafter embeds an `[anchor, MASK, ...]` block, runs it through a few
-// bidirectional layers that attend to a window of the target's hidden states,
-// keeps the top-K candidates per position, and walks one path through them with
-// a pairwise selector. Embedding and LM head are the target's.
+// layers that attend to the target's hidden states, and reads the block's
+// logits through the target's head. DFlash2 wraps each sublayer in a dynamic
+// convolution, keeps the top-K candidates per position, and walks one path
+// through them with a pairwise selector. DFlash v1 has neither and drafts the
+// argmax at every masked position.
 
 import Foundation
 import MLX
@@ -30,6 +33,8 @@ public struct DFlash2SpecConfiguration: Codable, Sendable {
     /// The mlx-community layout's sliding window: `use_swa` with `swa_window_size`.
     public var useSlidingWindow: Bool?
     public var slidingWindowSize: Int?
+    /// Whether the object names a convolution or a selector: DFlash2 rather than v1.
+    public var describesDFlash2: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case blockSize = "block_size"
@@ -66,15 +71,20 @@ public struct DFlash2SpecConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping)
         useSlidingWindow = try container.decodeIfPresent(Bool.self, forKey: .useSlidingWindow)
         slidingWindowSize = try container.decodeIfPresent(Int.self, forKey: .slidingWindowSize)
+        describesDFlash2 = [.convKernelSize, .convGroupSize, .selectorRank, .selectorTopK]
+            .contains(where: container.contains)
     }
 }
 
-/// Configuration of a DFlash2 draft checkpoint (`model_type: qwen3`,
-/// `architectures: [DFlash2DraftModel]`).
+/// Configuration of a DFlash2 (`architectures: [DFlash2DraftModel]`) or DFlash
+/// v1 (`[DFlashDraftModel]`) draft checkpoint; both report `model_type: qwen3`.
 ///
 /// Reads both published layouts: `layer_types` with `sliding_window` (z-lab,
 /// inco.ai), and `dflash_config.use_swa` with a top-level `block_size`
-/// (mlx-community). Every layer must be non-causal sliding-window attention.
+/// (mlx-community). A DFlash2 layer must be non-causal sliding-window
+/// attention. A v1 layer may be sliding or full attention; its block attends
+/// causally in sliding layers unless `is_causal` says otherwise, as the
+/// reference does.
 public struct DFlash2Configuration: Decodable, Sendable {
     public var hiddenSize: Int = 5120
     public var hiddenLayers: Int = 5
@@ -91,8 +101,15 @@ public struct DFlash2Configuration: Decodable, Sendable {
     /// Depth of the target the drafter was distilled for; mlx-community omits it.
     public var numTargetLayers: Int?
     public var dflash: DFlash2SpecConfiguration = .init()
+    /// `true` for DFlash2 (dynamic convolution and candidate selector), `false` for v1.
+    public var isDFlash2: Bool = true
+    /// `sliding_attention` or `full_attention`, one per layer.
+    public var layerTypes: [String] = []
+    /// Whether block positions attend causally; `nil` lets the layer type decide.
+    public var isCausal: Bool?
 
     enum CodingKeys: String, CodingKey {
+        case architectures
         case hiddenSize = "hidden_size"
         case hiddenLayers = "num_hidden_layers"
         case attentionHeads = "num_attention_heads"
@@ -153,24 +170,52 @@ public struct DFlash2Configuration: Decodable, Sendable {
         ropeTheta = ropeParameters?["rope_theta"]?.asFloat() ?? topLevelTheta ?? 10_000_000
         ropeScaling = ropeParameters
 
-        let window: Int?
-        if let layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes) {
-            let allSliding =
-                layerTypes.count == hiddenLayers
-                && layerTypes.allSatisfy { $0 == "sliding_attention" }
-            window =
-                allSliding ? try container.decodeIfPresent(Int.self, forKey: .slidingWindow) : nil
+        let architectures =
+            try container.decodeIfPresent([String].self, forKey: .architectures) ?? []
+        if architectures.contains("DFlash2DraftModel") {
+            isDFlash2 = true
+        } else if architectures.contains("DFlashDraftModel") {
+            isDFlash2 = false
         } else {
-            window = dflash.useSlidingWindow == true ? dflash.slidingWindowSize : nil
+            isDFlash2 = dflash.describesDFlash2
         }
-        guard let window, window > 1 else {
+
+        if let types = try container.decodeIfPresent([String].self, forKey: .layerTypes) {
+            layerTypes = types
+        } else {
+            let type = dflash.useSlidingWindow == true ? "sliding_attention" : "full_attention"
+            layerTypes = Array(repeating: type, count: hiddenLayers)
+        }
+        guard layerTypes.count == hiddenLayers else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes, in: container,
+                debugDescription: "layer_types must name one type per layer")
+        }
+        guard layerTypes.allSatisfy({ $0 == "sliding_attention" || $0 == "full_attention" })
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .layerTypes, in: container,
+                debugDescription: "unsupported layer type in \(layerTypes)")
+        }
+        if isDFlash2, layerTypes.contains("full_attention") {
             throw DecodingError.dataCorruptedError(
                 forKey: .layerTypes, in: container,
                 debugDescription: "DFlash2 needs sliding-window attention in every layer")
         }
-        slidingWindow = window
+        if layerTypes.contains("sliding_attention") {
+            let window =
+                try container.decodeIfPresent(Int.self, forKey: .slidingWindow)
+                ?? dflash.slidingWindowSize
+            guard let window, window > 1 else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .layerTypes, in: container,
+                    debugDescription: "sliding_attention layers need a sliding_window above 1")
+            }
+            slidingWindow = window
+        }
+        isCausal = try container.decodeIfPresent(Bool.self, forKey: .isCausal)
         // The reference treats a missing `is_causal` as causal for sliding layers.
-        guard try container.decodeIfPresent(Bool.self, forKey: .isCausal) == false else {
+        if isDFlash2, isCausal != false {
             throw DecodingError.dataCorruptedError(
                 forKey: .isCausal, in: container,
                 debugDescription: "DFlash2 needs a non-causal (is_causal: false) drafter")
@@ -182,8 +227,27 @@ public struct DFlash2Configuration: Decodable, Sendable {
         }
     }
 
-    /// Context rows a block can see: the window minus the block's own anchor.
-    public var contextWindow: Int { slidingWindow - 1 }
+    /// Context rows layer `index` can see: the window minus the block's own
+    /// anchor, or every row (`Int.max`) for a full-attention layer.
+    public func contextWindow(forLayer index: Int) -> Int {
+        layerTypes[index] == "sliding_attention" ? slidingWindow - 1 : .max
+    }
+
+    /// Context rows the drafter keeps: as many as its widest layer can see.
+    public var contextWindow: Int {
+        (0 ..< hiddenLayers).map(contextWindow(forLayer:)).max() ?? .max
+    }
+
+    /// How far back a block position in layer `index` attends: the sliding
+    /// window, or without bound (`Int.max`) for a full-attention layer.
+    public func attentionWindow(forLayer index: Int) -> Int {
+        layerTypes[index] == "sliding_attention" ? slidingWindow : .max
+    }
+
+    /// Whether block positions in layer `index` see only earlier block positions.
+    public func attendsCausally(layer index: Int) -> Bool {
+        isCausal ?? (layerTypes[index] == "sliding_attention")
+    }
 }
 
 // MARK: - Two-tap dynamic depthwise convolution
@@ -313,47 +377,65 @@ final class DFlash2Attention: Module {
 
 // MARK: - Decoder layer
 
-/// Pre-norm layer with a dynamic conv pair around each sublayer, split at the
-/// attention so the SDPA over the growing context runs between two traces.
+/// Pre-norm layer, split at the attention so the SDPA over the growing context
+/// runs between two traces. DFlash2 wraps each sublayer in a dynamic conv pair;
+/// a v1 layer has none.
 final class DFlash2DecoderLayer: Module {
+    /// Whether block positions see only earlier block positions.
+    let causalBlock: Bool
+
     @ModuleInfo(key: "self_attn") var selfAttn: DFlash2Attention
     @ModuleInfo(key: "mlp") var mlp: DFlash2MLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-    @ModuleInfo(key: "attention_conv") var attentionConv: DFlash2DynamicConv
-    @ModuleInfo(key: "mlp_conv") var mlpConv: DFlash2DynamicConv
+    @ModuleInfo(key: "attention_conv") var attentionConv: DFlash2DynamicConv?
+    @ModuleInfo(key: "mlp_conv") var mlpConv: DFlash2DynamicConv?
 
-    init(_ config: DFlash2Configuration) {
+    init(_ config: DFlash2Configuration, index: Int) {
+        causalBlock = config.attendsCausally(layer: index)
         _selfAttn.wrappedValue = DFlash2Attention(config)
         _mlp.wrappedValue = DFlash2MLP(config)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        _attentionConv.wrappedValue = DFlash2DynamicConv(
-            hiddenSize: config.hiddenSize,
-            kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
-        _mlpConv.wrappedValue = DFlash2DynamicConv(
-            hiddenSize: config.hiddenSize,
-            kernelSize: config.dflash.convKernelSize,
-            groupSize: config.dflash.convGroupSize)
+        if config.isDFlash2 {
+            _attentionConv.wrappedValue = DFlash2DynamicConv(
+                hiddenSize: config.hiddenSize,
+                kernelSize: config.dflash.convKernelSize,
+                groupSize: config.dflash.convGroupSize)
+            _mlpConv.wrappedValue = DFlash2DynamicConv(
+                hiddenSize: config.hiddenSize,
+                kernelSize: config.dflash.convKernelSize,
+                groupSize: config.dflash.convGroupSize)
+        }
         super.init()
     }
 
-    /// Input norm, conv prepare and the block projections.
+    /// Input norm, conv prepare where there is a conv, and the block projections.
     func preAttention(
         x: MLXArray, rope: RoPELayer, position: MLXArray
-    ) -> (kernel: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray) {
-        let (h, kernel) = attentionConv.prepare(inputLayerNorm(x))
+    ) -> (kernel: MLXArray?, queries: MLXArray, keys: MLXArray, values: MLXArray) {
+        var h = inputLayerNorm(x)
+        var kernel: MLXArray? = nil
+        if let attentionConv {
+            (h, kernel) = attentionConv.prepare(h)
+        }
         let (queries, keys, values) = selfAttn.projectBlock(h, rope: rope, position: position)
         return (kernel, queries, keys, values)
     }
 
     /// Output projection, conv finish, both residual adds and the MLP.
-    func postAttention(x: MLXArray, attention: MLXArray, kernel: MLXArray) -> MLXArray {
-        let h = x + attentionConv.finish(selfAttn.project(attention), kernel: kernel)
-        let (m, mlpKernel) = mlpConv.prepare(postAttentionLayerNorm(h))
+    func postAttention(x: MLXArray, attention: MLXArray, kernel: MLXArray?) -> MLXArray {
+        var r = selfAttn.project(attention)
+        if let attentionConv, let kernel {
+            r = attentionConv.finish(r, kernel: kernel)
+        }
+        let h = x + r
+        var m = postAttentionLayerNorm(h)
+        guard let mlpConv else { return h + mlp(m) }
+        let mlpKernel: MLXArray
+        (m, mlpKernel) = mlpConv.prepare(m)
         return h + mlpConv.finish(mlp(m), kernel: mlpKernel)
     }
 }
@@ -479,7 +561,7 @@ final class DFlash2CandidateSelector: Module {
 
 // MARK: - Draft model
 
-/// The DFlash2 drafter.
+/// The DFlash2 drafter, which also runs DFlash v1 checkpoints.
 ///
 /// A proposal runs as compiled segments split at each layer's attention. The
 /// block position and every accept-dependent value enter as arrays, so one
@@ -491,23 +573,30 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
     @ModuleInfo(key: "hidden_norm") var hiddenNorm: RMSNorm
     @ModuleInfo(key: "layers") var layers: [DFlash2DecoderLayer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
-    @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector
+    /// DFlash2 only; a v1 drafter takes the argmax instead.
+    @ModuleInfo(key: "candidate_selector") var candidateSelector: DFlash2CandidateSelector?
 
     let rope: RoPELayer
 
     /// Test hook: run the segment bodies eagerly instead of through traces.
     var compiledTracesEnabled = true
+    /// Test hook, eager mode only: keep each layer's block output and the logits.
+    var recordsIntermediates = false
+    private(set) var lastLayerOutputs: [MLXArray] = []
+    private(set) var lastLogits: MLXArray?
 
     public init(_ config: DFlash2Configuration) {
         self.config = config
         let concatDim = config.dflash.targetLayerIds.count * config.hiddenSize
         _fc.wrappedValue = Linear(concatDim, config.hiddenSize, bias: false)
         _hiddenNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        _layers.wrappedValue = (0 ..< config.hiddenLayers).map { _ in
-            DFlash2DecoderLayer(config)
+        _layers.wrappedValue = (0 ..< config.hiddenLayers).map { index in
+            DFlash2DecoderLayer(config, index: index)
         }
         _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        _candidateSelector.wrappedValue = DFlash2CandidateSelector(config)
+        if config.isDFlash2 {
+            _candidateSelector.wrappedValue = DFlash2CandidateSelector(config)
+        }
         rope = initializeRope(
             dims: config.headDim,
             base: config.ropeTheta,
@@ -532,7 +621,9 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 
     public func makeState() -> DFlash2DrafterState {
         DFlash2DrafterState(
-            contextCaches: layers.map { _ in DFlash2ContextCache(window: contextWindow) })
+            contextCaches: layers.indices.map {
+                DFlash2ContextCache(window: config.contextWindow(forLayer: $0))
+            })
     }
 
     public func propose(
@@ -558,30 +649,47 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
                 cache.append(
                     keys: contextKV[2 * i], values: contextKV[2 * i + 1], positions: positions))
         }
-        // The caches move in lockstep, so one mask serves every layer.
-        let mask = Self.visibilityMask(
-            cache: state.contextCaches[0], appended: rows, validRows: request.validRows,
-            blockPosition: blockPosition, width: width, window: config.slidingWindow)
+        // The caches move in lockstep; layers of one kind share a mask.
+        var masks: [Int: MLXArray] = [:]
+        var maskByKind: [String: MLXArray] = [:]
+        for index in layers.indices {
+            let window = config.attentionWindow(forLayer: index)
+            let kind = "\(window):\(layers[index].causalBlock)"
+            if maskByKind[kind] == nil {
+                maskByKind[kind] = Self.visibilityMask(
+                    cache: state.contextCaches[index], appended: rows,
+                    validRows: request.validRows, blockPosition: blockPosition, width: width,
+                    window: window, causalBlock: layers[index].causalBlock)
+            }
+            masks[index] = maskByKind[kind]
+        }
 
         // The target's embedding and head run outside the traces.
         var x = target.dflash2Embedding(block) * config.dflash.inputEmbeddingScale
         var attention: MLXArray? = nil
         var kernel: MLXArray? = nil
+        if recordsIntermediates { lastLayerOutputs = [] }
         for index in 0 ... layers.count {
-            let args = attention.map { [x, $0, kernel!, blockPosition] } ?? [x, blockPosition]
+            var args = [x]
+            if let attention {
+                args.append(attention)
+                if let kernel { args.append(kernel) }
+            }
+            args.append(blockPosition)
             let outputs =
                 compiledTracesEnabled
                 ? segmentTrace(index: index, width: width)(self, args)
                 : segmentBody(at: index, args)
             x = outputs[0]
             guard index < layers.count else { break }
-            kernel = outputs[1]
+            kernel = config.isDFlash2 ? outputs[1] : nil
+            let first = config.isDFlash2 ? 2 : 1
             let (contextKeys, contextValues) = layerKV[index]
             attention = MLXFast.scaledDotProductAttention(
-                queries: outputs[2],
-                keys: concatenated([contextKeys, outputs[3]], axis: 2),
-                values: concatenated([contextValues, outputs[4]], axis: 2),
-                scale: layers[index].selfAttn.scale, mask: mask)
+                queries: outputs[first],
+                keys: concatenated([contextKeys, outputs[first + 1]], axis: 2),
+                values: concatenated([contextValues, outputs[first + 2]], axis: 2),
+                scale: layers[index].selfAttn.scale, mask: masks[index]!)
         }
 
         let hidden = x[0..., 1..., 0...]
@@ -593,28 +701,51 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
         if let suppressor = request.suppressedTokens {
             logits = suppressor.process(logits: logits[0]).expandedDimensions(axis: 0)
         }
+        if recordsIntermediates { lastLogits = logits }
+        guard let candidateSelector else {
+            // v1: the argmax at every masked position. A sampled round sees a
+            // point mass on each draft, which rejection sampling accepts with
+            // the target's probability of it.
+            let tokens = argMax(logits, axis: -1).asType(.int32)
+            return DFlash2Proposal(
+                tokens: tokens, candidates: tokens.expandedDimensions(axis: -1),
+                probabilities: request.temperature > 0
+                    ? MLXArray.ones(tokens.shape + [1]) : nil)
+        }
         return candidateSelector.select(
             hidden: hidden, logits: logits, anchor: block[0..., 0],
             temperature: request.temperature)
     }
 
     /// Bool mask `[width, cache.count + width]`. Committed context rows within the
-    /// window are visible, placeholders never, and the block sees itself in full.
+    /// window are visible, placeholders never, and the block sees itself in full,
+    /// or up to each position when `causalBlock`. `Int.max` is an unbounded window.
     static func visibilityMask(
         cache: DFlash2ContextCache, appended: Int, validRows: MLXArray,
-        blockPosition: MLXArray, width: Int, window: Int
+        blockPosition: MLXArray, width: Int, window: Int, causalBlock: Bool = false
     ) -> MLXArray {
         let older = cache.count - appended
-        let keyPositions = MLXArray(cache.rowPositions)
         let olderValid = MLXArray(Array(cache.rowValid[0 ..< older]))
         let appendedValid = MLXArray(Int32(0) ..< Int32(appended)) .< validRows.asType(.int32)
-        let valid = concatenated([olderValid, appendedValid])
-        let queryPositions = blockPosition.asType(.int32) + MLXArray(Int32(0) ..< Int32(width))
-        let distance =
-            queryPositions.expandedDimensions(axis: 1) - keyPositions.expandedDimensions(axis: 0)
-        let contextVisible = valid.expandedDimensions(axis: 0) & (distance .< Int32(window))
-        return concatenated(
-            [contextVisible, MLXArray.ones([width, width], dtype: .bool)], axis: 1)
+        let valid = concatenated([olderValid, appendedValid]).expandedDimensions(axis: 0)
+        let contextVisible: MLXArray
+        if window >= Int(Int32.max) {
+            contextVisible = broadcast(valid, to: [width, cache.count])
+        } else {
+            let keyPositions = MLXArray(cache.rowPositions)
+            let queryPositions =
+                blockPosition.asType(.int32) + MLXArray(Int32(0) ..< Int32(width))
+            let distance =
+                queryPositions.expandedDimensions(axis: 1)
+                - keyPositions.expandedDimensions(axis: 0)
+            contextVisible = valid & (distance .< Int32(window))
+        }
+        let offsets = MLXArray(Int32(0) ..< Int32(width))
+        let block =
+            causalBlock
+            ? offsets.expandedDimensions(axis: 0) .<= offsets.expandedDimensions(axis: 1)
+            : MLXArray.ones([width, width], dtype: .bool)
+        return concatenated([contextVisible, block], axis: 1)
     }
 
     // MARK: Compiled segments
@@ -635,18 +766,20 @@ public final class DFlash2DraftModel: Module, DFlash2DrafterModel {
 
     /// Segment `i` closes layer `i - 1` and opens layer `i`; the last segment
     /// applies the final norm. In: `[x, position]` for segment 0, else
-    /// `[x, attention, kernel, position]`. Out: `[x, kernel, queries, keys, values]`,
-    /// or `[normed]` for the last.
+    /// `[x, attention, position]` with the conv kernel before the position for
+    /// DFlash2. Out: `[x, queries, keys, values]` with the kernel after `x` for
+    /// DFlash2, or `[normed]` for the last.
     private func segmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
         var x = args[0]
         if index > 0 {
-            x = layers[index - 1].postAttention(x: x, attention: args[1], kernel: args[2])
+            x = layers[index - 1].postAttention(
+                x: x, attention: args[1], kernel: config.isDFlash2 ? args[2] : nil)
+            if recordsIntermediates, !compiledTracesEnabled { lastLayerOutputs.append(x) }
         }
         guard index < layers.count else { return [norm(x)] }
-        let position = args[index == 0 ? 1 : 3]
         let (kernel, queries, keys, values) = layers[index].preAttention(
-            x: x, rope: rope, position: position)
-        return [x, kernel, queries, keys, values]
+            x: x, rope: rope, position: args[args.count - 1])
+        return [x] + (kernel.map { [$0] } ?? []) + [queries, keys, values]
     }
 
     private func segmentTrace(index: Int, width: Int) -> CompiledTrace<DFlash2DraftModel> {

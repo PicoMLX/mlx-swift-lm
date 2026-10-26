@@ -2,6 +2,23 @@
 
 import Foundation
 import MLX
+import MLXNN
+
+/// A drafter checkpoint whose tensors do not match the model, by name.
+public enum DFlash2DrafterLoadError: Error, CustomStringConvertible, Equatable {
+    case missingTensor(String)
+    case unexpectedTensors([String])
+
+    public var description: String {
+        switch self {
+        case .missingTensor(let name):
+            return "DFlash drafter checkpoint is missing tensor \(name)"
+        case .unexpectedTensors(let names):
+            return
+                "DFlash drafter checkpoint has unexpected tensors \(names.joined(separator: ", "))"
+        }
+    }
+}
 
 /// Registry of `model_type` strings to ``DFlash2DrafterModel`` creators. Empty until
 /// `DFlash2Registration.register()` in MLXLLM adds the drafter.
@@ -14,9 +31,11 @@ public class DFlash2DrafterRegistry: AbstractModelRegistry, @unchecked Sendable 
     public static let shared = DFlash2DrafterRegistry(modelConfigurations: all())
 
     public static let qwen38_27B_dflash2 = ModelConfiguration(id: "incoai/Qwen3.8-27B-DFlash2")
+    /// A DFlash v1 drafter for Qwen3.5-4B.
+    public static let qwen35_4B_dflash = ModelConfiguration(id: "z-lab/Qwen3.5-4B-DFlash")
 
     private static func all() -> [ModelConfiguration] {
-        [qwen38_27B_dflash2]
+        [qwen38_27B_dflash2, qwen35_4B_dflash]
     }
 }
 
@@ -108,12 +127,25 @@ public final class DFlash2DrafterModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents
-        )
+        do {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection,
+                excludedComponents: configuration.excludedComponents
+            )
+        } catch let error as UpdateError {
+            // Every tensor must land in the model and every parameter must be set.
+            switch error {
+            case .keyNotFound(let path, _):
+                throw DFlash2DrafterLoadError.missingTensor(path.joined(separator: "."))
+            case .unhandledKeys(let path, _, let keys):
+                throw DFlash2DrafterLoadError.unexpectedTensors(
+                    keys.map { (path + [$0]).joined(separator: ".") })
+            default:
+                throw error
+            }
+        }
 
         let modelConfig = ModelConfiguration(
             directory: modelDirectory,
