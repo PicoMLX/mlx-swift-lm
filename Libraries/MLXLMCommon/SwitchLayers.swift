@@ -10,8 +10,10 @@ public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = com
     MLXNN.silu(gate) * up
 }
 
+// Not shapeless: a trace with one routed expert simplifies away the reduction,
+// and reusing it for more experts would skip the sum.
 public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
+    shapeless: false
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
 }
