@@ -15,6 +15,10 @@ class GLM4MoEAttention: Module {
     let args: GLM4MoEConfiguration
     let scale: Float
 
+    // Sharding divides these by the group size.
+    private(set) var attentionHeads: Int
+    private(set) var kvHeads: Int
+
     @ModuleInfo(key: "q_proj") var wq: Linear
     @ModuleInfo(key: "k_proj") var wk: Linear
     @ModuleInfo(key: "v_proj") var wv: Linear
@@ -27,6 +31,8 @@ class GLM4MoEAttention: Module {
 
     init(_ args: GLM4MoEConfiguration) {
         self.args = args
+        self.attentionHeads = args.attentionHeads
+        self.kvHeads = args.kvHeads
 
         let headDim = args.headDim > 0 ? args.headDim : args.hiddenSize / args.attentionHeads
         self.scale = pow(Float(headDim), -0.5)
@@ -58,8 +64,8 @@ class GLM4MoEAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        queries = queries.reshaped(B, L, args.attentionHeads, -1)
-        keys = keys.reshaped(B, L, args.kvHeads, -1)
+        queries = queries.reshaped(B, L, attentionHeads, -1)
+        keys = keys.reshaped(B, L, kvHeads, -1)
 
         if let qNorm, let kNorm {
             queries = qNorm(queries)
@@ -68,7 +74,7 @@ class GLM4MoEAttention: Module {
 
         queries = queries.transposed(0, 2, 1, 3)
         keys = keys.transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -86,6 +92,15 @@ class GLM4MoEAttention: Module {
         .reshaped(B, L, -1)
 
         return wo(output)
+    }
+
+    /// Keeps this process' share of the heads. The query and key norms are per head, so
+    /// they stay whole.
+    func shard(group: MLXDistributed.Group) throws {
+        try shardLinears(
+            allToSharded: ["q_proj", "k_proj", "v_proj"], shardedToAll: ["o_proj"], group: group)
+        attentionHeads /= try group.size
+        kvHeads /= try group.size
     }
 }
 
@@ -218,7 +233,24 @@ class GLM4MoE: Module, UnaryLayer {
         if let sharedExperts {
             y = y + sharedExperts(x)
         }
+        // Each shard computes part of every expert, so the block sums once.
+        if let shardingGroup {
+            return MLXDistributed.allSum(y, group: shardingGroup)
+        }
         return y
+    }
+
+    /// The group the experts are split across, once the block holds a shard.
+    private(set) var shardingGroup: MLXDistributed.Group?
+
+    /// Keeps this process' share of every expert's hidden width, routed and shared. The
+    /// router stays whole.
+    func shard(group: MLXDistributed.Group) throws {
+        shardingGroup = group
+        try shardInPlace(switchMLP, predicate: expertSharding, group: group)
+        if let sharedExperts {
+            try shardInPlace(sharedExperts, predicate: expertSharding, group: group)
+        }
     }
 }
 
@@ -251,6 +283,17 @@ class GLM4MoEDecoderLayer: Module {
         let h = x + r
         let r2 = mlp(postAttentionLayerNorm(h))
         return h + r2
+    }
+
+    func shard(group: MLXDistributed.Group) throws {
+        try attention.shard(group: group)
+        if let moe = mlp as? GLM4MoE {
+            try moe.shard(group: group)
+        } else {
+            try mlp.shardLinears(
+                allToSharded: ["gate_proj", "up_proj"], shardedToAll: ["down_proj"],
+                group: group)
+        }
     }
 }
 
@@ -444,6 +487,24 @@ public struct GLM4MoEConfiguration: Codable, Sendable {
 extension GLM4MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+extension GLM4MoEModel: TensorParallelModel {
+    /// Keeps this process' share of the attention heads, dense MLP widths and every
+    /// expert's width. Embeddings, the expert routers, norms and `lm_head` stay whole.
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateShardable(self)
+        try requireDivisible(
+            [
+                "attention heads": configuration.attentionHeads,
+                "key-value heads": configuration.kvHeads,
+                "MLP width": configuration.intermediateSize,
+                "expert width": configuration.moeIntermediateSize,
+            ], by: group.size)
+        for layer in model.layers {
+            try layer.shard(group: group)
+        }
     }
 }
 
