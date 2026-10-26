@@ -720,8 +720,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         // Decode (S == 1) runs through a compiled trace: fusion merges the
         // elementwise chains into fewer kernels, bit-identically. Prefill
         // stays unfused — it is GEMM-bound and would pay a trace per shape.
-        // The trace was verified for the whole block, so a shard skips it.
-        if x.dim(1) != 1 || shardingGroup != nil {
+        if x.dim(1) != 1 {
             return forward(x)
         }
         return compiledForward(self, x)
@@ -833,9 +832,9 @@ final class Qwen35DecoderLayer: Module {
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
-        // (two for full attention, split at the KV write). Everything else,
-        // including a sharded layer, takes the general body below.
-        if !isSharded, x.dim(1) == 1, ssmMask == nil {
+        // (two for full attention, split at the KV write), a sharded layer's
+        // collectives included. Everything else takes the general body below.
+        if x.dim(1) == 1, ssmMask == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -859,14 +858,8 @@ final class Qwen35DecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
-    /// Set once the layer holds a shard. The traced decode paths were built and
-    /// verified for the whole layer, so a sharded layer skips them.
-    private(set) var isSharded = false
-
     /// Keeps this process' share of the layer: its heads and its MLP or expert width.
     func shard(group: MLXDistributed.Group) throws {
-        // Set first: a layer that fails part-way must still skip the traced paths.
-        isSharded = true
         try linearAttn?.shard(group: group)
         try selfAttn?.shard(group: group)
         if let moe = mlp as? Qwen35SparseMoeBlock {
@@ -1035,7 +1028,7 @@ public class Qwen35TextModelInner: Module {
         forward(inputs, cache: cache, applyFinalNorm: true)
     }
 
-    /// Set once the layers hold shards; the compiled decode schedule is then skipped.
+    /// Whether the layers hold shards.
     private(set) var isSharded = false
 
     func shard(group: MLXDistributed.Group) throws {
@@ -1056,7 +1049,7 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        if !isSharded, applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
