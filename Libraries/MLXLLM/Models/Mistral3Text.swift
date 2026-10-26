@@ -81,10 +81,11 @@ class Mistral3Attention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        // Prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+        // Prepare the queries, keys and values for the attention computation. The head
+        // counts come from the projections, which hold a share of them once sharded.
+        queries = queries.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
 
         // Apply RoPE
         let offset = cache?.ropeOffset
@@ -488,6 +489,30 @@ public struct Mistral3TextConfiguration: Codable, Sendable {
 extension Mistral3TextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension Mistral3TextModel: TensorParallelModel {
+    /// Keeps this process' share of every layer's attention heads and MLP width; the
+    /// embeddings, norms and output projection stay whole.
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateShardable(self)
+        try requireDivisible(
+            [
+                "attention heads": args.attentionHeads,
+                "key-value heads": args.kvHeads,
+                "MLP width": args.intermediateSize,
+            ], by: group.size)
+        for layer in model.layers {
+            try layer.attention.shardLinears(
+                allToSharded: ["q_proj", "k_proj", "v_proj"], shardedToAll: ["o_proj"],
+                group: group)
+            try layer.mlp.shardLinears(
+                allToSharded: ["gate_proj", "up_proj"], shardedToAll: ["down_proj"],
+                group: group)
+        }
     }
 }
 
