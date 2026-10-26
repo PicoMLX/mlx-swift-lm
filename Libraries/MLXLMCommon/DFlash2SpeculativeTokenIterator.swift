@@ -88,7 +88,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     ///   - input: the prompt, text only.
     ///   - mainModel: the target; must conform to ``DFlash2TargetModel``.
     ///   - drafter: a DFlash2 drafter distilled for `mainModel`'s shape.
-    ///   - mainCache: a target cache to decode over.
+    ///   - mainCache: a target cache to decode over. `input` continues after
+    ///     the positions it already holds.
     ///   - prefilledPrefixTokens: leading positions of `input` that `mainCache`
     ///     already holds; only the rest is prefilled.
     ///   - parameters: sampling and generation limits.
@@ -163,22 +164,27 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         input: LMInput, prefilledPrefixTokens: Int, prefill: PrefillParameters
     ) throws {
         processor?.prompt(input.text.tokens)
-        prefill.prefix?(prefilledPrefixTokens)
         let promptTokens = input.text.tokens
         let promptLength = promptTokens.dim(0)
-        if prefilledPrefixTokens > 0,
-            let attention = cache.first(where: { type(of: $0) == KVCacheSimple.self })
-        {
+        // The cache may hold positions `input` does not repeat, as when `input`
+        // is the uncached tail of a conversation. Positions below are absolute;
+        // `origin` is where `input`'s first token sits.
+        let cached =
+            (cache.first(where: { type(of: $0) == KVCacheSimple.self }) ?? cache.first)?.offset
+            ?? 0
+        if prefilledPrefixTokens > 0 {
             precondition(
-                attention.offset == prefilledPrefixTokens,
-                "cache holds \(attention.offset) positions, prefilledPrefixTokens is \(prefilledPrefixTokens)"
+                cached == prefilledPrefixTokens,
+                "cache holds \(cached) positions, prefilledPrefixTokens is \(prefilledPrefixTokens)"
             )
         }
+        let origin = cached - prefilledPrefixTokens
+        prefill.prefix?(cached)
 
         let window = drafter.contextWindow
         let captureLayers = drafter.targetLayerIds
         var hiddenWindow: MLXArray? = nil
-        var hiddenOffset = prefilledPrefixTokens
+        var hiddenOffset = cached
         func forward(_ range: Range<Int>) -> MLXArray {
             let chunk = promptTokens[range].expandedDimensions(axis: 0)
             let result = target.dflash2Prefill(chunk, cache: cache, captureLayers: captureLayers)
@@ -210,7 +216,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         eval(token)
         pendingTokens.append(token.item(Int.self))
         producedTokens = 1
-        anchorPosition = promptLength
+        anchorPosition = origin + promptLength
 
         // The prompt rows are committed context as soon as round 0 appends them.
         let context = hiddenWindow!
@@ -219,8 +225,8 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
             validRows: MLXArray(Int32(context.dim(1))),
             targetHidden: context,
             contextPosition: hiddenOffset,
-            position: MLXArray([Int32(promptLength)]),
-            positionUpperBound: promptLength,
+            position: MLXArray([Int32(anchorPosition)]),
+            positionUpperBound: anchorPosition,
             producedAtLeast: 1)
         for contextCache in drafterState.contextCaches {
             contextCache.resolve(newest: contextRows, valid: contextRows)

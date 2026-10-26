@@ -674,6 +674,41 @@ func testDFlash2IteratorWarmStartMatchesColdStream() throws {
 }
 
 @Test
+func testDFlash2IteratorContinuesAfterCachedPrefix() throws {
+    // The cache holds [1, 2] and `input` is the uncached tail [3], as a chat
+    // turn passes it. Every position is absolute: the context rows, the verify
+    // rows and the committed offsets all follow the cached positions.
+    let reports = PrefillReports()
+    let target = MockTarget()
+    target.script = [1, 1, 10, 20, 21, 55, 0, 30, 77, 0, 0, 77, 77, 77, 77]
+    let drafter = MockDrafter(script: [[20, 21, 99], [30, 31, 32], [77, 77, 77]])
+    let cache = target.newCache(parameters: nil)
+    _ = target(LMInput.Text(tokens: MLXArray([Int32(1), 2])), cache: cache, state: nil)
+
+    var parameters = GenerateParameters(maxTokens: 8)
+    parameters.temperature = 0
+    parameters.prefill.prefix = { reports.prefix.append($0) }
+    var iterator = try DFlash2SpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(3)])), mainModel: target,
+        drafter: drafter, mainCache: cache, parameters: parameters)
+
+    var produced: [Int] = []
+    for _ in 0 ..< 5 {
+        let token = iterator.next()
+        produced.append(try #require(token))
+    }
+    iterator.finalizeGeneration()
+    #expect(produced == [10, 20, 21, 55, 30])
+    #expect(reports.prefix == [2])
+    #expect(drafter.contextRows.first == 1)
+    // The first context row is position 2; the anchors sit at 3 and 6.
+    #expect(drafter.contextPositions.prefix(3) == [2, 3, 6])
+    // 30 sits at position 7, so the cache holds 8 positions and nothing rewinds.
+    #expect(cache[0].offset == 8)
+    #expect(cache[1].offset == 8)
+}
+
+@Test
 func testDFlash2IteratorFinalizeRewindsUndrainedDrafts() throws {
     let script: [Int32] = [1, 1, 10, 20, 21, 55, 0, 30, 77, 0, 0, 77, 77, 77, 77]
     let drafts: [[Int32]] = [[20, 21, 99], [30, 31, 32], [77, 77, 77]]
