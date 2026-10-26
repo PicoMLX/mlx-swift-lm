@@ -69,6 +69,24 @@ private func makeBatchedCacheFactory(
     if type(of: cache) == KVCacheSimple.self {
         return { BatchKVCache(leftPadding: $0) }
     }
+    if type(of: cache) == RotatingKVCache.self, let rotating = cache as? RotatingKVCache {
+        // A pinned prefix would pin padding, and a batch has no rewind reserve.
+        guard rotating.preservedPrefixTokens == 0 else {
+            throw unsupported("A RotatingKVCache with keep > 0 has no batched form.")
+        }
+        guard rotating.rewindCapacity == 0 else {
+            throw unsupported("A RotatingKVCache with a rewind reserve has no batched form.")
+        }
+        let window = rotating.maxSize ?? 0
+        let step = rotating.allocationStep
+        let capacityOrigin = rotating.capacityOrigin
+        return { leftPadding in
+            let cache = BatchRotatingKVCache(maxSize: window, leftPadding: leftPadding)
+            cache.step = step
+            cache.capacityOrigin = capacityOrigin
+            return cache
+        }
+    }
     if type(of: cache) == MambaCache.self {
         return { MambaCache(leftPadding: recurrentLeftPadding($0)) }
     }
