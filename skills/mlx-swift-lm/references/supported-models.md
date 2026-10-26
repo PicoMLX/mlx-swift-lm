@@ -95,7 +95,7 @@ LLMRegistry.mellum2_1_12b_a2_5b_thinking_6bit  // mlx-community/Mellum2.1-12B-A2
 | `granite` | IBM Granite |
 | `granitemoehybrid` | Granite MoE |
 | `mimo`, `mimo_v2_flash` | MiMo |
-| `minimax` | MiniMax |
+| `minimax`, `minimax_m2` | MiniMax |
 | `bitnet` | BitNet |
 | `smollm3` | SmolLM 3 |
 | `ernie4_5` | ERNIE 4.5 |
