@@ -395,6 +395,8 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
     /// Per-position token script for the verify rows; nil uses `transition`.
     var script: [Int32]?
     private var scriptIndex = 0
+    /// Flat logits at every position, for sampling tests.
+    var flatLogits = false
 
     override init() {
         super.init()
@@ -404,6 +406,9 @@ private final class MockTarget: Module, LanguageModel, KVCacheDimensionProvider,
 
     private func logits(for tokens: MLXArray) -> MLXArray {
         let ids = tokens.flattened().asArray(Int32.self).map(Int.init)
+        if flatLogits {
+            return MLXArray.zeros([1, ids.count, Self.vocab])
+        }
         var data = [Float](repeating: 0, count: ids.count * Self.vocab)
         for (i, token) in ids.enumerated() {
             let best: Int
@@ -526,8 +531,9 @@ private final class MockDrafter: Module, DFlash2DrafterModel {
     /// Committed context rows visible at each proposal, before its append.
     private(set) var committedRows: [Int] = []
     private(set) var sawSuppressedTokens = false
-    /// Above temperature 0, draw each draft from a flat candidate row with
-    /// `categorical`, as the real selector does, and record the draws.
+    /// Above temperature 0, draw the first draft over the whole vocabulary and
+    /// the rest from flat candidate rows with `categorical`, as the real
+    /// selector does, and record the draws.
     var samplesDrafts = false
     private(set) var sampledDrafts: [[Int32]] = []
     var geometry = DFlash2Geometry(
@@ -585,12 +591,21 @@ private final class MockDrafter: Module, DFlash2DrafterModel {
         let probabilities: [Float] = tokens.flatMap { _ in [0.9, 0.05, 0.025, 0.025] }
         let candidateRows = MLXArray(candidates, [1, width, 4])
         if samplesDrafts, request.temperature > 0 {
+            // The first draw has the shape of the target's first-token sample.
+            let vocabulary = MLXArray.ones([1, MockTarget.vocab]) / Float(MockTarget.vocab)
+            let first = categorical(log(vocabulary)).asType(.int32)
             let flat = MLXArray([Float](repeating: 0.25, count: width * 4), [1, width, 4])
             let chosen = categorical(log(flat))
-            let drafts = takeAlong(candidateRows, chosen[.ellipsis, .newAxis], axis: -1)[
-                .ellipsis, 0]
-            sampledDrafts.append(drafts.flattened().asArray(Int32.self))
-            return DFlash2Proposal(tokens: drafts, candidates: candidateRows, probabilities: flat)
+            var drafts = takeAlong(candidateRows, chosen[.ellipsis, .newAxis], axis: -1)[
+                .ellipsis, 0
+            ].flattened().asArray(Int32.self)
+            drafts[0] = first.item(Int32.self)
+            var sampledCandidates = candidates
+            sampledCandidates[0] = drafts[0]
+            sampledDrafts.append(drafts)
+            return DFlash2Proposal(
+                tokens: MLXArray(drafts, [1, width]),
+                candidates: MLXArray(sampledCandidates, [1, width, 4]), probabilities: flat)
         }
         return DFlash2Proposal(
             tokens: MLXArray(tokens).expandedDimensions(axis: 0),
@@ -751,6 +766,31 @@ func testDFlash2SeededSamplingIgnoresGlobalRandomState() throws {
     #expect(first.drafts.count >= 6)
     #expect(second.drafts == first.drafts)
     #expect(second.tokens == first.tokens)
+}
+
+@Test
+func testDFlash2FirstTokenAndDraftsDrawDifferentKeys() throws {
+    // One random state serves the first token and the drafts. Were both drawn
+    // from the same key, a flat target and a flat drafter would make the first
+    // draft repeat the first token for every seed.
+    var repeats = 0
+    for seed in UInt64(1) ... 8 {
+        let target = MockTarget()
+        target.flatLogits = true
+        let drafter = MockDrafter()
+        drafter.samplesDrafts = true
+        var parameters = GenerateParameters(maxTokens: 4)
+        parameters.temperature = 1
+        parameters.seed = seed
+        var iterator = try DFlash2SpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])), mainModel: target,
+            drafter: drafter, parameters: parameters)
+        let first = iterator.next()
+        if drafter.sampledDrafts.first?.first == Int32(try #require(first)) {
+            repeats += 1
+        }
+    }
+    #expect(repeats < 4)
 }
 
 @Test

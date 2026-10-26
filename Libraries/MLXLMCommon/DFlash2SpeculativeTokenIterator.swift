@@ -45,6 +45,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
     let topP: Float
     let topK: Int
     let minP: Float
+    /// One stream for the first token, the drafts and the acceptance, so no key is drawn twice.
     let randomState: MLXRandom.RandomState
 
     public let maxTokens: Int?
@@ -211,7 +212,7 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
 
         var last = logits[0..., -1, 0...]
         last = processor?.process(logits: last) ?? last
-        let token = sampler.sample(logits: last)
+        let token = sampleFirstToken(last)
         processor?.didSample(token: token)
         eval(token)
         pendingTokens.append(token.item(Int.self))
@@ -231,6 +232,16 @@ public struct DFlash2SpeculativeTokenIterator: TokenIteratorProtocol {
         for contextCache in drafterState.contextCaches {
             contextCache.resolve(newest: contextRows, valid: contextRows)
         }
+    }
+
+    /// The first token. Sampled rounds draw it from `randomState`, the stream
+    /// the drafts and the acceptance use: a sampler seeded alike would reuse
+    /// its first key for the drafts and correlate them with the anchor.
+    private func sampleFirstToken(_ logits: MLXArray) -> MLXArray {
+        guard !greedy else { return sampler.sample(logits: logits) }
+        let probabilities = speculativeSamplingProbabilities(
+            logits, temperature: temperature, topP: topP, minP: minP, topK: topK)
+        return withRandomState(randomState) { categorical(log(probabilities)) }
     }
 
     private func concatenatedHidden(_ layers: [MLXArray]) -> MLXArray {
