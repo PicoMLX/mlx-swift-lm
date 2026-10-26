@@ -10,6 +10,7 @@ import MLXNN
 class LlamaAttention: Module {
 
     let args: LlamaConfiguration
+    let headDim: Int
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -27,6 +28,7 @@ class LlamaAttention: Module {
         let kvHeads = args.kvHeads
 
         let headDim = args.resolvedHeadDimensions
+        self.headDim = headDim
         self.scale = pow(Float(headDim), -0.5)
 
         self._wq.wrappedValue = Linear(dim, heads * headDim, bias: args.attentionBias)
@@ -50,10 +52,11 @@ class LlamaAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        // Prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        // Prepare the queries, keys and values for the attention computation. The head
+        // counts come from the projections, which hold a share of them once sharded.
+        queries = queries.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
 
         let offset = cache?.ropeOffset
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
@@ -348,6 +351,30 @@ public struct LlamaConfiguration: Codable, Sendable {
 extension LlamaModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - Tensor parallelism
+
+extension LlamaModel: TensorParallelModel {
+    /// Keeps this process' share of every layer's attention heads and MLP width; the
+    /// embeddings, norms and output projection stay whole. Port of mlx-lm's `Model.shard`.
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateShardable(self)
+        try requireDivisible(
+            [
+                "attention heads": configuration.attentionHeads,
+                "key-value heads": configuration.kvHeads,
+                "MLP width": configuration.intermediateSize,
+            ], by: group.size)
+        for layer in model.layers {
+            try layer.attention.shardLinears(
+                allToSharded: ["q_proj", "k_proj", "v_proj"], shardedToAll: ["o_proj"],
+                group: group)
+            try layer.mlp.shardLinears(
+                allToSharded: ["gate_proj", "up_proj"], shardedToAll: ["down_proj"],
+                group: group)
+        }
     }
 }
 

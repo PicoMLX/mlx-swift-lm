@@ -476,6 +476,80 @@ public func loadWeights(
     }
 }
 
+/// Load model weights for tensor parallelism, keeping only this process' share in memory.
+///
+/// The steps of ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:componentLoading:)-858j8``
+/// in another order, as in mlx-lm's `sharded_load`: the weights are set on the model
+/// unread, the model is sharded, and only then is each tensor read. Each is read whole,
+/// this process' part is kept, and the rest is released before the next is read, so the
+/// whole model is never in memory.
+///
+/// Every process in `group` calls this with the same files. It does not communicate; run a
+/// collective such as `MLXDistributed.allSum` afterwards to confirm that every process
+/// loaded.
+public func loadShardedWeights(
+    modelDirectory: URL, model: any BaseLanguageModel & TensorParallelModel,
+    group: MLXDistributed.Group,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) async throws {
+    let model = SendableBox(model)
+    try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, any Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(
+                with: Result {
+                    try withLoaderThreadError {
+                        try loadShardedWeightsOnThisThread(
+                            modelDirectory: modelDirectory, model: model.consume(), group: group,
+                            perLayerQuantization: perLayerQuantization
+                                ?? quantization.map {
+                                    .init(quantization: $0, perLayerQuantization: [:])
+                                },
+                            weightFileSelection: weightFileSelection)
+                    }
+                })
+        }
+    }
+}
+
+private func loadShardedWeightsOnThisThread(
+    modelDirectory: URL, model: any BaseLanguageModel & TensorParallelModel,
+    group: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+    weightFileSelection: WeightFileSelection
+) throws {
+    let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
+    let weightURLs = try safetensorWeightURLs(
+        in: modelDirectory, selection: weightFileSelection, additionalFiles: additionalFiles ?? [])
+    let excluded = CheckpointNameMapping(
+        model.excludedCheckpointNamespaces.map { .excludePrefix($0) })
+    do {
+        // Scoped: a reference left on an unread tensor would keep it whole once read.
+        var weights = [String: MLXArray]()
+        var metadata = [String: String]()
+        for url in weightURLs {
+            let (arrays, fileMetadata) = try loadArraysAndMetadata(url: url, stream: .cpu)
+            for (name, array) in arrays where excluded.mapName(name) != nil {
+                weights[name] = array
+            }
+            if metadata.isEmpty { metadata = fileMetadata }
+        }
+        let checkpoint = try model.prepareCheckpoint(
+            ModelCheckpoint(
+                weights: weights, metadata: metadata, perLayerQuantization: perLayerQuantization))
+        try applyCheckpoint(checkpoint, to: model)
+    }
+    try model.shard(group: group)
+
+    // One tensor per eval: a single eval of the model keeps whole tensors alive longer.
+    for (_, parameter) in model.parameters().flattened() {
+        eval(parameter)
+    }
+    materializeModelForInference(model)
+}
+
 /// Run `body` in an MLX error scope on the current thread. An MLX error is thrown
 /// in place of a later error it caused in `body`, such as a shape mismatch.
 func withLoaderThreadError<R>(_ body: () throws -> R) throws -> R {

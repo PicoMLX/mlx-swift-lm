@@ -205,6 +205,7 @@ public final class EmbedderModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> EmbedderModelContext {
+        try configuration.refuseTensorParallelism()
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config

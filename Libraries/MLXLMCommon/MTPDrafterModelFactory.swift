@@ -82,6 +82,7 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> MTPDrafterContext {
+        try configuration.refuseTensorParallelism()
         let modelDirectory = configuration.modelDirectory
         let configurationURL = modelDirectory.appending(component: "config.json")
         let configData: Data

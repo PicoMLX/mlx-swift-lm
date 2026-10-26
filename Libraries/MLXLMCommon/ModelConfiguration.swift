@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import MLX
 
 /// Configuration for a given model:  at least an org/name identifier or a directory with the model files.
 ///
@@ -137,6 +138,13 @@ public struct ModelConfiguration: Sendable {
     /// without a component load it anyway; see ``ModelComponentsProviding``.
     public var excludedComponents: Set<ModelComponent> = []
 
+    /// The distributed group to split the model's weights across, for tensor parallelism.
+    ///
+    /// When set, the text model factory shards the model before reading its weights, so this
+    /// process only holds its share; see ``TensorParallelModel``. Factories and models that
+    /// cannot shard refuse a group. `nil`, the default, loads the whole model.
+    public var tensorParallelGroup: MLXDistributed.Group? = nil
+
     /// Overrides the ``MessageGenerator`` the model would otherwise supply.
     ///
     /// A model class is shared by every checkpoint of its model type, so a fine-tune that
@@ -210,7 +218,8 @@ public struct ModelConfiguration: Sendable {
             reasoningConfig: reasoningConfig,
             messageGenerator: messageGenerator,
             weightFileSelection: weightFileSelection,
-            excludedComponents: excludedComponents)
+            excludedComponents: excludedComponents,
+            tensorParallelGroup: tensorParallelGroup)
     }
 
 }
@@ -230,6 +239,7 @@ extension ModelConfiguration: Equatable {
             && lhs.reasoningConfig == rhs.reasoningConfig
             && lhs.weightFileSelection == rhs.weightFileSelection
             && lhs.excludedComponents == rhs.excludedComponents
+            && lhs.tensorParallelGroup === rhs.tensorParallelGroup
             && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
     }
 
