@@ -25,6 +25,13 @@ struct BatchedDecodeParityTests {
         }
     }
 
+    @Test("A ragged batch of Gemma 2 prompts decodes like separate sequences")
+    func gemma2() throws {
+        try Device.withDefaultDevice(.cpu) {
+            try expectBatchedRowsMatchSingles(tinyGemma2())
+        }
+    }
+
     @Test("A ragged batch of sliding-window Gemma 3 prompts decodes past its window")
     func gemma3() throws {
         try Device.withDefaultDevice(.cpu) {

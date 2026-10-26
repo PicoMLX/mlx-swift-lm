@@ -2816,7 +2816,7 @@ func maybeVarianceNormalizeKVCache(
 // MARK: - Attention Helpers
 
 /// Apply a symbolic or array attention mask to score logits.
-func applyAttentionMask(
+package func applyAttentionMask(
     scores: MLXArray,
     mask: MLXFast.ScaledDotProductAttentionMaskMode
 ) -> MLXArray {
