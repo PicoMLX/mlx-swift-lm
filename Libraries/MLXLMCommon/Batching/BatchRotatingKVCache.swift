@@ -223,11 +223,18 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         written + positions < window
     }
 
+    /// What ``trim(_:)`` removes, while the window has not filled.
+    public override var maxTrimCount: Int { isTrimmable ? trimLimit : 0 }
+
+    /// No row can lose more tokens than the shortest row holds.
+    private var trimLimit: Int {
+        let shortest = batchSize > 0 ? Int(batchOffset.min().item(Int32.self)) : 0
+        return min(written, max(0, shortest))
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        // No row can lose more tokens than the shortest row holds.
-        let shortest = batchSize > 0 ? Int(batchOffset.min().item(Int32.self)) : 0
-        let trimmed = min(written, max(0, shortest), n)
+        let trimmed = min(trimLimit, n)
         written -= trimmed
         idx -= trimmed
         batchOffset = batchOffset - Int32(trimmed)
@@ -297,9 +304,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             if keys == nil, other.keys == nil {
                 leftPadding = concatenated([leftPadding, other.leftPadding])
                 batchOffset = concatenated([batchOffset, other.batchOffset])
-            } else if other.keys != nil {
-                keys = other.keys
-                values = other.values
+            } else if let otherKeys = other.keys, let otherValues = other.values {
+                // New array objects, so writes to either cache leave the other unchanged.
+                keys = otherKeys[.ellipsis]
+                values = otherValues[.ellipsis]
                 idx = other.idx
                 written = other.written
                 rotated = other.rotated

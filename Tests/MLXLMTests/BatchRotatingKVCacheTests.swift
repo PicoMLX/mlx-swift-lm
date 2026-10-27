@@ -58,6 +58,35 @@ struct BatchRotatingKVCacheTests {
         #expect(try #require(second.state.last)[0, 0, 0..., 0].asArray(Float.self) == [110, 111])
     }
 
+    @Test("maxTrimCount reports only what trim can remove")
+    func maxTrimCountMatchesTrim() {
+        let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [2, 0])
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+
+        #expect(cache.maxTrimCount == 1)
+        #expect(!canTrimPromptCache([cache], numTokens: 2))
+        #expect(canTrimPromptCache([cache], numTokens: 1))
+        #expect(cache.trim(1) == 1)
+    }
+
+    @Test("An empty cache extended from another does not share its arrays")
+    func extendEmptyCacheCopies() throws {
+        // One token at a time, so the source's buffer has room past its tokens.
+        let source = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        append(0 ..< 1, to: source)
+        append(1 ..< 2, to: source)
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [])
+        cache.extend(other: source)
+
+        // Both writes land inside the buffer the source allocated.
+        append(50 ..< 51, to: cache)
+        append(70 ..< 71, to: source)
+
+        #expect(try view(row(cache)).0.asArray(Float.self) == [0, 1, 50])
+        #expect(try view(row(source)).0.asArray(Float.self) == [0, 1, 70])
+    }
+
     @Test("ropeOffset is per row through the KVCache type")
     func ropeOffsetThroughKVCache() {
         let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
