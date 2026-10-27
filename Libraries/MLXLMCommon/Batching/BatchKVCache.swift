@@ -27,12 +27,17 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     /// The right padding of a ragged prefill, from `prepare` until `finalize`.
     private var rightPadding: MLXArray?
 
+    /// Whether any row may have left padding. Kept on the CPU, so `makeMask` reads
+    /// nothing back from the GPU.
+    private var hasLeftPadding: Bool
+
     public var step = 256
 
     /// - Parameter leftPadding: the left padding of each row
     public init(leftPadding: [Int]) {
         self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
         self.batchOffset = MLXArray(leftPadding.map { -Int32($0) })
+        self.hasLeftPadding = leftPadding.contains { $0 != 0 }
         super.init()
     }
 
@@ -99,6 +104,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             default:
                 fatalError("BatchKVCache state must have 2 or 4 arrays, got \(newValue.count)")
             }
+            hasLeftPadding = batchSize > 0 && leftPadding.max().item(Int32.self) > 0
         }
     }
 
@@ -118,11 +124,16 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         return trimmed
     }
 
-    /// An explicit mask even for one token, so the left padding stays masked.
+    /// While any row has left padding, an explicit mask even for one token, so the
+    /// padding stays masked. Otherwise the mask of a single-sequence cache, which keeps
+    /// the fused causal attention.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        .array(
+        guard hasLeftPadding else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        return .array(
             createCausalMask(
                 n: n, offset: offset, windowSize: windowSize, leftPadding: leftPadding))
     }
@@ -149,6 +160,8 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         }
         batchOffset = batchOffset - rightPadding
         leftPadding = leftPadding + rightPadding
+        // `prepare` only keeps right padding when some row is shorter.
+        hasLeftPadding = true
         self.rightPadding = nil
     }
 
@@ -161,6 +174,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             offset = 0
             leftPadding = MLXArray([Int32]())
             batchOffset = MLXArray([Int32]())
+            hasLeftPadding = false
             return
         }
         let indices = MLXArray(rows)
@@ -178,33 +192,36 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             offset -= shared
             leftPadding = leftPadding - Int32(shared)
         }
+        hasLeftPadding = leftPadding.max().item(Int32.self) > 0
     }
 
-    /// Appends the rows of `other`, a `BatchKVCache` with prefilled rows.
+    /// Appends the rows of `other`. The rows of both caches must be prefilled: rows
+    /// without keys cannot be lined up with rows that have them.
     public func extend(other: any BatchedCache) {
         guard let other = other as? BatchKVCache else {
             preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
         }
         precondition(
-            other.keys != nil || other.batchSize == 0,
+            (keys != nil || batchSize == 0) && (other.keys != nil || other.batchSize == 0),
             "BatchKVCache.extend requires prefilled rows")
         guard let ownKeys = keys, let ownValues = values, let otherKeys = other.keys,
             let otherValues = other.values
         else {
-            if keys == nil, other.keys == nil {
-                leftPadding = concatenated([leftPadding, other.leftPadding])
-                batchOffset = concatenated([batchOffset, other.batchOffset])
-            } else if let otherKeys = other.keys, let otherValues = other.values {
+            // A cache without keys has no rows here, so take the other's as they are.
+            if let otherKeys = other.keys, let otherValues = other.values {
                 // New array objects, so writes to either cache leave the other unchanged.
                 keys = otherKeys[.ellipsis]
                 values = otherValues[.ellipsis]
                 offset = other.offset
                 leftPadding = other.leftPadding
                 batchOffset = other.batchOffset
+                hasLeftPadding = other.hasLeftPadding
             }
             return
         }
 
+        // Right-justifying the shorter side pads its rows.
+        hasLeftPadding = hasLeftPadding || other.hasLeftPadding || offset != other.offset
         let end = max(offset, other.offset)
         let width = max(ownKeys.dim(2), otherKeys.dim(2))
         let own = rightJustify(ownKeys, ownValues, end: offset, to: end, width: width)
@@ -255,6 +272,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         copy.keys = keys?[.ellipsis]
         copy.values = values?[.ellipsis]
         copy.rightPadding = rightPadding?[0...]
+        copy.hasLeftPadding = hasLeftPadding
         copy.offset = offset
         copy.step = step
         return copy

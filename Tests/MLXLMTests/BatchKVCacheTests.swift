@@ -153,6 +153,55 @@ struct BatchKVCacheTests {
         #expect(sourceKeys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 70])
     }
 
+    @Test("Extending rejects rows that were never prefilled")
+    func extendRejectsUnprefilledRows() async throws {
+        let result = try await #require(
+            processExitsWith: .failure, observing: [\.standardErrorContent]
+        ) {
+            Device.withDefaultDevice(.cpu) {
+                let receiver = BatchKVCache(leftPadding: [0, 0])
+                let other = BatchKVCache(leftPadding: [0])
+                let kv = MLXArray.ones([1, 1, 1, 1])
+                _ = other.update(keys: kv, values: kv)
+                receiver.extend(other: other)
+            }
+        }
+        #expect(
+            String(decoding: result.standardErrorContent, as: UTF8.self).contains(
+                "BatchKVCache.extend requires prefilled rows"))
+    }
+
+    @Test("The mask is symbolic only while no row has left padding")
+    func symbolicMaskWithoutPadding() throws {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+        #expect(maskKind(cache, n: 1) == "none")
+        #expect(maskKind(cache, n: 2) == "causal")
+
+        // A shorter row joins with one position of left padding.
+        let added = BatchKVCache(leftPadding: [0])
+        let addedKV = makeKV(batchSize: 1, heads: 2, seqLen: 2, headDim: 4)
+        _ = added.update(keys: addedKV.0, values: addedKV.1)
+        cache.extend(other: added)
+        #expect(maskKind(cache, n: 1) == "array")
+        #expect(maskKind(try #require(cache.copy() as? BatchKVCache), n: 1) == "array")
+
+        // Without the padded row, the mask is symbolic again.
+        cache.filter(batchIndices: batchRows(0, 1))
+        #expect(maskKind(cache, n: 1) == "none")
+
+        // A ragged prefill leaves the shorter row padded, also after a state restore.
+        let ragged = BatchKVCache(leftPadding: [0, 0])
+        ragged.prepare(lengths: [2, 3])
+        _ = ragged.update(keys: kv.0, values: kv.1)
+        ragged.finalize()
+        #expect(maskKind(ragged, n: 1) == "array")
+        let restored = BatchKVCache(leftPadding: [])
+        restored.state = ragged.state
+        #expect(maskKind(restored, n: 1) == "array")
+    }
+
     @Test("The mask excludes each row's left padding, also for one token")
     func maskExcludesLeftPadding() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
@@ -237,5 +286,15 @@ struct BatchKVCacheTests {
             try savePromptCache(url: url, cache: [cache])
         }
         #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+}
+
+/// The kind of mask `cache` returns for `n` new tokens.
+private func maskKind(_ cache: BatchKVCache, n: Int) -> String {
+    switch cache.makeMask(n: n, windowSize: nil, returnArray: false) {
+    case .none: "none"
+    case .causal: "causal"
+    case .array: "array"
+    case .arrays: "arrays"
     }
 }
