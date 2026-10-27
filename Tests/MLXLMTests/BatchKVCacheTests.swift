@@ -121,6 +121,38 @@ struct BatchKVCacheTests {
         #expect(try #require(second.state.last)[0, 0, 0..., 0].asArray(Float.self) == [110, 111])
     }
 
+    @Test("maxTrimCount reports only what trim can remove")
+    func maxTrimCountMatchesTrim() {
+        let cache = BatchKVCache(leftPadding: [2, 0])
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+
+        #expect(cache.maxTrimCount == 1)
+        #expect(!canTrimPromptCache([cache], numTokens: 2))
+        #expect(canTrimPromptCache([cache], numTokens: 1))
+        #expect(cache.trim(1) == 1)
+    }
+
+    @Test("An empty cache extended from another does not share its arrays")
+    func extendEmptyCacheCopies() throws {
+        let source = BatchKVCache(leftPadding: [0])
+        let prompt = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = source.update(keys: prompt.0, values: prompt.1)
+        let cache = BatchKVCache(leftPadding: [])
+        cache.extend(other: source)
+
+        // Both writes land inside the buffer the source allocated.
+        let next = makePositionKV(positions: 50 ..< 51, heads: 2, headDim: 4)
+        _ = cache.update(keys: next.0, values: next.1)
+        let sourceNext = makePositionKV(positions: 70 ..< 71, heads: 2, headDim: 4)
+        _ = source.update(keys: sourceNext.0, values: sourceNext.1)
+
+        let keys = try #require(cache.extract(0).state.first)
+        #expect(keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 50])
+        let sourceKeys = try #require(source.extract(0).state.first)
+        #expect(sourceKeys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 70])
+    }
+
     @Test("The mask excludes each row's left padding, also for one token")
     func maskExcludesLeftPadding() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])

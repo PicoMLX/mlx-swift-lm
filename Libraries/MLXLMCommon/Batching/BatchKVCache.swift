@@ -104,11 +104,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 
     public override var isTrimmable: Bool { true }
 
+    /// No row can lose more tokens than the shortest row holds.
+    public override var maxTrimCount: Int {
+        let shortest = batchSize > 0 ? Int(batchOffset.min().item(Int32.self)) : 0
+        return min(offset, max(0, shortest))
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        // No row can lose more tokens than the shortest row holds.
-        let shortest = batchSize > 0 ? Int(batchOffset.min().item(Int32.self)) : 0
-        let trimmed = min(offset, max(0, shortest), n)
+        let trimmed = min(maxTrimCount, n)
         offset -= trimmed
         batchOffset = batchOffset - Int32(trimmed)
         return trimmed
@@ -190,9 +194,10 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             if keys == nil, other.keys == nil {
                 leftPadding = concatenated([leftPadding, other.leftPadding])
                 batchOffset = concatenated([batchOffset, other.batchOffset])
-            } else if other.keys != nil {
-                keys = other.keys
-                values = other.values
+            } else if let otherKeys = other.keys, let otherValues = other.values {
+                // New array objects, so writes to either cache leave the other unchanged.
+                keys = otherKeys[.ellipsis]
+                values = otherValues[.ellipsis]
                 offset = other.offset
                 leftPadding = other.leftPadding
                 batchOffset = other.batchOffset
