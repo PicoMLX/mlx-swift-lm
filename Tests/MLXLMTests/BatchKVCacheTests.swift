@@ -153,22 +153,78 @@ struct BatchKVCacheTests {
         #expect(sourceKeys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 70])
     }
 
-    @Test("Extending rejects rows that were never prefilled")
-    func extendRejectsUnprefilledRows() async throws {
-        let result = try await #require(
-            processExitsWith: .failure, observing: [\.standardErrorContent]
-        ) {
-            Device.withDefaultDevice(.cpu) {
-                let receiver = BatchKVCache(leftPadding: [0, 0])
-                let other = BatchKVCache(leftPadding: [0])
-                let kv = MLXArray.ones([1, 1, 1, 1])
-                _ = other.update(keys: kv, values: kv)
-                receiver.extend(other: other)
-            }
+    @Test("Rows without keys join as padding only, in either direction")
+    func extendKeepsRowsWithoutKeys() throws {
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+
+        // Rows that were never prefilled receive a prefilled one.
+        let receiver = BatchKVCache(leftPadding: [0, 0])
+        let prefilled = BatchKVCache(leftPadding: [0])
+        _ = prefilled.update(keys: kv.0, values: kv.1)
+        receiver.extend(other: prefilled)
+        #expect(receiver.batchSize == 3)
+        #expect(receiver.leftPadding.asArray(Int32.self) == [2, 2, 0])
+        #expect(receiver.batchOffset.asArray(Int32.self) == [0, 0, 2])
+        #expect(receiver.extract(0).offset == 0)
+        let joined = try #require(receiver.extract(2).state.first)
+        #expect(joined[0, 0, 0..., 0].asArray(Float.self) == [0, 1])
+
+        // A prefilled batch receives a row that was never prefilled.
+        let batch = BatchKVCache(leftPadding: [0])
+        _ = batch.update(keys: kv.0, values: kv.1)
+        batch.extend(other: BatchKVCache(leftPadding: [0]))
+        #expect(batch.batchSize == 2)
+        #expect(batch.leftPadding.asArray(Int32.self) == [0, 2])
+        #expect(batch.batchOffset.asArray(Int32.self) == [2, 0])
+        let kept = try #require(batch.extract(0).state.first)
+        #expect(kept[0, 0, 0..., 0].asArray(Float.self) == [0, 1])
+        #expect(maskKind(batch, n: 1) == "array")
+    }
+
+    @Test("Extending with an empty cache changes nothing")
+    func extendWithEmptyCache() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+        cache.extend(other: BatchKVCache(leftPadding: []))
+        #expect(cache.batchSize == 1)
+        #expect(cache.offset == 2)
+        #expect(maskKind(cache, n: 1) == "none")
+        let keys = try #require(cache.extract(0).state.first)
+        #expect(keys[0, 0, 0..., 0].asArray(Float.self) == [0, 1])
+
+        let unprefilled = BatchKVCache(leftPadding: [1, 0])
+        unprefilled.extend(other: BatchKVCache(leftPadding: []))
+        #expect(unprefilled.leftPadding.asArray(Int32.self) == [1, 0])
+    }
+
+    @Test("A request admitted to an empty batch keeps the symbolic mask")
+    func firstAdmissionKeepsSymbolicMask() {
+        let request = BatchKVCache(leftPadding: [0])
+        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 3, headDim: 4)
+        _ = request.update(keys: kv.0, values: kv.1)
+        let batch = BatchKVCache(leftPadding: [])
+        batch.extend(other: request)
+        #expect(maskKind(batch, n: 1) == "none")
+        #expect(maskKind(batch, n: 2) == "causal")
+    }
+
+    @Test("Without padding, a window or a requested array still gets the explicit mask")
+    func explicitMaskForWindowOrRequestedArray() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let kv = makeKV(batchSize: 1, heads: 2, seqLen: 8, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+        #expect(maskKind(cache, n: 1, returnArray: true) == "array")
+
+        guard case .array(let mask) = cache.makeMask(n: 2, windowSize: 4, returnArray: false)
+        else {
+            Issue.record("A window needs an explicit mask")
+            return
         }
-        #expect(
-            String(decoding: result.standardErrorContent, as: UTF8.self).contains(
-                "BatchKVCache.extend requires prefilled rows"))
+        // The token at position 8 sees positions 5 through 8 only.
+        #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+        #expect(mask[0, 0, 0, 4].item(Bool.self) == false)
+        #expect(mask[0, 0, 0, 5].item(Bool.self) == true)
     }
 
     @Test("The mask is symbolic only while no row has left padding")
@@ -290,8 +346,8 @@ struct BatchKVCacheTests {
 }
 
 /// The kind of mask `cache` returns for `n` new tokens.
-private func maskKind(_ cache: BatchKVCache, n: Int) -> String {
-    switch cache.makeMask(n: n, windowSize: nil, returnArray: false) {
+private func maskKind(_ cache: BatchKVCache, n: Int, returnArray: Bool = false) -> String {
+    switch cache.makeMask(n: n, windowSize: nil, returnArray: returnArray) {
     case .none: "none"
     case .causal: "causal"
     case .array: "array"

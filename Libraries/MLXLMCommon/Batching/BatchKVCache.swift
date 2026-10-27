@@ -124,14 +124,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         return trimmed
     }
 
-    /// While any row has left padding, an explicit mask even for one token, so the
-    /// padding stays masked. Otherwise the mask of a single-sequence cache, which keeps
-    /// the fused causal attention.
+    /// The symbolic mask while no row has left padding and the caller needs neither a
+    /// window nor an array, which keeps the fused causal attention. Otherwise an explicit
+    /// mask, even for one token, so the padding stays masked.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        guard hasLeftPadding else {
-            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        if !hasLeftPadding && windowSize == nil && !returnArray {
+            return n == 1 ? .none : .causal
         }
         return .array(
             createCausalMask(
@@ -195,37 +195,48 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         hasLeftPadding = leftPadding.max().item(Int32.self) > 0
     }
 
-    /// Appends the rows of `other`. The rows of both caches must be prefilled: rows
-    /// without keys cannot be lined up with rows that have them.
+    /// Appends the rows of `other`. As in mlx-lm, rows without keys, on either side,
+    /// join as rows of padding only.
     public func extend(other: any BatchedCache) {
         guard let other = other as? BatchKVCache else {
             preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
         }
-        precondition(
-            (keys != nil || batchSize == 0) && (other.keys != nil || other.batchSize == 0),
-            "BatchKVCache.extend requires prefilled rows")
-        guard let ownKeys = keys, let ownValues = values, let otherKeys = other.keys,
-            let otherValues = other.values
+        guard other.batchSize > 0 else { return }
+        guard batchSize > 0 else {
+            // Take the rows as they are, without the copy a concatenation makes. New
+            // array objects, so writes to either cache leave the other unchanged.
+            keys = other.keys?[.ellipsis]
+            values = other.values?[.ellipsis]
+            offset = other.offset
+            leftPadding = other.leftPadding
+            batchOffset = other.batchOffset
+            hasLeftPadding = other.hasLeftPadding
+            return
+        }
+        guard let shapeKeys = keys ?? other.keys, let shapeValues = values ?? other.values
         else {
-            // A cache without keys has no rows here, so take the other's as they are.
-            if let otherKeys = other.keys, let otherValues = other.values {
-                // New array objects, so writes to either cache leave the other unchanged.
-                keys = otherKeys[.ellipsis]
-                values = otherValues[.ellipsis]
-                offset = other.offset
-                leftPadding = other.leftPadding
-                batchOffset = other.batchOffset
-                hasLeftPadding = other.hasLeftPadding
-            }
+            // Neither cache holds keys yet.
+            leftPadding = concatenated([leftPadding, other.leftPadding])
+            batchOffset = concatenated([batchOffset, other.batchOffset])
+            hasLeftPadding = hasLeftPadding || other.hasLeftPadding
             return
         }
 
-        // Right-justifying the shorter side pads its rows.
-        hasLeftPadding = hasLeftPadding || other.hasLeftPadding || offset != other.offset
         let end = max(offset, other.offset)
-        let width = max(ownKeys.dim(2), otherKeys.dim(2))
-        let own = rightJustify(ownKeys, ownValues, end: offset, to: end, width: width)
-        let added = rightJustify(otherKeys, otherValues, end: other.offset, to: end, width: width)
+        let width = max(keys?.dim(2) ?? 0, other.keys?.dim(2) ?? 0)
+        func justified(_ cache: BatchKVCache) -> (keys: MLXArray, values: MLXArray) {
+            // A cache without keys holds rows of padding only.
+            func empty(_ like: MLXArray) -> MLXArray {
+                MLXArray.zeros([cache.batchSize, like.dim(1), 0, like.dim(3)], dtype: like.dtype)
+            }
+            return rightJustify(
+                cache.keys ?? empty(shapeKeys), cache.values ?? empty(shapeValues),
+                end: cache.offset, to: end, width: width)
+        }
+        let own = justified(self)
+        let added = justified(other)
+        // Right-justifying the side that ends earlier pads its rows.
+        hasLeftPadding = hasLeftPadding || other.hasLeftPadding || offset != other.offset
         keys = concatenated([own.keys, added.keys])
         values = concatenated([own.values, added.values])
         leftPadding = concatenated([
