@@ -61,7 +61,7 @@ final class GenerationExecutionTests: XCTestCase {
                     maxTokens: cancelled ? 0 : 1,
                     onSynchronize: { synchronized.fulfill() }))
             if cancelled { task.cancel() }
-            await task.value
+            _ = await task.value
             await fulfillment(of: [synchronized], timeout: 0)
             withExtendedLifetime(stream) {}
         }
