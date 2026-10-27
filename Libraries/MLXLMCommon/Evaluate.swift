@@ -532,24 +532,27 @@ struct TokenRing {
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
+    ///
+    /// Image sentinels (such as FastVLM's -200) are not vocabulary IDs, so they are
+    /// skipped. The prompt is read back to front, only as far as it takes to find
+    /// `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        // Image sentinels (such as FastVLM's -200) are not vocabulary IDs.
-        let promptTokens = MLXArray(prompt.asArray(Int32.self).filter { $0 >= 0 })
-        let n = promptTokens.count
-        if n <= capacity {
-            if n < capacity {
-                let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens, padding])
-            } else {
-                buffer = promptTokens
-            }
-            count = n
-            writeIndex = n % capacity
-        } else {
-            buffer = promptTokens[(-capacity)...]
-            count = capacity
-            writeIndex = 0
+        let prompt = prompt.flattened()
+        var tokens = [Int32]()
+        var end = prompt.size
+        var length = capacity
+        while tokens.count < capacity, end > 0 {
+            let start = max(0, end - length)
+            // Converting on the CPU skips a GPU round trip for a handful of tokens.
+            let chunk = prompt[start ..< end].asType(.int32, stream: .cpu)
+            tokens = chunk.asArray(Int32.self).filter { $0 >= 0 } + tokens
+            end = start
+            length *= 2
         }
+        let kept = tokens.suffix(capacity)
+        buffer = MLXArray(Array(kept) + [Int32](repeating: 0, count: capacity - kept.count))
+        count = kept.count
+        writeIndex = count % capacity
     }
 
     /// Append a single token using GPU-only mask write (no CPU←GPU sync).

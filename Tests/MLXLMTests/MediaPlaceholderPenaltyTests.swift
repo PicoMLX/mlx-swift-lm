@@ -4,7 +4,8 @@ import Testing
 
 struct MediaPlaceholderPenaltyTests {
     @Test(
-        "Image placeholders do not penalize vocabulary entries", arguments: [0, 1, 2], [0, 1, 2])
+        "Image placeholders do not penalize vocabulary entries", arguments: [0, 1, 2],
+        [0, 1, 2, 3])
     func placeholderPenalty(kind: Int, promptCase: Int) {
         Device.withDefaultDevice(.cpu) {
             var actual: any LogitProcessor
@@ -29,6 +30,10 @@ struct MediaPlaceholderPenaltyTests {
             case 1:
                 prompt = [-200, -200]
                 text = []
+            case 2:
+                // The prompt ends in five context windows' worth of placeholders.
+                prompt = [5, 6, 7] + Array(repeating: -200, count: 40)
+                text = [5, 6, 7]
             default:
                 prompt = [0, 1, 2, 3, -200, 4, 5, 6, 7, -200, 8, 9]
                 text = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
