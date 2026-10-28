@@ -99,4 +99,41 @@ final class DeepseekV3Tests: XCTestCase {
         XCTAssertNotNil(sanitized["model.layers.77.self_attn.q_proj.weight"])
         XCTAssertNil(sanitized["model.layers.78.self_attn.q_proj.weight"])
     }
+
+    /// The official checkpoints store E4M3 FP8 weights with 128 x 128 block scales.
+    func testSanitizeDecodesFP8WeightsBeforeScaling() throws {
+        let model = DeepseekV3Model(try makeConfig())
+        // 130 rows span two row blocks, scaled by 2 and by 4.
+        let values = MLXArray((0 ..< 130).flatMap { _ in [Float(1.5), -0.25] }).reshaped([130, 2])
+        let key = "model.layers.0.self_attn.q_a_proj.weight"
+        let sanitized = model.sanitize(weights: [
+            key: toFP8(values),
+            key + "_scale_inv": MLXArray([Float(2), 4]).reshaped([2, 1]),
+        ])
+
+        let decoded = try XCTUnwrap(sanitized[key])
+        let expected = (0 ..< 130).flatMap { row -> [Float] in row < 128 ? [3, -0.5] : [6, -1] }
+        XCTAssertEqual(decoded.asType(.float32).asArray(Float.self), expected)
+        XCTAssertEqual(decoded.dtype, .bfloat16)
+        XCTAssertNil(sanitized[key + "_scale_inv"])
+    }
+
+    /// Experts are stacked from their decoded weights, and their per-expert keys removed.
+    func testSanitizeStacksDecodedFP8Experts() throws {
+        let model = DeepseekV3Model(try makeConfig())
+        let values = MLXArray([Float(1.5), -0.25, 0.5, 2]).reshaped([2, 2])
+        var weights: [String: MLXArray] = [:]
+        for expert in 0 ..< 4 {
+            let key = "model.layers.1.mlp.experts.\(expert).gate_proj.weight"
+            weights[key] = toFP8(values)
+            weights[key + "_scale_inv"] = MLXArray([Float(expert + 1)]).reshaped([1, 1])
+        }
+        let sanitized = model.sanitize(weights: weights)
+
+        let stacked = try XCTUnwrap(sanitized["model.layers.1.mlp.switch_mlp.gate_proj.weight"])
+        let expected = (1 ... 4).flatMap { scale in [1.5, -0.25, 0.5, 2].map { $0 * Float(scale) } }
+        XCTAssertEqual(stacked.asType(.float32).asArray(Float.self), expected)
+        XCTAssertEqual(stacked.dtype, .bfloat16)
+        XCTAssertEqual(sanitized.keys.filter { $0.contains(".experts.") }, [])
+    }
 }

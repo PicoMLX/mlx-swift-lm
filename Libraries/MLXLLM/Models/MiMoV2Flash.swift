@@ -413,7 +413,10 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
+        func dequant(weight raw: MLXArray, scaleInv: MLXArray) -> MLXArray {
+            // FP8 checkpoints store E4M3 bytes as uint8. Decode them before scaling, as
+            // mlx-lm does.
+            let weight = raw.dtype == .uint8 ? fromFP8(raw, dtype: .bfloat16) : raw
             let dtype = weight.dtype
             let bs = 128
             let (m, n) = (weight.dim(0), weight.dim(1))

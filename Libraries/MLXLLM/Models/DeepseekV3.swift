@@ -437,9 +437,13 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var newWeights = weights
+        var newWeights: [String: MLXArray] = [:]
 
-        func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
+        func dequant(weight raw: MLXArray, scaleInv: MLXArray) -> MLXArray {
+            // FP8 checkpoints store E4M3 bytes as uint8. Decode them before scaling, as
+            // mlx-lm does.
+            let weight = raw.dtype == .uint8 ? fromFP8(raw, dtype: .bfloat16) : raw
+            let dtype = weight.dtype
             let bs = 128
             let (m, n) = (weight.dim(0), weight.dim(1))
             let padBottom = (bs - m % bs) % bs
@@ -449,6 +453,7 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             padded = padded.reshaped([(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
             let scaled = padded * scaleInv[0..., .newAxis, 0..., .newAxis]
             return scaled.reshaped([m + padBottom, n + padSide])[0 ..< m, 0 ..< n]
+                .asType(dtype)
         }
 
         for (key, value) in weights {
@@ -468,9 +473,11 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
                 for key in ["weight", "scales", "biases"] {
                     let firstKey = "\(prefix).mlp.experts.0.\(projName).\(key)"
-                    if weights[firstKey] != nil {
+                    if newWeights[firstKey] != nil {
+                        // The decoded experts, without their per-expert keys.
                         let joined = (0 ..< (args.nRoutedExperts ?? 1)).map {
-                            weights["\(prefix).mlp.experts.\($0).\(projName).\(key)"]!
+                            newWeights.removeValue(
+                                forKey: "\(prefix).mlp.experts.\($0).\(projName).\(key)")!
                         }
                         newWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] = stacked(joined)
                     }
