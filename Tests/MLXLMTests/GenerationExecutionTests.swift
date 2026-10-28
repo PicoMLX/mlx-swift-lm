@@ -43,7 +43,6 @@ final class GenerationExecutionTests: XCTestCase {
 
         func synchronizeGeneration() {
             onSynchronize()
-            GenerationStreamTracker().synchronize()
         }
 
         mutating func finalizeGeneration() {

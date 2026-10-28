@@ -764,11 +764,10 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func recordEmittedToken(_ token: Int)
     mutating func discardGeneratedToken()
 
-    /// Waits for the work this iterator submitted. The generation loop calls this
-    /// before it completes.
+    /// Waits for the work this iterator submitted with `asyncEval`, on whichever
+    /// streams it runs. The generation loop calls this before it completes.
     ///
-    /// The default waits for the current default stream and the GPU and CPU
-    /// streams. An iterator that submits work on other streams waits for them too.
+    /// The default does nothing, for iterators that evaluate synchronously.
     func synchronizeGeneration()
 }
 
@@ -786,10 +785,28 @@ extension TokenIteratorProtocol {
     public var reasoningTokenCount: Int? { nil }
     public mutating func recordEmittedToken(_ token: Int) {}
     public mutating func discardGeneratedToken() {}
+    public func synchronizeGeneration() {}
+}
 
-    public func synchronizeGeneration() {
-        GenerationStreamTracker().synchronize()
-    }
+/// Submits `arrays` with `asyncEval`, then a completion marker that finishes only after
+/// them and after `previous`. Waiting on the marker waits for everything submitted so
+/// far, on whichever streams it runs, and for nothing queued later.
+///
+/// MLX releases an array's inputs once it schedules the array, so holding the marker
+/// keeps none of `arrays` alive and doesn't stop the cache reusing their buffers.
+func asyncEvalWithCompletionMarker(_ arrays: [MLXArray], after previous: MLXArray?)
+    -> MLXArray
+{
+    asyncEval(arrays)
+    // The marker goes in its own evaluation: within one, MLX orders streams by fences
+    // on the computation, and an array on another stream could finish after the marker.
+    // Across evaluations, the marker waits for each array's completion event.
+    // A fresh operation places the marker on the current default stream. A marker
+    // made from a constant would go to MLX's process-wide default stream instead.
+    let anchor = MLXArray.zeros([1], dtype: .int32)
+    let marker = depends(input: anchor, dependencies: arrays + (previous.map { [$0] } ?? []))
+    asyncEval(marker)
+    return marker
 }
 
 /// Normalized logits shared by reporting and filtered sampling.
@@ -902,12 +919,13 @@ public struct DeferredTokenLogProbabilities {
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
 public struct TokenIterator: TokenIteratorProtocol {
-    /// The streams prefill and decode ran on, which can differ from the loop's.
-    private let generationStreams = GenerationStreamTracker()
+    /// Finishes after everything this iterator submitted with `asyncEval`.
+    private var completionMarker: MLXArray?
 
     public func synchronizeGeneration() {
-        generationStreams.capture()
-        generationStreams.synchronize()
+        if let completionMarker {
+            eval(completionMarker)
+        }
     }
 
     let model: any LanguageModel
@@ -1141,12 +1159,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         return y
     }
 
-    private func evaluateTokenAndLogProbabilities(_ token: MLXArray) {
-        if let deferredLogProbabilities {
-            asyncEval([token] + deferredLogProbabilities.arrays)
-        } else {
-            asyncEval(token)
-        }
+    private mutating func evaluateTokenAndLogProbabilities(_ token: MLXArray) {
+        submit([token] + (deferredLogProbabilities?.arrays ?? []))
+    }
+
+    private mutating func submit(_ arrays: [MLXArray]) {
+        completionMarker = asyncEvalWithCompletionMarker(arrays, after: completionMarker)
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
@@ -1165,7 +1183,6 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
-        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1187,11 +1204,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             // unevaluated chain of those updates keeps every prior step's
             // intermediates alive. Python mlx-lm settles cache state the same
             // way in its generation loop.
-            if let deferredLogProbabilities {
-                asyncEval([token] + cache.flatMap { $0.state } + deferredLogProbabilities.arrays)
-            } else {
-                asyncEval([token] + cache.flatMap { $0.state })
-            }
+            submit(
+                [token] + cache.flatMap { $0.state }
+                    + (deferredLogProbabilities?.arrays ?? []))
 
             // Periodically return freed buffers that cannot be reused (odd or
             // monotonically growing sizes accumulate in the pool otherwise).
@@ -1244,12 +1259,14 @@ extension TokenIterator: GenerationFinalizingTokenIterator {
 ///
 /// Port of `speculative_generate_step()` from https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
 public struct SpeculativeTokenIterator: TokenIteratorProtocol {
-    /// The streams prefill and decode ran on, which can differ from the loop's.
-    private let generationStreams = GenerationStreamTracker()
+    /// Finishes after the draft token prefill submitted with `asyncEval`. A round
+    /// evaluates its own drafts before it returns.
+    private var completionMarker: MLXArray?
 
     public func synchronizeGeneration() {
-        generationStreams.capture()
-        generationStreams.synchronize()
+        if let completionMarker {
+            eval(completionMarker)
+        }
     }
 
     var y: LMInput.Text
@@ -1476,7 +1493,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
             draftY = .init(tokens: token)
-            asyncEval(draftY.tokens)
+            completionMarker = asyncEvalWithCompletionMarker(
+                [draftY.tokens], after: completionMarker)
         }
 
         try kvCachePlan.applyAndValidate(to: mainCacheStorage)
@@ -1655,7 +1673,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     }
 
     mutating public func next() -> Int? {
-        generationStreams.capture()
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
@@ -1906,9 +1923,11 @@ private func runSynchronousGenerationLoop(
 
     // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
     // exits the program right away, those tasks will still be executing and will
-    // hit assertions as the mlx scheduler is torn down. Synchronize with the streams
-    // the iterator used to make sure it is complete.
+    // hit assertions as the mlx scheduler is torn down. Wait for the work the
+    // iterator submitted, which can run on other streams, and synchronize with the
+    // stream to make sure it is complete.
     iterator.synchronizeGeneration()
+    Stream.defaultStream.synchronize()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -2788,8 +2807,9 @@ private func generateLoopTask<
             // `while let token = iterator.next()` form) allowed one extra asyncEval to be
             // submitted post-cancellation, which faults if the app has backgrounded
             // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
-            // post-loop block below assigns `.cancelled`; iterator.synchronizeGeneration() still
-            // settles any in-flight evaluation at the end of the task body.
+            // post-loop block below assigns `.cancelled`; iterator.synchronizeGeneration() and
+            // Stream.defaultStream.synchronize() still settle any in-flight evaluation at the
+            // end of the task body.
             tokenLoop: while !Task.isCancelled {
                 guard let token = autoreleasepool(invoking: { iterator.next() }) else { break }
                 tokenCollector.record(token)
@@ -2910,8 +2930,10 @@ private func generateLoopTask<
             )
             _ = continuation.yield(handler.infoEvent(info))
 
-            // Synchronize with the iterator's streams to ensure tasks are completed
+            // Wait for the iterator's submitted work, then synchronize with the stream
+            // to ensure tasks are completed
             iterator.synchronizeGeneration()
+            Stream.defaultStream.synchronize()
 
             // Finalize the stream
             continuation.finish()
