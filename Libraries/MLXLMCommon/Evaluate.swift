@@ -792,8 +792,11 @@ extension TokenIteratorProtocol {
 /// them and after `previous`. Waiting on the marker waits for everything submitted so
 /// far, on whichever streams it runs, and for nothing queued later.
 ///
-/// MLX releases an array's inputs once it schedules the array, so holding the marker
-/// keeps none of `arrays` alive and doesn't stop the cache reusing their buffers.
+/// Holding the marker keeps no graph alive: MLX releases an array's inputs once it
+/// schedules the array. Until the marker finishes, though, its command buffer holds
+/// the buffers of `arrays`, so the cache can't reuse them in place. In single-stream
+/// decode the marker finishes right after its step, which holds those buffers until
+/// then anyway; a slow array on another stream holds them until it finishes.
 func asyncEvalWithCompletionMarker(_ arrays: [MLXArray], after previous: MLXArray?)
     -> MLXArray
 {
