@@ -184,10 +184,12 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         leftPadding = leftPadding[indices]
         rightPadding = rightPadding?[indices]
 
-        // Drop the left padding that every remaining row has. Rows without keys keep
-        // theirs, which waits for their prefill. Both bounds come from one readback.
+        // Drop the left padding that every remaining row has, up to the positions stored
+        // so far: in a chunked prefill the rest of it is still to come, and the rows keep
+        // it, with their negative positions. Rows without keys keep all of theirs. Both
+        // bounds come from one readback.
         let bounds = MLX.stacked([leftPadding.min(), leftPadding.max()]).asArray(Int32.self)
-        let shared = keys != nil ? Int(bounds[0]) : 0
+        let shared = keys != nil ? min(Int(bounds[0]), offset) : 0
         if shared > 0 {
             keys = keys?[.ellipsis, shared..., 0...]
             values = values?[.ellipsis, shared..., 0...]
@@ -199,6 +201,9 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 
     /// Appends the rows of `other`. Rows without keys, on either side, join as rows of
     /// padding only, as in mlx-lm. Next to stored rows they start empty, at position 0.
+    ///
+    /// Rows with keys must have completed their prefill, including `finalize()` after a
+    /// ragged one. Padding still to come would mask a row's next token from itself.
     public func extend(other: any BatchedCache) {
         guard let other = other as? BatchKVCache else {
             preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
@@ -257,11 +262,13 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         offset = end
     }
 
-    /// The row at `index` without its left padding, as a ``KVCacheSimple``.
+    /// The row at `index` without its left padding, as a ``KVCacheSimple``. A row that
+    /// holds only padding so far, such as one in the middle of a chunked prefill, comes
+    /// back empty.
     public func extract(_ index: Int) -> any KVCache {
         let cache = KVCacheSimple()
         let padding = Int(leftPadding[index].item(Int32.self))
-        if let keys, let values {
+        if let keys, let values, padding < offset {
             cache.keys = MLX.contiguous(keys[index ..< index + 1, 0..., padding ..< offset, 0...])
             cache.values = MLX.contiguous(
                 values[index ..< index + 1, 0..., padding ..< offset, 0...])

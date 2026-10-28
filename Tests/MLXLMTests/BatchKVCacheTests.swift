@@ -259,6 +259,46 @@ struct BatchKVCacheTests {
         #expect(maxAbsDifference(batched[1 ..< 2], expected) < 1e-5)
     }
 
+    @Test("Padding still to come in a chunked prefill survives extract and filter")
+    func pendingPaddingSurvivesExtractAndFilter() throws {
+        // Row 0 is one token after three positions of padding. The first chunk covers
+        // one position, so two positions of its padding are still to come.
+        let cache = BatchKVCache(leftPadding: [3, 0])
+        let first = makePositionKV(
+            positions: 0 ..< 1, heads: 2, headDim: 4, batchSize: 2, rowStride: 10)
+        _ = cache.update(keys: first.0, values: first.1)
+        #expect(cache.extract(0).offset == 0)
+
+        cache.filter(batchIndices: batchRows(0))
+        #expect(cache.offset == 0)
+        #expect(cache.leftPadding.asArray(Int32.self) == [2])
+        #expect(cache.batchOffset.asArray(Int32.self) == [-2])
+
+        // The next chunk: the two remaining positions of padding, then the token.
+        let rest = makePositionKV(positions: 1 ..< 4, heads: 2, headDim: 4)
+        let queries = MLXArray.ones([1, 2, 3, 4])
+        let mask = cache.makeMask(n: 3, windowSize: nil, returnArray: false)
+        let (keys, values) = cache.update(keys: rest.0, values: rest.1)
+        let batched = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: 0.5, mask: mask)
+
+        let single = KVCacheSimple()
+        let singleMask = single.makeMask(n: 1, windowSize: nil, returnArray: false)
+        let (tokenKeys, tokenValues) = single.update(
+            keys: rest.0[.ellipsis, 2 ..< 3, 0...], values: rest.1[.ellipsis, 2 ..< 3, 0...])
+        let expected = MLXFast.scaledDotProductAttention(
+            queries: queries[.ellipsis, 2 ..< 3, 0...], keys: tokenKeys, values: tokenValues,
+            scale: 0.5, mask: singleMask)
+        // Only the token's output means anything; the padding positions' do not.
+        #expect(maxAbsDifference(batched[.ellipsis, 2 ..< 3, 0...], expected) < 1e-5)
+
+        let row = cache.extract(0)
+        #expect(row.offset == 1)
+        let rowKeys = try #require(row.state.first)
+        #expect(rowKeys[0, 0, 0..., 0].asArray(Float.self) == [3])
+        #expect(cache.batchOffset.asArray(Int32.self) == [1])
+    }
+
     @Test("filter clears the padding flag only when it removes the padding")
     func filterRecomputesPaddingFlag() {
         // Stored rows with two positions of shared padding: filter removes them.
