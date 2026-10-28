@@ -198,6 +198,84 @@ struct BatchKVCacheTests {
         #expect(unprefilled.leftPadding.asArray(Int32.self) == [1, 0])
     }
 
+    @Test("A padded row without keys starts empty when it joins stored rows")
+    func paddedRowWithoutKeysStartsEmpty() throws {
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+
+        // The row without keys receives a prefilled one.
+        let receiver = BatchKVCache(leftPadding: [1])
+        let prefilled = BatchKVCache(leftPadding: [0])
+        _ = prefilled.update(keys: kv.0, values: kv.1)
+        receiver.extend(other: prefilled)
+        #expect(receiver.leftPadding.asArray(Int32.self) == [2, 0])
+        #expect(receiver.batchOffset.asArray(Int32.self) == [0, 2])
+        #expect(receiver.extract(0).offset == 0)
+
+        // A prefilled batch receives the row without keys.
+        let batch = BatchKVCache(leftPadding: [0])
+        _ = batch.update(keys: kv.0, values: kv.1)
+        batch.extend(other: BatchKVCache(leftPadding: [1]))
+        #expect(batch.leftPadding.asArray(Int32.self) == [0, 2])
+        #expect(batch.batchOffset.asArray(Int32.self) == [2, 0])
+
+        // Filtering down to that row leaves an empty sequence that takes new tokens.
+        batch.filter(batchIndices: batchRows(1))
+        #expect(batch.offset == 0)
+        #expect(batch.leftPadding.asArray(Int32.self) == [0])
+        let next = makePositionKV(positions: 7 ..< 8, heads: 2, headDim: 4)
+        _ = batch.update(keys: next.0, values: next.1)
+        let keys = try #require(batch.extract(0).state.first)
+        #expect(keys[0, 0, 0..., 0].asArray(Float.self) == [7])
+
+        // Without stored rows, the padding still waits for the prefill.
+        let pending = BatchKVCache(leftPadding: [1])
+        pending.extend(other: BatchKVCache(leftPadding: [2]))
+        #expect(pending.leftPadding.asArray(Int32.self) == [1, 2])
+        #expect(pending.batchOffset.asArray(Int32.self) == [-1, -2])
+    }
+
+    @Test("The first token of a joined row without keys attends like a single sequence")
+    func joinedRowFirstTokenMatchesSingleSequence() {
+        let batch = BatchKVCache(leftPadding: [0])
+        let history = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
+        _ = batch.update(keys: history.0, values: history.1)
+        batch.extend(other: BatchKVCache(leftPadding: [1]))
+
+        // One decode step as a model runs it: mask, cache update, attention.
+        let step = makePositionKV(
+            positions: 3 ..< 4, heads: 2, headDim: 4, batchSize: 2, rowStride: 10)
+        let queries = MLXArray.ones([2, 2, 1, 4])
+        let mask = batch.makeMask(n: 1, windowSize: nil, returnArray: false)
+        let (keys, values) = batch.update(keys: step.0, values: step.1)
+        let batched = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: 0.5, mask: mask)
+
+        let single = KVCacheSimple()
+        let singleMask = single.makeMask(n: 1, windowSize: nil, returnArray: false)
+        let (rowKeys, rowValues) = single.update(keys: step.0[1 ..< 2], values: step.1[1 ..< 2])
+        let expected = MLXFast.scaledDotProductAttention(
+            queries: queries[1 ..< 2], keys: rowKeys, values: rowValues, scale: 0.5,
+            mask: singleMask)
+        #expect(maxAbsDifference(batched[1 ..< 2], expected) < 1e-5)
+    }
+
+    @Test("filter clears the padding flag only when it removes the padding")
+    func filterRecomputesPaddingFlag() {
+        // Stored rows with two positions of shared padding: filter removes them.
+        let stored = BatchKVCache(leftPadding: [2, 2, 0])
+        let kv = makeKV(batchSize: 3, heads: 2, seqLen: 3, headDim: 4)
+        _ = stored.update(keys: kv.0, values: kv.1)
+        stored.filter(batchIndices: batchRows(0, 1))
+        #expect(stored.leftPadding.asArray(Int32.self) == [0, 0])
+        #expect(maskKind(stored, n: 1) == "none")
+
+        // Rows without keys keep the padding that waits for their prefill.
+        let pending = BatchKVCache(leftPadding: [2, 2, 0])
+        pending.filter(batchIndices: batchRows(0, 1))
+        #expect(pending.leftPadding.asArray(Int32.self) == [2, 2])
+        #expect(maskKind(pending, n: 1) == "array")
+    }
+
     @Test("A request admitted to an empty batch keeps the symbolic mask")
     func firstAdmissionKeepsSymbolicMask() {
         let request = BatchKVCache(leftPadding: [0])

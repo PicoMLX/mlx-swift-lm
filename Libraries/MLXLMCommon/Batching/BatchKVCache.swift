@@ -184,19 +184,21 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         leftPadding = leftPadding[indices]
         rightPadding = rightPadding?[indices]
 
-        // Drop the left padding that every remaining row has.
-        let shared = Int(leftPadding.min().item(Int32.self))
-        if shared > 0, keys != nil {
+        // Drop the left padding that every remaining row has. Rows without keys keep
+        // theirs, which waits for their prefill. Both bounds come from one readback.
+        let bounds = MLX.stacked([leftPadding.min(), leftPadding.max()]).asArray(Int32.self)
+        let shared = keys != nil ? Int(bounds[0]) : 0
+        if shared > 0 {
             keys = keys?[.ellipsis, shared..., 0...]
             values = values?[.ellipsis, shared..., 0...]
             offset -= shared
             leftPadding = leftPadding - Int32(shared)
         }
-        hasLeftPadding = leftPadding.max().item(Int32.self) > 0
+        hasLeftPadding = Int(bounds[1]) > shared
     }
 
-    /// Appends the rows of `other`. As in mlx-lm, rows without keys, on either side,
-    /// join as rows of padding only.
+    /// Appends the rows of `other`. Rows without keys, on either side, join as rows of
+    /// padding only, as in mlx-lm. Next to stored rows they start empty, at position 0.
     public func extend(other: any BatchedCache) {
         guard let other = other as? BatchKVCache else {
             preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
@@ -233,16 +235,25 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
                 cache.keys ?? empty(shapeKeys), cache.values ?? empty(shapeValues),
                 end: cache.offset, to: end, width: width)
         }
+        func rows(_ cache: BatchKVCache) -> (leftPadding: MLXArray, batchOffset: MLXArray) {
+            guard cache.keys != nil else {
+                // Empty sequences whose first token comes next. Padding they kept for a
+                // prefill cannot sit behind stored rows.
+                let zeros = MLXArray.zeros([cache.batchSize], dtype: .int32)
+                return (zeros + Int32(end), zeros)
+            }
+            return (cache.leftPadding + Int32(end - cache.offset), cache.batchOffset)
+        }
         let own = justified(self)
         let added = justified(other)
+        let ownRows = rows(self)
+        let addedRows = rows(other)
         // Right-justifying the side that ends earlier pads its rows.
         hasLeftPadding = hasLeftPadding || other.hasLeftPadding || offset != other.offset
         keys = concatenated([own.keys, added.keys])
         values = concatenated([own.values, added.values])
-        leftPadding = concatenated([
-            leftPadding + Int32(end - offset), other.leftPadding + Int32(end - other.offset),
-        ])
-        batchOffset = concatenated([batchOffset, other.batchOffset])
+        leftPadding = concatenated([ownRows.leftPadding, addedRows.leftPadding])
+        batchOffset = concatenated([ownRows.batchOffset, addedRows.batchOffset])
         offset = end
     }
 
