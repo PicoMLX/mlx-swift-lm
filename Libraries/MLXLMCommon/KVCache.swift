@@ -321,7 +321,8 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    leftPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -336,6 +337,11 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Row `b` attends only positions at or after `leftPadding[b]`.
+    if let leftPadding {
+        mask = mask & (rinds .>= leftPadding[0..., .newAxis, .newAxis, .newAxis])
     }
 
     return mask
