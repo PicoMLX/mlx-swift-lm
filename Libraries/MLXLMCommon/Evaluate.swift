@@ -2395,7 +2395,7 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
 /// ``ModelConfiguration/reasoningConfig``, and then only its tail: a prefilled
 /// delimiter is the last thing a generation prompt writes, so copying a long prompt
 /// out of its `MLXArray` to read the final few tokens would cost more than it saves.
-func promptPrimesReasoning(
+public func promptPrimesReasoning(
     input: LMInput, modelConfiguration: ModelConfiguration, tokenizer: Tokenizer
 ) -> Bool {
     guard let config = modelConfiguration.reasoningConfig else { return false }
