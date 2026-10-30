@@ -29,7 +29,7 @@ import MLXNN
 ///     }
 /// }
 /// ```
-public final class ModelContainer: Sendable {
+public final class ModelContainer: ModelMemoryReporting {
     private let context: SerialAccessContainer<ModelContext>
 
     public var configuration: ModelConfiguration {
@@ -128,6 +128,10 @@ public final class ModelContainer: Sendable {
 
     // MARK: - Thread-safe convenience methods
 
+    public func memory() async throws -> ModelMemory {
+        try await context.read { try $0.model.memory() }
+    }
+
     /// Authoritative planned cache status for the given generation parameters.
     ///
     /// Reports topology, capacity provenance, and strategy compatibility without
@@ -180,6 +184,7 @@ public final class ModelContainer: Sendable {
     /// for await generation in stream {
     ///     switch generation {
     ///     case .chunk(let text): print(text)
+    ///     case .reasoning(let text): print(text)
     ///     case .info(let info): print(info.tokensPerSecond)
     ///     case .toolCall(let call): handleToolCall(call)
     ///     case .rejectedToolCall(let rejection): handleRejectedToolCall(rejection)

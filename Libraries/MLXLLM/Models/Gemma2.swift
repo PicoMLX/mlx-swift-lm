@@ -170,7 +170,7 @@ public class Gemma2ModelInner: Module {
         h = h * hiddenScale
 
         // The cache builds the mask, so a batched cache masks each row's left padding.
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let mask = createAttentionMask(h: h, cache: cache?.first, returnArray: true)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
