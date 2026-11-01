@@ -6,6 +6,26 @@ import Testing
 
 @Suite(.serialized)
 struct CacheListOffsetTests {
+    @Test("Media admission distinguishes attention positions from recurrent and positional state")
+    func mediaPrefillTopology() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let attention = KVCacheSimple()
+            let values = MLXArray.ones([1, 2, 5, 4])
+            _ = attention.update(keys: values, values: values)
+            let recurrent = MambaCache()
+            recurrent[0] = MLXArray.zeros([1, 3, 8])
+            recurrent[1] = MLXArray.zeros([1, 2, 4, 4])
+            let metadata = ArraysCache(size: 1)
+            metadata[0] = MLXArray([Int32(3)]).reshaped(1, 1)
+            let caches: [any KVCache] = [recurrent, CacheList(attention, metadata)]
+            #expect(areBatchedMediaCachesPrepared(caches, tokenCount: 5))
+            #expect(!areBatchedMediaCachesPrepared(caches, tokenCount: 4))
+            #expect(!areBatchedMediaCachesPrepared([recurrent], tokenCount: 5))
+            metadata[0] = nil
+            #expect(!areBatchedMediaCachesPrepared(caches, tokenCount: 5))
+        }
+    }
+
     @Test("Copying and restoring a media cache preserves its admission position")
     func copyAndRestore() throws {
         try Device.withDefaultDevice(.cpu) {

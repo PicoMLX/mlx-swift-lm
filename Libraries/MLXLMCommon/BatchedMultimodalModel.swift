@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLX
 
 /// Media inputs whose prepared caches a model can safely adopt into ragged decoding.
 public struct BatchedMediaCapabilities: OptionSet, Sendable {
@@ -29,4 +30,28 @@ public protocol BatchedMultimodalModel: LanguageModel {
 
 extension BatchedMultimodalModel {
     public var batchTokenPlaceholderIDs: Set<Int> { [] }
+}
+
+/// Whether a single media prefill can be adopted at `tokenCount` without losing state.
+/// Attention leaves must consume the full prompt; recurrent and positional metadata
+/// leaves must hold initialized single-row state rather than an attention offset.
+public func areBatchedMediaCachesPrepared(_ caches: [any KVCache], tokenCount: Int) -> Bool {
+    guard tokenCount > 0, !caches.isEmpty else { return false }
+    var hasAttention = false
+    func prepared(_ cache: any KVCache) -> Bool {
+        if let list = cache as? CacheList {
+            return !list.children.isEmpty && list.children.allSatisfy(prepared)
+        }
+        if let arrays = cache as? ArraysCache {
+            return arrays.state.count == arrays.slotCount
+                && arrays.state.allSatisfy { $0.ndim > 0 && $0.dim(0) == 1 }
+        }
+        guard type(of: cache) == KVCacheSimple.self || type(of: cache) == RotatingKVCache.self
+        else {
+            return false
+        }
+        hasAttention = true
+        return cache.offset == tokenCount
+    }
+    return caches.allSatisfy(prepared) && hasAttention
 }
