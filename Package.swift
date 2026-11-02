@@ -237,13 +237,34 @@ let package = Package(
                 "README.md",
                 "Resources/generate_gemma3n_fixture.py",
                 "Resources/generate_phi4mm_reference.py",
+                "Resources/generate_deepseek_ocr_reference.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
                 .copy("Resources/gemma3n-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.json"),
+                .copy("Resources/deepseek-ocr-reference.safetensors"),
             ]
+        ),
+        .executableTarget(
+            name: "DeepSeekOCRDistributedParity",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/DeepSeekOCRDistributedParity",
+            exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "DeepSeekOCRCheckpointSmoke",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/DeepSeekOCRCheckpointSmoke",
+            exclude: ["prepare.py", "run.sh"]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

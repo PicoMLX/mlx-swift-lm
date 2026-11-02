@@ -69,6 +69,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
 
     /// Shared instance, preloaded with this package's built-in loading rules.
     public static let shared = VLMProcessorLoadingRegistry(resolvers: [
+        DeepSeekOCRProcessorLoadingResolver(),
         Qwen35ProcessorLoadingResolver(),
         Phi4MultimodalProcessorLoadingResolver(),
         ModelTypeProcessorResolver(processorTypes: [

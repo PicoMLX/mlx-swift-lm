@@ -83,6 +83,46 @@ Currently supported model types are:
 - gemma3
 - smolvlm
 - muse_glimmer
+- deepseekocr
+- deepseekocr_2
+
+## DeepSeek OCR
+
+`DeepSeekOCR` loads the original `deepseekocr` and `deepseekocr_2` architectures.
+Both accept text and images and produce text, including grounded document-to-Markdown
+responses. The processor retains a global image and native-resolution local crops:
+1024/640 pixels for OCR and 1024/768 pixels for OCR2. OCR uses SAM plus CLIP;
+OCR2 uses SAM plus the Qwen2 visual encoder. Their decoder weights and OCR2's learned
+query tensors load from either the original Hugging Face namespaces or converted MLX
+checkpoints, including quantized expert projections.
+
+The decoder supports ragged batched caches and `BatchedMultimodalModel` image admission.
+Image prefill returns cache-owned continuation without per-request model state, so an
+image request can join text decoding and survive row filtering, reordering and extraction.
+`TensorParallelModel` splits attention heads and dense/expert intermediate widths; vision
+encoders, embeddings, routers, norms and the output head remain replicated. Every split
+dimension must divide the rank count. The standard 10-head decoder supports two ranks;
+four ranks are rejected before any weights are changed.
+
+Numerical fixtures use unmodified model equations from
+[`mlx-vlm@4693cd0`](https://github.com/Blaizzy/mlx-vlm/tree/4693cd0eaf022ae7ef61c6fdb55e17e6399879a7/mlx_vlm/models/deepseekocr).
+Regenerate them with `Tests/MLXLMTests/Resources/generate_deepseek_ocr_reference.py`.
+`DeepSeekOCRTests` covers both vision pipelines, reference logits, quantized/ragged
+decoding and cache adoption. Build `DeepSeekOCRDistributedParity` and run
+`sh Tests/DeepSeekOCRDistributedParity/run.sh <binary>` for float/4-bit media prefill
+and ragged decoding on two local ring ranks. The port retains the upstream
+[MIT notice](../../ThirdPartyNotices/DeepSeekOCR-LICENSE.txt).
+
+For an opt-in native checkpoint check, build `DeepSeekOCRCheckpointSmoke`, then run
+`sh Tests/DeepSeekOCRCheckpointSmoke/run.sh <binary> <checkpoint-directory> <python>`.
+The selected Python environment needs Pillow and Hugging Face `tokenizers`. The check
+loads the checkpoint through `VLMModelFactory`, preprocesses a generated 64-pixel image
+at the native 1024-pixel resolution, and compares image/text batch adoption with
+independent decoding. Prompt IDs and output decoding use the checkpoint's native
+tokenizer. Weights and generated smoke inputs remain outside the repository.
+The strict numerical check promotes floating parameters/scales to float32 and
+disables M5 TF32 (`MLX_ENABLE_TF32=0`), while retaining packed quantized weights,
+to separate cache/model behavior from shape-dependent Metal kernel rounding.
 
 See [llm-tool](../../Tools/llm-tool)
 

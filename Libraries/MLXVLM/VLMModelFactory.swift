@@ -110,6 +110,8 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "deepseekocr": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
+        "deepseekocr_2": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
     ])
 }
@@ -162,6 +164,10 @@ public enum VLMProcessorTypeRegistry {
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
+        "DeepSeekOCRProcessor": create(
+            DeepSeekOCRProcessorConfiguration.self, DeepSeekOCRProcessor.init),
+        "DeepSeekOCR2Processor": create(
+            DeepSeekOCRProcessorConfiguration.self, DeepSeekOCR2Processor.init),
     ])
 }
 
