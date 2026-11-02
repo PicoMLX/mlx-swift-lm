@@ -101,7 +101,7 @@ let package = Package(
             ],
             path: "Libraries/MLXVLM",
             exclude: [
-                "README.md"
+                "README.md", "Phi4Multimodal.md", "Phi4Multimodal-LICENSE",
             ]
         ),
         .target(
@@ -176,6 +176,14 @@ let package = Package(
         // PicoMLX fork only: one rank of the two-rank tensor-parallel decode check that
         // Tests/ShardedDecodeParity/run.sh launches.
         .executableTarget(
+            name: "Phi4MultimodalDistributedParity",
+            dependencies: [
+                "MLXVLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Phi4MultimodalDistributedParity", exclude: ["run.sh"]
+        ),
+        .executableTarget(
             name: "ShardedDecodeParity",
             dependencies: [
                 "MLXLMCommon",
@@ -203,6 +211,14 @@ let package = Package(
             ],
             path: "Tests/Gemma3nCheckpointSmoke", exclude: ["prepare.py", "run.sh"]
         ),
+        .executableTarget(
+            name: "Phi4MultimodalCheckpointSmoke",
+            dependencies: [
+                "MLXVLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Phi4MultimodalCheckpointSmoke", exclude: ["prepare.py", "run.sh"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -220,10 +236,13 @@ let package = Package(
             exclude: [
                 "README.md",
                 "Resources/generate_gemma3n_fixture.py",
+                "Resources/generate_phi4mm_reference.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
                 .copy("Resources/gemma3n-reference.safetensors"),
+                .copy("Resources/phi4mm-reference.safetensors"),
+                .copy("Resources/phi4mm-reference.json"),
             ]
         ),
         .macro(

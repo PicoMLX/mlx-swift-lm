@@ -88,6 +88,7 @@ public enum VLMTypeRegistry {
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
+        "phi4mm": create(Phi4MultimodalConfiguration.self, Phi4Multimodal.init),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
@@ -117,6 +118,10 @@ public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "Phi4MultimodalProcessor": create(
+            Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
+        "Phi4MMProcessor": create(
+            Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
