@@ -114,6 +114,45 @@ struct PrefillParametersTests {
 
     // MARK: - progress through a real TokenIterator
 
+    @Test("A coordinated cancellation check stops before the next chunk")
+    func coordinatedCancellation() {
+        let checks = CancellationChecks()
+        var prefill = PrefillParameters(stepSize: 2)
+        prefill.cancellationCheck = {
+            try checks.check()
+        }
+        var chunks: [Range<Int>] = []
+        #expect(throws: CancellationError.self) {
+            try prefill.forEachChunk(total: 6) { chunks.append($0) }
+        }
+        #expect(chunks == [0 ..< 2])
+        #expect(checks.count == 2)
+    }
+
+    @Test("Without a coordinator the current task still owns cancellation")
+    func defaultCancellation() async {
+        await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            #expect(throws: CancellationError.self) {
+                try PrefillParameters(stepSize: 2).forEachChunk(total: 6) { _ in
+                    Issue.record("A cancelled task entered a prefill forward")
+                }
+            }
+        }.value
+    }
+
+    private final class CancellationChecks: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func check() throws {
+            try lock.withLock {
+                value += 1
+                if value == 2 { throw CancellationError() }
+            }
+        }
+    }
+
     private final class ProgressLog: @unchecked Sendable {
         var events: [[Int]] = []
     }
