@@ -88,6 +88,7 @@ public enum VLMTypeRegistry {
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
+        "phi4mm": create(Phi4MultimodalConfiguration.self, Phi4Multimodal.init),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
@@ -116,6 +117,10 @@ public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "Phi4MultimodalProcessor": create(
+            Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
+        "Phi4MMProcessor": create(
+            Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
@@ -395,7 +400,6 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
-        try configuration.refuseTensorParallelism()
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -481,11 +485,18 @@ public final class VLMModelFactory: GenericModelFactory {
             context: processorLoadingContext,
             registry: processorLoadingRegistry)
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+        if let group = configuration.tensorParallelGroup {
+            try await loadVLMShardedWeights(
+                modelDirectory: modelDirectory, model: model, group: group,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection,
+                excludedComponents: configuration.excludedComponents)
+        }
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration
@@ -519,7 +530,7 @@ public final class VLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -530,11 +541,29 @@ public final class VLMModelFactory: GenericModelFactory {
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
 
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
+
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
     }
 
+}
+
+/// Keep the temporary sharding existential inside the loader's isolation region.
+private func loadVLMShardedWeights(
+    modelDirectory: URL, model: any LanguageModel, group: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+    weightFileSelection: WeightFileSelection
+) async throws {
+    guard let shardable = model as? any (BaseLanguageModel & TensorParallelModel) else {
+        throw ModelFactoryError.invalidConfiguration(
+            "\(type(of: model)) models cannot be split across a distributed group")
+    }
+    try await loadShardedWeights(
+        modelDirectory: modelDirectory, model: shardable, group: group,
+        perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection)
 }
 
 /// Error wrapper that includes the filename for better error messages.
