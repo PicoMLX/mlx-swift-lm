@@ -103,6 +103,41 @@ private func recurrentLeftPadding(_ leftPadding: [Int]) -> [Int]? {
     leftPadding.isEmpty || leftPadding.contains { $0 != 0 } ? leftPadding : nil
 }
 
+/// Copy a prepared single-sequence cache into its continuous-batching representation.
+///
+/// Composite owners keep their complete topology, including recurrent and per-row
+/// metadata leaves. Unknown subclasses, compressed attention, pinned rotating
+/// prefixes and rewind reserves fail closed. The source remains independently usable.
+public func makeBatchedCache(from cache: any KVCache) -> (any BatchedCache)? {
+    if type(of: cache) == CacheList.self, let list = cache as? CacheList {
+        guard let children = makeBatchedCaches(from: list.children) else { return nil }
+        return BatchedCacheList(caches: children)
+    }
+    if type(of: cache) == KVCacheSimple.self, let simple = cache as? KVCacheSimple {
+        return BatchKVCache.fromSingle(simple)
+    }
+    if type(of: cache) == RotatingKVCache.self, let rotating = cache as? RotatingKVCache {
+        return BatchRotatingKVCache.fromSingle(rotating)
+    }
+    if type(of: cache) == ArraysCache.self || type(of: cache) == MambaCache.self {
+        return cache.copy() as? any BatchedCache
+    }
+    return nil
+}
+
+/// Convert every layer of a prepared row, or reject its complete topology.
+/// No source cache is mutated if a later layer cannot be represented.
+public func makeBatchedCaches(from caches: [any KVCache]) -> [any BatchedCache]? {
+    guard !caches.isEmpty else { return nil }
+    var result: [any BatchedCache] = []
+    result.reserveCapacity(caches.count)
+    for cache in caches {
+        guard let batched = makeBatchedCache(from: cache) else { return nil }
+        result.append(batched)
+    }
+    return result
+}
+
 // MARK: - Composite and recurrent caches
 
 /// A ``CacheList`` whose children are batched caches, for layers that hold several caches.
