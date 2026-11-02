@@ -94,6 +94,7 @@ let package = Package(
             name: "MLXVLM",
             dependencies: [
                 "MLXLMCommon",
+                "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -185,6 +186,23 @@ let package = Package(
             path: "Tests/ShardedDecodeParity",
             exclude: ["run.sh"]
         ),
+        .executableTarget(
+            name: "Gemma3nDistributedParity",
+            dependencies: [
+                "MLXLLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Gemma3nDistributedParity",
+            exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "Gemma3nCheckpointSmoke",
+            dependencies: [
+                "MLXVLM", "MLXLMCommon", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Gemma3nCheckpointSmoke", exclude: ["prepare.py", "run.sh"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -200,9 +218,13 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "Resources/generate_gemma3n_fixture.py",
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/gemma3n-reference.safetensors"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

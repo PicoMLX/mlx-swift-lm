@@ -16,17 +16,17 @@ import MLXNN
 
 public struct Gemma3nTextConfiguration: Codable {
     let modelType: String
-    let hiddenSize: Int
-    let numHiddenLayers: Int
+    package let hiddenSize: Int
+    package let numHiddenLayers: Int
     let intermediateSize: IntOrIntArray
     let numAttentionHeads: Int
-    let headDim: Int
-    let rmsNormEps: Float
-    let vocabSize: Int
+    package let headDim: Int
+    package let rmsNormEps: Float
+    package let vocabSize: Int
     let numKeyValueHeads: Int
     let numKvSharedLayers: Int
     let queryPreAttnScalar: Float?  // Optional - not present in all HF configs
-    let vocabSizePerLayerInput: Int
+    package let vocabSizePerLayerInput: Int
     let slidingWindow: Int
     let maxPositionEmbeddings: Int
     let ropeLocalBaseFreq: Float
@@ -155,6 +155,37 @@ public struct Gemma3nTextConfiguration: Codable {
         slidingWindowPattern = nil
         vocabSize = 262400
         vocabSizePerLayerInput = 262144
+    }
+}
+
+extension Gemma3nTextConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        let owners = numHiddenLayers - numKvSharedLayers
+        guard hiddenSize > 0, numHiddenLayers > 0, owners > 0, numKvSharedLayers >= 0,
+            numAttentionHeads > 0, numKeyValueHeads > 0,
+            numAttentionHeads % numKeyValueHeads == 0, headDim > 0,
+            vocabSize > 0, vocabSizePerLayerInput > 0, vocabSizePerLayerInput <= vocabSize,
+            hiddenSizePerLayerInput > 0, laurelRank > 0, altupNumInputs > 0,
+            (0 ..< altupNumInputs).contains(altupActiveIdx),
+            rmsNormEps.isFinite, rmsNormEps > 0,
+            finalLogitSoftcapping.isFinite, finalLogitSoftcapping > 0,
+            intermediateSize.values.count == 1 || intermediateSize.values.count == numHiddenLayers,
+            intermediateSize.values.allSatisfy({ $0 > 0 }),
+            attentionLayerTypes.count == numHiddenLayers,
+            attentionLayerTypes.allSatisfy({ ["full_attention", "sliding_attention"].contains($0) }
+            ),
+            activationSparsityPattern.map({
+                $0.count == numHiddenLayers && $0.allSatisfy { $0.isFinite && $0 >= 0 && $0 < 1 }
+            }) ?? true
+        else {
+            throw ModelFactoryError.invalidConfiguration(
+                "Invalid Gemma3n text dimensions or layer layout.")
+        }
+        let ownerTypes = Set(attentionLayerTypes.prefix(owners))
+        guard attentionLayerTypes.dropFirst(owners).allSatisfy({ ownerTypes.contains($0) }) else {
+            throw ModelFactoryError.invalidConfiguration(
+                "Gemma3n shared attention has no matching owner.")
+        }
     }
 }
 
@@ -480,10 +511,10 @@ class Gemma3nAltUp: Module {
         let activeX = predictions[config.altupActiveIdx]
         let innovation = activated - activeX
 
-        let allCoefsTransposed = allCoefs.transposed(2, 1, 0)
+        let allCoefsTransposed = allCoefs.transposed(2, 0, 1)
         let corrected =
             expandedDimensions(innovation, axis: 0)
-            * expandedDimensions(allCoefsTransposed, axis: 1)
+            * expandedDimensions(allCoefsTransposed, axis: -1)
         let finalCorrected = corrected + predictions
 
         return finalCorrected.asType(activated.dtype)
@@ -690,7 +721,7 @@ public class Gemma3nLanguageModel: Module {
         }
     }
 
-    init(_ config: Gemma3nTextConfiguration) {
+    package init(_ config: Gemma3nTextConfiguration) {
         self.config = config
         self.hiddenSize = config.hiddenSize
         self.vocabSize = config.vocabSize
@@ -771,7 +802,7 @@ public class Gemma3nLanguageModel: Module {
         super.init()
     }
 
-    func callAsFunction(
+    package func callAsFunction(
         inputs: MLXArray? = nil,
         inputsEmbeds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -887,7 +918,7 @@ public class Gemma3nLanguageModel: Module {
         return out
     }
 
-    func getPerLayerInputs(_ inputIds: MLXArray) -> MLXArray {
+    package func getPerLayerInputs(_ inputIds: MLXArray) -> MLXArray {
         let perLayerInputsMask = logicalAnd(
             inputIds .>= 0,
             inputIds .< vocabSizePerLayerInput
@@ -928,16 +959,59 @@ public class Gemma3nLanguageModel: Module {
         return (perLayerProjection + adjustedPerLayerInputs)
             * MLXArray(pow(2.0, -0.5), dtype: inputsEmbeds.dtype)
     }
+
+    package func embeddings(_ tokens: MLXArray) -> MLXArray {
+        let embeddings = embedTokens(tokens)
+        return (embeddings * MLXArray(_embedTokensScale, dtype: .float32)).asType(embeddings.dtype)
+    }
+
+    package var loraLayers: [Module] { layers }
+
+    package var owningLayerCount: Int { firstKvSharedLayerIdx }
+    package var cacheHeadCounts: [Int] {
+        layers.prefix(firstKvSharedLayerIdx).map { layer in
+            guard let key = layer.selfAttn.kProj else {
+                preconditionFailure("An owning attention layer must have a key projection")
+            }
+            return key.weight.dim(0) / layer.selfAttn.headDim
+        }
+    }
+
+    /// Modality encoders, AltUp and sparse MLPs stay replicated. Sparse MLP thresholds
+    /// depend on global feature statistics, so splitting their activations changes outputs.
+    package func shard(group: MLXDistributed.Group) throws {
+        try validateShardable(self)
+        try requireDivisible(
+            [
+                "attention heads": config.numAttentionHeads,
+                "key-value heads": config.numKeyValueHeads,
+            ], by: group.size)
+        for layer in layers where layer.mlp.activationSparsity == 0 {
+            try requireDivisible(["MLP width": layer.mlp.intermediateSize], by: group.size)
+        }
+        for layer in layers {
+            try layer.selfAttn.shardLinears(
+                allToSharded: layer.selfAttn.isKvSharedLayer
+                    ? ["q_proj"] : ["q_proj", "k_proj", "v_proj"],
+                shardedToAll: ["o_proj"], group: group)
+            if layer.mlp.activationSparsity == 0 {
+                try layer.mlp.shardLinears(
+                    allToSharded: ["gate_proj", "up_proj"],
+                    shardedToAll: ["down_proj"], group: group)
+            }
+        }
+    }
 }
 
-public class Gemma3nTextModel: Module, LLMModel {
+public class Gemma3nTextModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") public var languageModel: Gemma3nLanguageModel
 
     let config: Gemma3nTextConfiguration
     let modelType: String
     let textVocabSize: Int
 
-    var kvHeads: [Int]
+    public var kvHeads: [Int] { languageModel.cacheHeadCounts }
+    public var headDim: IntOrPair { .init(config.headDim) }
 
     public init(config: Gemma3nTextConfiguration) {
         self.config = config
@@ -945,8 +1019,6 @@ public class Gemma3nTextModel: Module, LLMModel {
         self.textVocabSize = config.vocabSizePerLayerInput
 
         self._languageModel.wrappedValue = Gemma3nLanguageModel(config)
-
-        self.kvHeads = Array(repeating: config.numKeyValueHeads, count: config.numHiddenLayers)
 
         super.init()
     }
@@ -1036,5 +1108,11 @@ public class Gemma3nTextModel: Module, LLMModel {
 extension Gemma3nTextModel: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.layers
+    }
+}
+
+extension Gemma3nTextModel: TensorParallelModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try languageModel.shard(group: group)
     }
 }
