@@ -232,6 +232,79 @@ struct Gemma3nMultimodalTests {
         #expect(await VLMTypeRegistry.shared.contains("gemma3n"))
     }
 
+    @Test("Actual media preparation preserves ragged cache positions", arguments: [false, true])
+    func raggedMediaPreparation(chunked: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            var text = try #require(
+                JSONSerialization.jsonObject(
+                    with: JSONEncoder().encode(tinyGemma3n(sparse: true).config)) as? [String: Any])
+            text["vocab_size_per_layer_input"] = 32
+            let data = try JSONSerialization.data(withJSONObject: [
+                "model_type": "gemma3n", "text_config": text,
+                "vision_config": [
+                    "hidden_size": 2048, "image_size": 32,
+                    "vocab_size": 8, "vocab_offset": 32,
+                ],
+                "audio_config": [
+                    "input_feat_size": 8, "hidden_size": 8,
+                    "conf_num_attention_heads": 2, "conf_num_hidden_layers": 1,
+                    "conf_attention_chunk_size": 4, "conf_attention_context_left": 3,
+                    "conf_attention_context_right": 1, "conf_reduction_factor": 2,
+                    "sscp_conv_channel_size": [2, 2], "vocab_size": 16, "vocab_offset": 40,
+                ],
+                "image_token_id": 34, "audio_token_id": 42, "audio_soft_tokens_per_image": 3,
+            ])
+            let configuration = try JSONDecoder().decode(Gemma3nConfiguration.self, from: data)
+            try configuration.validateModelConfiguration()
+            let model = Gemma3n(configuration)
+            let mediaIDs: [Int32] = [1, 42, 42, 42, 2]
+            let textIDs: [Int32] = [3, 4]
+            let audio = LMInput.ProcessedAudio(
+                features: sin(MLXArray(0 ..< 152).asType(.float32) * 0.09).reshaped(1, 19, 8),
+                mask: MLXArray.ones([1, 19], dtype: .bool))
+            let singles = try [model.newCache(parameters: nil), model.newCache(parameters: nil)]
+            let prefill = PrefillParameters(stepSize: 2, chunking: chunked ? .balanced : .unchunked)
+            let media = LMInput(
+                text: .init(tokens: MLXArray(mediaIDs).reshaped(1, 5)), audio: audio)
+            guard
+                case .logits(let expected) = try model.prepare(
+                    media, cache: singles[0], state: nil, prefill: prefill)
+            else {
+                Issue.record("Media preparation must return logits")
+                return
+            }
+            eval(model(MLXArray(textIDs).reshaped(1, 2), cache: singles[1]))
+            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
+            let batch = factories.map { $0([0, 0]) }
+            let caches = batch.map { $0 as any KVCache }
+            let input = LMInput(
+                text: .init(
+                    tokens: MLXArray(mediaIDs + textIDs + [0, 0, 0]).reshaped(2, 5),
+                    mask: MLXArray([1, 1, 1, 1, 1, 1, 1, 0, 0, 0]).reshaped(2, 5)), audio: audio)
+            guard
+                case .logits(let actual) = try model.prepare(
+                    input, cache: caches, state: nil, prefill: prefill)
+            else {
+                Issue.record("Batched media preparation must return logits")
+                return
+            }
+            try expectClose(actual.logits[0, -1], expected.logits[0, -1])
+            for layer in batch {
+                let positioned = try #require(layer as? any BatchPositionedKVCache)
+                #expect(positioned.batchOffset.asArray(Int.self) == [5, 2])
+            }
+            for step in 0 ..< 3 {
+                let tokens: [Int32] = [Int32(9 + step), Int32(19 + step)]
+                let output = model(MLXArray(tokens).reshaped(2, 1), cache: caches)
+                for row in 0 ..< 2 {
+                    try expectClose(
+                        output[row ..< row + 1],
+                        model(MLXArray([tokens[row]]).reshaped(1, 1), cache: singles[row]))
+                }
+            }
+        }
+    }
+
     @Test func processorRetainsSplitImageAndAudioSidecars() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString)
