@@ -153,6 +153,42 @@ struct BatchKVCacheTests {
         #expect(sourceKeys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 70])
     }
 
+    @Test("One token with no left padding needs no mask; padding brings it back")
+    func oneTokenWithoutPaddingHasNoMask() throws {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        guard case .none = cache.makeMask(n: 1, windowSize: nil, returnArray: false) else {
+            Issue.record("unpadded rows must decode one token without a mask")
+            return
+        }
+        guard case .array = cache.makeMask(n: 2, windowSize: nil, returnArray: false) else {
+            Issue.record("more than one token keeps the explicit mask")
+            return
+        }
+
+        // Joining a shorter row pads it, so the one-token mask returns.
+        let added = BatchKVCache(leftPadding: [0])
+        let addedKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = added.update(keys: addedKV.0, values: addedKV.1)
+        cache.extend(other: added)
+        guard case .array(let mask) = cache.makeMask(n: 1, windowSize: nil, returnArray: false)
+        else {
+            Issue.record("a padded batch must mask its padding")
+            return
+        }
+        #expect(mask[2, 0, 0, 0].item(Bool.self) == false)
+
+        // Keeping only the padded row makes its padding shared, which filter drops.
+        cache.filter(batchIndices: batchRows(2))
+        guard case .none = cache.makeMask(n: 1, windowSize: nil, returnArray: false) else {
+            Issue.record("padding dropped by filter must not keep the mask")
+            return
+        }
+        #expect(cache.batchOffset.asArray(Int32.self) == [2])
+        #expect(cache.offset == 2)
+    }
+
     @Test("The mask excludes each row's left padding, also for one token")
     func maskExcludesLeftPadding() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
