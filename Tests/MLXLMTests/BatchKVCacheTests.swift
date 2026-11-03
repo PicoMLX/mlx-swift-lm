@@ -223,6 +223,30 @@ struct BatchKVCacheTests {
         #expect(offsets.asArray(Int32.self) == [2, 3])
     }
 
+    @Test("ropeOffset is scalar while every row shares one position")
+    func ropeOffsetScalarForSharedPosition() {
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        let batch = BatchKVCache(leftPadding: [0, 0])
+        _ = batch.update(keys: kv.0, values: kv.1)
+        guard case .scalar(let offset) = batch.ropeOffset else {
+            Issue.record("rows at one position must use the scalar offset")
+            return
+        }
+        #expect(offset == 3)
+        #expect(batch.batchOffset.asArray(Int32.self) == [3, 3])
+
+        // A shorter row joining the batch gives the rows different positions.
+        let added = BatchKVCache(leftPadding: [0])
+        let addedKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = added.update(keys: addedKV.0, values: addedKV.1)
+        batch.extend(other: added)
+        guard case .batch(let offsets) = batch.ropeOffset else {
+            Issue.record("rows at different positions must use per-row offsets")
+            return
+        }
+        #expect(offsets.asArray(Int32.self) == [3, 3, 2])
+    }
+
     @Test("createCausalMask masks each row's left padding")
     func causalMaskWithLeftPadding() throws {
         let mask = createCausalMask(n: 4, offset: 0, leftPadding: MLXArray([Int32(1), 2]))

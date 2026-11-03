@@ -81,8 +81,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 
     /// Per-row positions, also when the cache is typed as `KVCache`.
     ///
-    /// No copy: every change replaces the array rather than mutating it.
-    public override var ropeOffset: RoPEOffset { .batch(batchOffset) }
+    /// Rows at one shared position, such as a batch of one, get the scalar
+    /// form, so no array is built per layer per step. Otherwise no copy:
+    /// every change replaces the array rather than mutating it.
+    public override var ropeOffset: RoPEOffset {
+        if let first = positions.first, positions.allSatisfy({ $0 == first }) {
+            return .scalar(Int(first))
+        }
+        return .batch(batchOffset)
+    }
 
     public override func innerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
@@ -262,7 +269,8 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         let ownShift = Int32(end - offset)
         let addedShift = Int32(end - other.offset)
         setLeftPadding(
-            leftPaddingValues.map { $0 + ownShift } + other.leftPaddingValues.map { $0 + addedShift })
+            leftPaddingValues.map { $0 + ownShift }
+                + other.leftPaddingValues.map { $0 + addedShift })
         setPositions(positions + other.positions)
         offset = end
     }
