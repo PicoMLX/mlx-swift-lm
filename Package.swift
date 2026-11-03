@@ -102,6 +102,7 @@ let package = Package(
             path: "Libraries/MLXVLM",
             exclude: [
                 "README.md", "Phi4Multimodal.md", "Phi4Multimodal-LICENSE",
+                "MiniCPM.md", "MiniCPM-LICENSE", "MiniCPM-Canvas-LICENSE",
             ]
         ),
         .target(
@@ -219,6 +220,19 @@ let package = Package(
             ],
             path: "Tests/Phi4MultimodalCheckpointSmoke", exclude: ["prepare.py", "run.sh"]
         ),
+        .executableTarget(
+            name: "MiniCPMDistributedParity",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ], path: "Tests/MiniCPMDistributedParity", exclude: ["run.sh"]),
+        .executableTarget(
+            name: "MiniCPMCheckpointSmoke",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MiniCPMCheckpointSmoke", exclude: ["prepare.py", "run.sh"]),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -238,6 +252,7 @@ let package = Package(
                 "Resources/generate_gemma3n_fixture.py",
                 "Resources/generate_phi4mm_reference.py",
                 "Resources/generate_deepseek_ocr_reference.py",
+                "Resources/generate_minicpm_reference.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
@@ -245,6 +260,12 @@ let package = Package(
                 .copy("Resources/phi4mm-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.json"),
                 .copy("Resources/deepseek-ocr-reference.safetensors"),
+                .copy("Resources/minicpmo-reference.safetensors"),
+                .copy("Resources/minicpmo-reference.json"),
+                .copy("Resources/minicpmv4_6-reference.safetensors"),
+                .copy("Resources/minicpmv4_6-reference.json"),
+                .copy("Resources/minicpmv4_7-reference.safetensors"),
+                .copy("Resources/minicpmv4_7-reference.json"),
             ]
         ),
         .executableTarget(

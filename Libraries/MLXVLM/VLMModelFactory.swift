@@ -113,6 +113,9 @@ public enum VLMTypeRegistry {
         "deepseekocr": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
         "deepseekocr_2": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
+        "minicpmo": create(MiniCPMConfiguration.self, MiniCPM.init),
+        "minicpmv4_6": create(MiniCPMConfiguration.self, MiniCPM.init),
+        "minicpmv4_7": create(MiniCPMConfiguration.self, MiniCPM.init),
     ])
 }
 
@@ -124,6 +127,15 @@ public enum VLMProcessorTypeRegistry {
             Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
         "Phi4MMProcessor": create(
             Phi4MultimodalProcessorConfiguration.self, Phi4MultimodalProcessor.init),
+        "MiniCPMOProcessor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmo") }),
+        "MiniCPMVProcessor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmv4_6") }),
+        "MiniCPMV4_7Processor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmv4_7") }),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
@@ -439,6 +451,12 @@ public final class VLMModelFactory: GenericModelFactory {
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
         var eosTokenIds = baseConfig.effectiveEOSTokenIds
+        // MiniCPM-V's turn-end marker takes precedence over its generic end-of-text ID.
+        if ["minicpmv4_6", "minicpmv4_7"].contains(baseConfig.modelType),
+            eosTokenIds.contains(248046)
+        {
+            eosTokenIds = [248046]
+        }
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {

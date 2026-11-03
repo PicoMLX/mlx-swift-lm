@@ -72,6 +72,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
         DeepSeekOCRProcessorLoadingResolver(),
         Qwen35ProcessorLoadingResolver(),
         Phi4MultimodalProcessorLoadingResolver(),
+        MiniCPMProcessorLoadingResolver(),
         ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
             "gemma4_unified": "Gemma4UnifiedProcessor",

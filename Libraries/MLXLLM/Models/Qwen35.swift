@@ -401,7 +401,7 @@ final class Qwen35GatedDeltaNet: Module {
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, validLengths: cache?.currentLengths)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
@@ -433,7 +433,8 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        validLengths: MLXArray? = nil
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -451,10 +452,21 @@ final class Qwen35GatedDeltaNet: Module {
 
         let fusedDecode =
             S == 1 && mask == nil && (qkv.dtype == .float16 || qkv.dtype == .bfloat16)
-        let (convPre, newConvState) =
+        let (convPre, physicalConvState) =
             fusedDecode
             ? decodeConv(convState: convState, qkv: qkv)
             : generalConv(convState: convState, qkv: qkv)
+        let newConvState: MLXArray
+        if let validLengths {
+            let lengths = clip(validLengths, min: 0, max: S).asType(.int32)
+            let joined = concatenated([convState, qkv], axis: 1)
+            let indices =
+                lengths[0..., .newAxis, .newAxis]
+                + MLXArray(0 ..< convKernelSize - 1)[.newAxis, 0..., .newAxis]
+            newConvState = contiguous(takeAlong(joined, indices, axis: 1))
+        } else {
+            newConvState = physicalConvState
+        }
         let convOut = silu(convPre)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -588,6 +600,7 @@ final class Qwen35Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rope: RoPELayer
+    let multimodalRope: Qwen35CanvasRotary
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -608,6 +621,9 @@ final class Qwen35Attention: Module {
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
         let ropeDims = Int(Float(headDim) * args.partialRotaryFactor)
+        self.multimodalRope = Qwen35CanvasRotary(
+            dimensions: ropeDims, base: args.ropeTheta,
+            sections: args.ropeScaling?["mrope_section"]?.asInts() ?? [11, 11, 10])
         self.rope = initializeRope(
             dims: max(1, ropeDims),
             base: args.ropeTheta,
@@ -621,13 +637,19 @@ final class Qwen35Attention: Module {
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-        positionOffset: Int? = nil
+        positionOffset: Int? = nil, positionIds: MLXArray? = nil
     ) -> MLXArray {
         let (q, gate, k, values) = projectPreRope(x)
 
         let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
-        let queries = applyRotaryPosition(rope, to: q, offset: offset)
-        let keys = applyRotaryPosition(rope, to: k, offset: offset)
+        let queries: MLXArray
+        let keys: MLXArray
+        if let positionIds {
+            (queries, keys) = multimodalRope(q: q, k: k, positions: positionIds)
+        } else {
+            queries = applyRotaryPosition(rope, to: q, offset: offset)
+            keys = applyRotaryPosition(rope, to: k, offset: offset)
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -829,12 +851,13 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?,
         positionOffset: Int? = nil,
+        positionIds: MLXArray? = nil,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write), a sharded layer's
         // collectives included. Everything else takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        if x.dim(1) == 1, ssmMask == nil, positionIds == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -851,7 +874,7 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
-                positionOffset: positionOffset)
+                positionOffset: positionOffset, positionIds: positionIds)
         }
 
         let h = x + r
@@ -1514,4 +1537,74 @@ extension Qwen35Model {
 extension Qwen35TextModel {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+}
+
+// MARK: - Embedded multimodal inputs
+
+package struct Qwen35CanvasRotary {
+    let dimensions: Int
+    let frequencies: MLXArray
+    let selectors: MLXArray
+    init(dimensions: Int, base: Float, sections: [Int]) {
+        self.dimensions = dimensions
+        frequencies =
+            1
+            / pow(
+                MLXArray(base),
+                MLXArray(stride(from: 0, to: dimensions, by: 2)).asType(.float32)
+                    / Float(dimensions))
+        var indices = [Int32](repeating: 0, count: dimensions / 2)
+        for dimension in 1 ... 2 {
+            for index in stride(
+                from: dimension,
+                to: min((sections.count > dimension ? sections[dimension] : 0) * 3, indices.count),
+                by: 3)
+            {
+                indices[index] = Int32(dimension)
+            }
+        }
+        selectors = MLXArray(indices).reshaped(1, 1, 1, -1)
+    }
+    func callAsFunction(q: MLXArray, k: MLXArray, positions: MLXArray) -> (MLXArray, MLXArray) {
+        let positions =
+            positions.ndim == 2
+            ? broadcast(
+                positions[.newAxis, 0..., 0...], to: [3, positions.dim(0), positions.dim(1)])
+            : positions
+        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis] * frequencies
+        let angles = takeAlong(all, selectors, axis: 0).squeezed(axis: 0)
+        let repeated = concatenated([angles, angles], axis: -1)
+        func rotate(_ x: MLXArray) -> MLXArray {
+            let h = x[.ellipsis, ..<dimensions]
+            let half = dimensions / 2
+            let rotated = concatenated([-h[.ellipsis, half...], h[.ellipsis, ..<half]], axis: -1)
+            let c = cos(repeated).asType(x.dtype)[0..., .newAxis, 0..., 0...]
+            let s = sin(repeated).asType(x.dtype)[0..., .newAxis, 0..., 0...]
+            return concatenated([h * c + rotated * s, x[.ellipsis, dimensions...]], axis: -1)
+        }
+        return (rotate(q), rotate(k))
+    }
+}
+
+extension Qwen35TextModel {
+    package func tokenEmbeddings(_ tokens: MLXArray) -> MLXArray { model.embedTokens(tokens) }
+    package var multimodalLayers: [Module] { model.layers }
+    package func embeddedLogits(
+        _ embeddings: MLXArray, cache: [KVCache]?, positionIds: MLXArray? = nil
+    ) -> MLXArray {
+        var h = embeddings
+        let attentionMask =
+            model.faIdx.map { createAttentionMask(h: h, cache: cache?[$0]) } ?? .none
+        let recurrentMask = model.ssmIdx.flatMap {
+            createSSMMask(h: h, cache: cache?[$0] as? MambaCache)
+        }
+        for (i, layer) in model.layers.enumerated() {
+            h = layer(
+                h, attentionMask: layer.isLinear ? .none : attentionMask,
+                ssmMask: layer.isLinear ? recurrentMask : nil, cache: cache?[i],
+                positionIds: positionIds)
+        }
+        h = model.norm(h)
+        return lmHead.map { $0(h) } ?? model.embedTokens.asLinear(h)
+    }
 }
