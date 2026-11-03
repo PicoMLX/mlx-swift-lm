@@ -15,6 +15,8 @@ import MLXNN
 class Qwen3Attention: Module {
     let args: Qwen3Configuration
     let scale: Float
+    var heads: Int
+    var kvHeads: Int
 
     @ModuleInfo(key: "q_proj") var wq: Linear
     @ModuleInfo(key: "k_proj") var wk: Linear
@@ -28,6 +30,8 @@ class Qwen3Attention: Module {
 
     public init(_ args: Qwen3Configuration) {
         self.args = args
+        self.heads = args.attentionHeads
+        self.kvHeads = args.kvHeads
 
         let dim = args.hiddenSize
         let heads = args.attentionHeads
@@ -63,9 +67,9 @@ class Qwen3Attention: Module {
         var values = wv(x)
 
         // prepare the queries, keys and values for the attention computation
-        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        queries = qNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         // Apply RoPE positioning
         let offset = cache?.ropeOffset
@@ -165,7 +169,7 @@ public class Qwen3ModelInner: Module {
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public private(set) var kvHeads: [Int]
 
     public let model: Qwen3ModelInner
     let configuration: Qwen3Configuration
@@ -298,4 +302,43 @@ extension Qwen3Model: LoRAModel {
 
 extension Qwen3Model {
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.qwen3 }
+}
+
+// MARK: - Multimodal consumers and tensor parallelism
+
+extension Qwen3Model {
+    package func tokenEmbeddings(_ tokens: MLXArray) -> MLXArray { model.embedTokens(tokens) }
+
+    package func embeddedLogits(_ embeddings: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var h = embeddings
+        for (index, layer) in model.layers.enumerated() {
+            h = layer(
+                h, mask: createAttentionMask(h: h, cache: cache?[index]), cache: cache?[index])
+        }
+        h = model.norm(h)
+        return lmHead.map { $0(h) } ?? model.embedTokens.asLinear(h)
+    }
+}
+
+extension Qwen3Model: TensorParallelModel {
+    public func shard(group: MLXDistributed.Group) throws {
+        try validateShardable(self)
+        try requireDivisible(
+            [
+                "attention heads": configuration.attentionHeads,
+                "key-value heads": configuration.kvHeads,
+                "MLP width": configuration.intermediateSize,
+            ], by: group.size)
+        for layer in model.layers {
+            try layer.attention.shardLinears(
+                allToSharded: ["q_proj", "k_proj", "v_proj"], shardedToAll: ["o_proj"], group: group
+            )
+            try layer.mlp.shardLinears(
+                allToSharded: ["gate_proj", "up_proj"], shardedToAll: ["down_proj"], group: group)
+            layer.attention.heads /= try group.size
+            layer.attention.kvHeads /= try group.size
+        }
+        let size = try group.size
+        kvHeads = kvHeads.map { $0 / size }
+    }
 }

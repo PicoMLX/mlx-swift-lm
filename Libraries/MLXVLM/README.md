@@ -486,3 +486,7 @@ configuration by id:
 # Using a Model
 
 See [MLXLMCommon/README.md](../MLXLMCommon/README.md#using-a-model).
+
+## MiniCPM
+
+See [MiniCPM media understanding](MiniCPM.md) for input modalities, batching and tensor parallelism.
