@@ -168,12 +168,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         return trimmed
     }
 
-    /// No mask for one token when no row is padded; otherwise an explicit mask,
-    /// so left padding stays masked.
+    /// No mask for one token when no row is padded and the window, if any,
+    /// covers every retained key; otherwise an explicit mask, so left padding
+    /// and the window stay masked. This cache never evicts, so a window
+    /// smaller than the history still needs the mask.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        if n == 1, !hasLeftPadding {
+        if n == 1, !hasLeftPadding, windowSize.map({ $0 >= offset + n }) ?? true {
             return .none
         }
         return .array(

@@ -189,6 +189,27 @@ struct BatchKVCacheTests {
         #expect(cache.offset == 2)
     }
 
+    @Test("A window smaller than the history keeps the one-token mask")
+    func windowKeepsOneTokenMask() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let (keys, values) = makeDistinctKV(batchSize: 1, heads: 2, seqLen: 8, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        guard case .none = cache.makeMask(n: 1, windowSize: 9, returnArray: false) else {
+            Issue.record("a window covering every key needs no mask")
+            return
+        }
+        guard case .array(let mask) = cache.makeMask(n: 1, windowSize: 4, returnArray: false)
+        else {
+            Issue.record("a window smaller than the history must keep the mask")
+            return
+        }
+        try #require(mask.shape.last == 9)
+        // The query at position 8 sees positions 5...8 only.
+        #expect(mask[0, 0, 0, 4].item(Bool.self) == false)
+        #expect(mask[0, 0, 0, 5].item(Bool.self) == true)
+        #expect(mask[0, 0, 0, 8].item(Bool.self) == true)
+    }
+
     @Test("The mask excludes each row's left padding, also for one token")
     func maskExcludesLeftPadding() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
