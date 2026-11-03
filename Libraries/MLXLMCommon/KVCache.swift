@@ -1862,12 +1862,14 @@ public class CacheList: BaseKVCache {
     public init(_ caches: KVCache...) {
         self.caches = caches
         super.init()
+        offset = caches.map(\.offset).max() ?? 0
     }
 
     /// Internal initializer for reconstruction from deserialized children.
     internal init(caches: [KVCache]) {
         self.caches = caches
         super.init()
+        offset = caches.map(\.offset).max() ?? 0
     }
 
     public override func innerState() -> [MLXArray] {
