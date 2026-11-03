@@ -82,15 +82,12 @@ let first = try lastLogits(model.prepare(media, cache: singles[0], state: nil, p
 let second = try lastLogits(model.prepare(text, cache: singles[1], state: nil, prefill: .init()))
 var next = [argMax(first).item(Int.self), argMax(second).item(Int.self)]
 var generated = next.map { [$0] }
-let batch = try singles[0].enumerated().map { index, cache -> BatchKVCache in
-    guard let first = cache as? KVCacheSimple, let second = singles[1][index] as? KVCacheSimple
-    else {
-        throw VLMError.processing("Unexpected OCR attention cache type.")
-    }
-    let combined = BatchKVCache.fromSingle(first.copy() as! KVCacheSimple)
-    combined.extend(other: BatchKVCache.fromSingle(second.copy() as! KVCacheSimple))
-    return combined
+guard let batch = makeBatchedCaches(from: singles[0]),
+    let added = makeBatchedCaches(from: singles[1])
+else {
+    throw VLMError.processing("Native OCR cache cannot enter continuous batching")
 }
+for index in batch.indices { batch[index].extend(other: added[index]) }
 var maximumDifference: Float = 0
 for _ in 0 ..< 7 {
     let batched = model(MLXArray(next).reshaped(2, 1), cache: batch.map { $0 as any KVCache })
