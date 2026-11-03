@@ -83,7 +83,7 @@ public final class DeepSeekOCR: Module, VLMModel, KVCacheDimensionProvider, Tens
             throw VLMError.processing("DeepSeek OCR local crops are missing.")
         }
         let global = imageFeatures(image.pixels)
-        let local = image.crops.map(imageFeatures)
+        let local: MLXArray? = expectedCrops == 0 ? nil : image.crops.map(imageFeatures)
         var rowFeatures = [[MLXArray]](repeating: [], count: tokens.dim(0))
         var localOffset = 0
         for (index, frame) in frames.enumerated() {

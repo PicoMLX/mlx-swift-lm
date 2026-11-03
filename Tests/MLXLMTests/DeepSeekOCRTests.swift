@@ -106,6 +106,15 @@ struct DeepSeekOCRTests {
                         pixels: pixels,
                         frames: [THW(0, grid[0], grid[1])], crops: crops))
                 let embeddings = try model.inputEmbeddings(input)
+                if variant == "global" {
+                    let emptyCrops = LMInput(
+                        text: input.text,
+                        image: .init(
+                            pixels: pixels, frames: [THW(0, 0, 0)],
+                            crops: MLXArray.zeros([0, 3, pixels.dim(2), pixels.dim(3)])))
+                    #expect(
+                        maxAbsDifference(try model.inputEmbeddings(emptyCrops), embeddings) == 0)
+                }
                 #expect(
                     maxAbsDifference(embeddings, try #require(arrays[key + "embeddings"])) < 2e-5)
                 let cache = try model.newCache(parameters: nil)
