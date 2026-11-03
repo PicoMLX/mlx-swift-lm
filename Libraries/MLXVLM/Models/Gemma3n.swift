@@ -230,20 +230,22 @@ public final class Gemma3n: Module, VLMModel, TensorParallelModel, KVCacheDimens
             return .tokens(input.text)
         }
         let (embeddings, perLayer) = try inputEmbeddings(input)
-        let caches = cache.map { Optional($0) }
-        let total = embeddings.dim(1)
-        let processed = try prefill.forEachChunk(total: total) { range in
-            _ = languageModel(
-                inputsEmbeds: embeddings[0..., range, 0...], cache: caches,
-                perLayerInputs: perLayer[0..., range, 0..., 0...])
-            asyncEval(cache)
+        return try withPreparedCache(cache, lengths: input.text.sequenceLengths) {
+            let caches = cache.map { Optional($0) }
+            let total = embeddings.dim(1)
+            let processed = try prefill.forEachChunk(total: total) { range in
+                _ = languageModel(
+                    inputsEmbeds: embeddings[0..., range, 0...], cache: caches,
+                    perLayerInputs: perLayer[0..., range, 0..., 0...])
+                asyncEval(cache)
+            }
+            if processed > 0 { eval(cache) }
+            let logits = languageModel(
+                inputsEmbeds: embeddings[0..., processed..., 0...], cache: caches,
+                perLayerInputs: perLayer[0..., processed..., 0..., 0...])
+            prefill.progress?(total, total)
+            return .logits(.init(logits: logits))
         }
-        if processed > 0 { eval(cache) }
-        let logits = languageModel(
-            inputsEmbeds: embeddings[0..., processed..., 0...], cache: caches,
-            perLayerInputs: perLayer[0..., processed..., 0..., 0...])
-        prefill.progress?(total, total)
-        return .logits(.init(logits: logits))
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
