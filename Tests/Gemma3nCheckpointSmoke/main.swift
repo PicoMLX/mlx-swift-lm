@@ -75,29 +75,11 @@ func prepare(_ input: LMInput, model: any LanguageModel, cache: [any KVCache]) t
     }
     return last
 }
-func adopt(_ source: any KVCache, template: any KVCache) throws -> any BatchedCache {
-    if let source = source as? CacheList, let template = template as? BatchedCacheList {
-        var index = 0
-        var failure: (any Error)?
-        template.mapChildren { child in
-            defer { index += 1 }
-            do { return try adopt(source[index], template: child) } catch {
-                failure = error
-                return child
-            }
-        }
-        if let failure { throw failure }
-        template.offset = source.offset
-        return template
+func adopted(_ source: [any KVCache]) throws -> [any BatchedCache] {
+    guard let converted = makeBatchedCaches(from: source) else {
+        throw VLMError.processing("Native checkpoint cache cannot enter continuous batching")
     }
-    if let source = source.copy() as? RotatingKVCache,
-        let batch = BatchRotatingKVCache.fromSingle(source)
-    {
-        return batch
-    }
-    if let source = source.copy() as? KVCacheSimple { return BatchKVCache.fromSingle(source) }
-    if let source = source.copy() as? ArraysCache { return source }
-    throw VLMError.processing("Unsupported native checkpoint cache topology")
+    return converted
 }
 let arguments = CommandLine.arguments
 precondition(arguments.count == 3, "Usage: checkpoint-smoke checkpoint-directory input.json")
@@ -133,11 +115,6 @@ var next = try inputs.enumerated().map { row, input in
     argMax(try prepare(input, model: model, cache: singles[row])).item(Int.self)
 }
 var generated = next.map { [$0] }
-let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-@MainActor func adopted(_ source: [any KVCache]) throws -> [any BatchedCache] {
-    let templates = factories.map { $0([0]) }
-    return try source.indices.map { try adopt(source[$0], template: templates[$0]) }
-}
 let batch = try adopted(singles[0])
 for row in 1 ..< singles.count {
     let added = try adopted(singles[row])
