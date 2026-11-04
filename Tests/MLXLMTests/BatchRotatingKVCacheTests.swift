@@ -166,23 +166,26 @@ struct BatchRotatingKVCacheTests {
             try #require(cache.extract(1).state.first).asArray(Float.self) == [10, 11, 12, 13])
     }
 
-    @Test("fromSingle keeps the retained window, below and at capacity")
-    func fromSingleKeepsWindow() throws {
+    @Test("merge keeps the retained window, below and at capacity")
+    func mergeKeepsWindow() throws {
         for length in [5, 8] {
             let single = RotatingKVCache(maxSize: 8)
             append(0 ..< length, to: single)
-            let batch = try #require(BatchRotatingKVCache.fromSingle(single))
+            let batch = try RotatingKVCache.merge([single])
             #expect(batch.batchSize == 1)
+            #expect(batch.batchOffset.asArray(Int.self) == [single.offset])
             try expectHistory(row(batch), single)
         }
     }
 
-    @Test("fromSingle refuses a pinned prefix or a rewind reserve")
-    func fromSingleRefusesUnbatchableCaches() {
-        #expect(BatchRotatingKVCache.fromSingle(RotatingKVCache(maxSize: 8, keep: 2)) == nil)
-        #expect(
-            BatchRotatingKVCache.fromSingle(RotatingKVCache(maxSize: 8, rewindCapacity: 4))
-                == nil)
+    @Test("merge refuses a pinned prefix or a rewind reserve")
+    func mergeRefusesUnbatchableCaches() {
+        #expect(throws: BatchedCacheError.self) {
+            _ = try RotatingKVCache.merge([RotatingKVCache(maxSize: 8, keep: 2)])
+        }
+        #expect(throws: BatchedCacheError.self) {
+            _ = try RotatingKVCache.merge([RotatingKVCache(maxSize: 8, rewindCapacity: 4)])
+        }
     }
 
     @Test("A trimmed wrapped source keeps its rows through batching and decode")
@@ -192,7 +195,8 @@ struct BatchRotatingKVCacheTests {
         #expect(single.trim(2) == 2)
         #expect(single.offset == 15)
 
-        let batch = try #require(BatchRotatingKVCache.fromSingle(single))
+        let batch = try RotatingKVCache.merge([single])
+        #expect(batch.batchOffset.asArray(Int.self) == [15])
         try expectHistory(row(batch), single)
         for position in 15 ..< 20 {
             append(position ..< position + 1, to: single)
@@ -215,7 +219,8 @@ struct BatchRotatingKVCacheTests {
                 }
                 let original = source.state.map { $0.asArray(Float.self) }
                 let reference = try #require(source.copy() as? RotatingKVCache)
-                let batch = try #require(BatchRotatingKVCache.fromSingle(source))
+                let batch = try RotatingKVCache.merge([source])
+                #expect(batch.batchSize == 1)
                 #expect(batch.batchOffset.asArray(Int.self) == [11])
                 #expect(batch.step == 3)
                 #expect(
@@ -248,7 +253,8 @@ struct BatchRotatingKVCacheTests {
             append(0 ..< 8, to: source)
             let original = source.state.map { $0.asArray(Float.self) }
             let metadata = source.metaState
-            let batch = try #require(BatchRotatingKVCache.fromSingle(source))
+            let batch = try RotatingKVCache.merge([source])
+            #expect(batch.batchOffset.asArray(Int.self) == [8])
             append(8 ..< 9, to: batch)
             #expect(source.metaState == metadata)
             #expect(source.state.map { $0.asArray(Float.self) } == original)
@@ -263,7 +269,8 @@ struct BatchRotatingKVCacheTests {
         try Device.withDefaultDevice(.cpu) {
             let source = RotatingKVCache(maxSize: 4)
             append(0 ..< 4, to: source)
-            let batch = try #require(BatchRotatingKVCache.fromSingle(source))
+            let batch = try RotatingKVCache.merge([source])
+            #expect(batch.batchOffset.asArray(Int.self) == [4])
             append(4 ..< 6, to: batch)
             append(4 ..< 6, to: source)
             let extracted = try row(batch)
@@ -285,9 +292,10 @@ struct BatchRotatingKVCacheTests {
             for position in 8 ..< 11 { append(position ..< position + 1, to: sources[0]) }
             append(100 ..< 113, to: sources[1])
             append(200 ..< 203, to: sources[2])
-            let batch = try #require(BatchRotatingKVCache.fromSingle(sources[0]))
-            batch.extend(other: try #require(BatchRotatingKVCache.fromSingle(sources[1])))
-            batch.extend(other: try #require(BatchRotatingKVCache.fromSingle(sources[2])))
+            let batch = try RotatingKVCache.merge(sources)
+            #expect(batch.batchSize == 3)
+            #expect(batch.batchOffset.asArray(Int.self) == sources.map(\.offset))
+            #expect(batch.leftPadding.asArray(Int32.self).count == 3)
             for index in sources.indices { try expectHistory(row(batch, index), sources[index]) }
 
             batch.filter(batchIndices: batchRows(2, 0))
@@ -378,34 +386,36 @@ struct BatchRotatingKVCacheTests {
         #expect(try row(cache, 0).capacityOrigin == .requested)
     }
 
-    @Test("The factory carries the window, step and capacity origin")
-    func factory() throws {
+    @Test("merge carries the window, step and capacity origin")
+    func mergeCarriesConfiguration() throws {
         let probe = RotatingKVCache(maxSize: 16, step: 3)
         probe.capacityOrigin = .requested
-        let factory = try #require(try makeBatchedCacheFactories(for: [probe]).first)
-        let cache = try #require(factory([0]) as? BatchRotatingKVCache)
+        let cache = try RotatingKVCache.merge([probe])
+        #expect(cache.batchSize == 1)
         #expect(cache.maxSize == 16)
         #expect(cache.step == 3)
         #expect(cache.capacityOrigin == .requested)
 
-        let list = try #require(
-            try makeBatchedCacheFactories(
-                for: [CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16))]
-            ).first)
-        let composite = try #require(list([0, 0]) as? BatchedCacheList)
+        let composite = try CacheList.merge([
+            CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16)),
+            CacheList(KVCacheSimple(), RotatingKVCache(maxSize: 16)),
+        ])
+        #expect(composite[0] is BatchKVCache)
         #expect(composite[1] is BatchRotatingKVCache)
+        #expect((composite[1] as? BatchRotatingKVCache)?.batchSize == 2)
+        #expect((composite[1] as? BatchRotatingKVCache)?.maxSize == 16)
     }
 
-    @Test("The factory refuses a pinned prefix or a rewind reserve, also when nested")
-    func factoryRefusesUnbatchableCaches() {
+    @Test("merge refuses a pinned prefix or a rewind reserve, also when nested")
+    func mergeRefusesUnbatchableCachesWhenNested() {
         for cache in [
             RotatingKVCache(maxSize: 16, keep: 4), RotatingKVCache(maxSize: 16, rewindCapacity: 4),
         ] {
             #expect(throws: BatchedCacheError.self) {
-                _ = try makeBatchedCacheFactories(for: [cache])
+                _ = try mergeCaches([cache])
             }
             #expect(throws: BatchedCacheError.self) {
-                _ = try makeBatchedCacheFactories(for: [CacheList(KVCacheSimple(), cache)])
+                _ = try CacheList.merge([CacheList(KVCacheSimple(), cache)])
             }
         }
     }

@@ -80,13 +80,13 @@ struct BatchKVCacheTests {
         #expect(try #require(second.values).asArray(Float.self) == [40, 42, 44, 46, 48])
     }
 
-    @Test("fromSingle and extract round-trip a sequence")
-    func fromSingleRoundTrip() throws {
+    @Test("merge of one cache and extract round-trip a sequence")
+    func mergeRoundTrip() throws {
         let single = KVCacheSimple()
         let kv = makePositionKV(positions: 0 ..< 4, heads: 2, headDim: 4)
         _ = single.update(keys: kv.0, values: kv.1)
 
-        let batch = BatchKVCache.fromSingle(single)
+        let batch = KVCacheSimple.merge([single])
         #expect(batch.batchSize == 1)
 
         let restored = batch.extract(0)
@@ -279,17 +279,28 @@ struct BatchKVCacheTests {
         #expect(mask[1, 0, 2, 2].item(Bool.self) == true)
     }
 
-    @Test("The factory batches KVCacheSimple and refuses caches without a batched form")
-    func factory() throws {
-        let factories = try makeBatchedCacheFactories(for: [KVCacheSimple()])
-        let factory = try #require(factories.first)
-        #expect((factory([0, 2]) as? BatchKVCache)?.leftPadding.asArray(Int32.self) == [0, 2])
+    @Test("merge left-pads ragged rows, and mergeCaches refuses caches without a batched form")
+    func mergeRaggedRows() throws {
+        let longer = KVCacheSimple()
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = longer.update(keys: kv.0, values: kv.1)
+        let merged = KVCacheSimple.merge([longer, KVCacheSimple()])
+        #expect(merged.leftPadding.asArray(Int32.self) == [0, 2])
+        #expect(merged.batchOffset.asArray(Int32.self) == [2, 0])
+        #expect(merged.offset == 2)
+        // Two empty caches merge into an empty two-row batch.
+        let empty = KVCacheSimple.merge([KVCacheSimple(), KVCacheSimple()])
+        #expect(empty.batchSize == 2)
+        #expect(empty.offset == 0)
 
         #expect(throws: BatchedCacheError.self) {
-            _ = try makeBatchedCacheFactories(for: [QuantizedKVCache()])
+            _ = try mergeCaches([QuantizedKVCache()])
         }
         #expect(throws: BatchedCacheError.self) {
-            _ = try makeBatchedCacheFactories(for: [ChunkedKVCache(chunkSize: 16)])
+            _ = try mergeCaches([ChunkedKVCache(chunkSize: 16)])
+        }
+        #expect(throws: BatchedCacheError.self) {
+            _ = try mergeCaches([KVCacheSimple(), RotatingKVCache(maxSize: 4)])
         }
     }
 
