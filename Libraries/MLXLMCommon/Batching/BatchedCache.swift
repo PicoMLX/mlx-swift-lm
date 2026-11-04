@@ -20,152 +20,94 @@ public protocol BatchedCache: KVCache {
     func extract(_ index: Int) -> any KVCache
 }
 
-/// Makes the batched cache of one layer for `leftPadding.count` rows.
-public typealias BatchedCacheFactory = (_ leftPadding: [Int]) -> any BatchedCache
-
-/// A model cache that has no batched counterpart.
+/// A cache that has no batched form.
 public enum BatchedCacheError: Error, CustomStringConvertible, Equatable {
-    case unsupportedCacheTopology(layer: Int, path: String, cacheType: String, reason: String)
+    case unsupportedCache(cacheType: String, reason: String)
 
     public var description: String {
         switch self {
-        case .unsupportedCacheTopology(let layer, let path, let cacheType, let reason):
-            "Unsupported cache topology at layer \(layer), \(path): \(cacheType). \(reason)"
+        case .unsupportedCache(let cacheType, let reason):
+            "No batched form for \(cacheType): \(reason)"
         }
     }
 }
 
-/// One ``BatchedCacheFactory`` per layer of `probe`, a model's single-sequence caches
-/// such as those from `newCache(parameters:)`.
+/// The rows of `caches`, single-sequence caches of one layer, as one batched cache.
 ///
-/// This checks only the cache types. A caller still has to check that the model
-/// supports per-row positions.
+/// Port of mlx-lm's `_merge_caches`: dispatches on the exact cache type, so a
+/// `ChunkedKVCache` or a compressed cache is refused rather than treated as the
+/// class it subclasses. Empty caches merge into an empty batch with one row each.
 ///
-/// - Throws: ``BatchedCacheError`` when a layer's cache has no batched counterpart.
-public func makeBatchedCacheFactories(for probe: [any KVCache]) throws -> [BatchedCacheFactory] {
-    try probe.enumerated().map { layer, cache in
-        try makeBatchedCacheFactory(for: cache, layer: layer, path: "layer")
+/// - Throws: ``BatchedCacheError`` when the type has no batched form, when the
+///   rows do not share one type, or when a rotating cache keeps a prefix or a
+///   rewind reserve.
+public func mergeCaches(_ caches: [any KVCache]) throws -> any BatchedCache {
+    guard let first = caches.first else {
+        throw BatchedCacheError.unsupportedCache(cacheType: "none", reason: "merge needs a cache")
     }
-}
-
-private func makeBatchedCacheFactory(
-    for cache: any KVCache, layer: Int, path: String
-) throws -> BatchedCacheFactory {
-    func unsupported(_ reason: String) -> BatchedCacheError {
-        .unsupportedCacheTopology(
-            layer: layer, path: path, cacheType: String(describing: type(of: cache)),
-            reason: reason)
-    }
-
-    if let list = cache as? CacheList {
-        let children = try list.children.enumerated().map { index, child in
-            try makeBatchedCacheFactory(
-                for: child, layer: layer, path: "\(path).children[\(index)]")
-        }
-        return { leftPadding in BatchedCacheList(caches: children.map { $0(leftPadding) }) }
-    }
-
-    // Exact types: subclasses such as ChunkedKVCache behave differently.
-    if type(of: cache) == KVCacheSimple.self {
-        return { BatchKVCache(leftPadding: $0) }
-    }
-    if type(of: cache) == RotatingKVCache.self, let rotating = cache as? RotatingKVCache {
-        // A pinned prefix would pin padding, and a batch has no rewind reserve.
-        guard rotating.preservedPrefixTokens == 0 else {
-            throw unsupported("A RotatingKVCache with keep > 0 has no batched form.")
-        }
-        guard rotating.rewindCapacity == 0 else {
-            throw unsupported("A RotatingKVCache with a rewind reserve has no batched form.")
-        }
-        let window = rotating.maxSize ?? 0
-        let step = rotating.allocationStep
-        let capacityOrigin = rotating.capacityOrigin
-        return { leftPadding in
-            let cache = BatchRotatingKVCache(maxSize: window, leftPadding: leftPadding)
-            cache.step = step
-            cache.capacityOrigin = capacityOrigin
-            return cache
-        }
-    }
-    if type(of: cache) == MambaCache.self {
-        return { MambaCache(leftPadding: recurrentLeftPadding($0)) }
-    }
-    if type(of: cache) == ArraysCache.self, let arrays = cache as? ArraysCache {
-        let slotCount = arrays.slotCount
-        return { ArraysCache(size: slotCount, leftPadding: recurrentLeftPadding($0)) }
-    }
-    throw unsupported("No batched cache implementation exists for this cache type.")
-}
-
-/// `nil` for an all-zero left padding, so a recurrent cache masks with the lengths
-/// `prepare(lengths:)` sets. An empty batch keeps its zero rows.
-private func recurrentLeftPadding(_ leftPadding: [Int]) -> [Int]? {
-    leftPadding.isEmpty || leftPadding.contains { $0 != 0 } ? leftPadding : nil
-}
-
-// MARK: - Composite and recurrent caches
-
-/// A ``CacheList`` whose children are batched caches, for layers that hold several caches.
-public final class BatchedCacheList: CacheList, BatchedCache {
-    /// A batch cannot be restored from a prompt cache file.
-    public override class var serializedClassName: String? { nil }
-
-    init(caches: [any BatchedCache]) {
-        super.init(caches: caches)
-    }
-
-    private var batchedChildren: [any BatchedCache] {
-        children.map { child in
-            guard let child = child as? any BatchedCache else {
-                preconditionFailure("A BatchedCacheList child must stay a BatchedCache")
+    let cacheType = String(describing: type(of: first))
+    func rows<T: KVCache>(as _: T.Type) throws -> [T] {
+        try caches.map { cache in
+            guard type(of: cache) == T.self, let row = cache as? T else {
+                throw BatchedCacheError.unsupportedCache(
+                    cacheType: cacheType, reason: "Rows must share one cache type.")
             }
-            return child
+            return row
         }
     }
-
-    public func filter(batchIndices: MLXArray) {
-        for child in batchedChildren {
-            child.filter(batchIndices: batchIndices)
-        }
-    }
-
-    public func extend(other: any BatchedCache) {
-        guard let other = other as? BatchedCacheList, other.children.count == children.count
-        else {
-            preconditionFailure(
-                "BatchedCacheList can only be extended with a BatchedCacheList of the same layout")
-        }
-        for (child, added) in zip(batchedChildren, other.batchedChildren) {
-            child.extend(other: added)
-        }
-    }
-
-    public func extract(_ index: Int) -> any KVCache {
-        CacheList(caches: batchedChildren.map { $0.extract(index) })
-    }
-
-    /// The mask of the first child with per-row positions, so it excludes left padding.
-    public override func makeMask(
-        n: Int, windowSize: Int?, returnArray: Bool
-    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        if let child = batchedChildren.first(where: { $0 is any BatchPositionedKVCache }) {
-            return child.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
-        }
-        return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
-    }
-
-    public override func copy() -> any KVCache {
-        BatchedCacheList(
-            caches: batchedChildren.map { child in
-                guard let copy = child.copy() as? any BatchedCache else {
-                    preconditionFailure("A BatchedCache copy must stay a BatchedCache")
-                }
-                return copy
-            })
+    switch first {
+    case is CacheList:
+        return try CacheList.merge(try rows(as: CacheList.self))
+    case is MambaCache:
+        return ArraysCache.merge(try rows(as: MambaCache.self))
+    case is ArraysCache:
+        return ArraysCache.merge(try rows(as: ArraysCache.self))
+    case is RotatingKVCache:
+        return try RotatingKVCache.merge(try rows(as: RotatingKVCache.self))
+    case is KVCacheSimple where type(of: first) == KVCacheSimple.self:
+        return KVCacheSimple.merge(try rows(as: KVCacheSimple.self))
+    default:
+        throw BatchedCacheError.unsupportedCache(
+            cacheType: cacheType,
+            reason: "No batched cache implementation exists for this cache type.")
     }
 }
+
+// MARK: - Recurrent caches
 
 extension ArraysCache: BatchedCache {
+    /// The rows of `caches` as one cache. Recurrent state has no padding to
+    /// align, so this is the first row extended by the rest; a batch of
+    /// `MambaCache` stays a `MambaCache`. A row with no state yet counts as
+    /// one row only once it holds arrays, so when any row is populated the
+    /// empty ones get zero state of the same shape first. An all-empty merge
+    /// stays empty and takes its row count from the first update.
+    public static func merge(_ caches: [ArraysCache]) -> ArraysCache {
+        precondition(!caches.isEmpty, "merge needs a cache")
+        func isEmpty(_ cache: ArraysCache) -> Bool {
+            (0 ..< cache.slotCount).allSatisfy { cache[$0] == nil }
+        }
+        let template = caches.first { !isEmpty($0) }
+        let rows: [ArraysCache] = caches.map { cache in
+            guard let row = cache.copy() as? ArraysCache else {
+                preconditionFailure("An ArraysCache copy must stay an ArraysCache")
+            }
+            guard let template, isEmpty(row) else { return row }
+            for slot in 0 ..< row.slotCount {
+                if let example = template[slot] {
+                    row[slot] = MLXArray.zeros(
+                        [1] + Array(example.shape.dropFirst()), dtype: example.dtype)
+                }
+            }
+            return row
+        }
+        let merged = rows[0]
+        for row in rows.dropFirst() {
+            merged.extend(other: row)
+        }
+        return merged
+    }
+
     public func extend(other: any BatchedCache) {
         guard let other = other as? ArraysCache else {
             preconditionFailure("ArraysCache can only be extended with an ArraysCache")
@@ -183,5 +125,54 @@ extension ArraysCache: BatchedCache {
         row.leftPadding = leftPadding?[index ..< index + 1]
         row.lengths = lengths?[index ..< index + 1]
         return row
+    }
+}
+
+// MARK: - Composite caches
+
+extension CacheList: BatchedCache {
+    /// The rows of `caches`, composite caches of one layout, as one composite
+    /// whose children are batched. Each child position merges on its own type.
+    public static func merge(_ caches: [CacheList]) throws -> CacheList {
+        precondition(!caches.isEmpty, "merge needs a cache")
+        let width = caches[0].children.count
+        guard caches.allSatisfy({ $0.children.count == width }) else {
+            throw BatchedCacheError.unsupportedCache(
+                cacheType: "CacheList", reason: "Rows must share one layout.")
+        }
+        let merged = try (0 ..< width).map { index in
+            try mergeCaches(caches.map { $0.children[index] }) as any KVCache
+        }
+        return CacheList(caches: merged)
+    }
+
+    private var batchedChildren: [any BatchedCache] {
+        children.map { child in
+            guard let child = child as? any BatchedCache else {
+                preconditionFailure("A batched CacheList child must be a BatchedCache")
+            }
+            return child
+        }
+    }
+
+    public func filter(batchIndices: MLXArray) {
+        for child in batchedChildren {
+            child.filter(batchIndices: batchIndices)
+        }
+    }
+
+    public func extend(other: any BatchedCache) {
+        guard let other = other as? CacheList, other.children.count == children.count
+        else {
+            preconditionFailure(
+                "A CacheList can only be extended with a CacheList of the same layout")
+        }
+        for (child, added) in zip(batchedChildren, other.batchedChildren) {
+            child.extend(other: added)
+        }
+    }
+
+    public func extract(_ index: Int) -> any KVCache {
+        CacheList(caches: batchedChildren.map { $0.extract(index) })
     }
 }

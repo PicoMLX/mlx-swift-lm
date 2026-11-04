@@ -64,7 +64,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     /// Whether any row carries left padding.
     private var hasLeftPadding: Bool { leftPaddingValues.contains { $0 != 0 } }
 
-    private func setPositions(_ new: [Int32]) {
+    fileprivate func setPositions(_ new: [Int32]) {
         positions = new
         positionsArray = nil
     }
@@ -290,21 +290,40 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         return cache
     }
 
-    /// A batch of one row holding the sequence in `cache`.
-    public static func fromSingle(_ cache: KVCacheSimple) -> BatchKVCache {
-        // Exact type: a ChunkedKVCache can report an offset beyond the arrays it holds.
-        precondition(
-            type(of: cache) == KVCacheSimple.self,
-            "BatchKVCache.fromSingle requires a KVCacheSimple")
-        let batch = BatchKVCache(leftPadding: [0])
-        if let keys = cache.keys, let values = cache.values {
-            // New array objects, so writes to the batch leave `cache` unchanged.
-            batch.keys = keys[.ellipsis]
-            batch.values = values[.ellipsis]
-            batch.offset = cache.offset
-            batch.setPositions([Int32(cache.offset)])
+    /// The rows of `caches` as one batch, left-padded to the longest row.
+    fileprivate convenience init(merging caches: [KVCacheSimple]) {
+        let longest = caches.map(\.offset).max() ?? 0
+        self.init(leftPadding: caches.map { longest - $0.offset })
+        // An all-empty merge is an empty batch; the first update sizes it.
+        guard let template = caches.first(where: { $0.keys != nil }),
+            let templateKeys = template.keys, let templateValues = template.values
+        else { return }
+        var keys: [MLXArray] = []
+        var values: [MLXArray] = []
+        for cache in caches {
+            if let rowKeys = cache.keys, let rowValues = cache.values, cache.offset > 0 {
+                // Slice off allocation slack, then pad on the left to `longest`.
+                let row = rightJustify(
+                    rowKeys[.ellipsis, ..<cache.offset, 0...],
+                    rowValues[.ellipsis, ..<cache.offset, 0...],
+                    end: cache.offset, to: longest, width: longest)
+                keys.append(row.keys)
+                values.append(row.values)
+            } else {
+                keys.append(
+                    MLXArray.zeros(
+                        [1, templateKeys.dim(1), longest, templateKeys.dim(3)],
+                        dtype: templateKeys.dtype))
+                values.append(
+                    MLXArray.zeros(
+                        [1, templateValues.dim(1), longest, templateValues.dim(3)],
+                        dtype: templateValues.dtype))
+            }
         }
-        return batch
+        self.keys = concatenated(keys)
+        self.values = concatenated(values)
+        offset = longest
+        setPositions(caches.map { Int32($0.offset) })
     }
 
     public override func copy() -> any KVCache {
@@ -317,6 +336,20 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         copy.offset = offset
         copy.step = step
         return copy
+    }
+}
+
+extension KVCacheSimple {
+    /// The rows of `caches` as one batch, left-padded so every row ends at the
+    /// longest row's position. Port of mlx-lm's `KVCache.merge`. Every cache
+    /// must be exactly a `KVCacheSimple`; empty caches become empty rows.
+    public static func merge(_ caches: [KVCacheSimple]) -> BatchKVCache {
+        precondition(!caches.isEmpty, "merge needs a cache")
+        // Exact type: a ChunkedKVCache can report an offset beyond the arrays it holds.
+        precondition(
+            caches.allSatisfy { type(of: $0) == KVCacheSimple.self },
+            "KVCacheSimple.merge takes exactly KVCacheSimple rows")
+        return BatchKVCache(merging: caches)
     }
 }
 
