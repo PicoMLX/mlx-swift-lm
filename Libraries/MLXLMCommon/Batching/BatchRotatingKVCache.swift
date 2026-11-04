@@ -56,7 +56,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     public var batchSize: Int { leftPadding.dim(0) }
 
     /// Per-row positions, also when the cache is typed as `KVCache`.
-    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset) }
 
     public override func innerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }

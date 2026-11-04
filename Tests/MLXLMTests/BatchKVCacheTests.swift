@@ -153,6 +153,63 @@ struct BatchKVCacheTests {
         #expect(sourceKeys[0, 0, 0..., 0].asArray(Float.self) == [0, 1, 70])
     }
 
+    @Test("One token with no left padding needs no mask; padding brings it back")
+    func oneTokenWithoutPaddingHasNoMask() throws {
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        guard case .none = cache.makeMask(n: 1, windowSize: nil, returnArray: false) else {
+            Issue.record("unpadded rows must decode one token without a mask")
+            return
+        }
+        guard case .array = cache.makeMask(n: 2, windowSize: nil, returnArray: false) else {
+            Issue.record("more than one token keeps the explicit mask")
+            return
+        }
+
+        // Joining a shorter row pads it, so the one-token mask returns.
+        let added = BatchKVCache(leftPadding: [0])
+        let addedKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = added.update(keys: addedKV.0, values: addedKV.1)
+        cache.extend(other: added)
+        guard case .array(let mask) = cache.makeMask(n: 1, windowSize: nil, returnArray: false)
+        else {
+            Issue.record("a padded batch must mask its padding")
+            return
+        }
+        #expect(mask[2, 0, 0, 0].item(Bool.self) == false)
+
+        // Keeping only the padded row makes its padding shared, which filter drops.
+        cache.filter(batchIndices: batchRows(2))
+        guard case .none = cache.makeMask(n: 1, windowSize: nil, returnArray: false) else {
+            Issue.record("padding dropped by filter must not keep the mask")
+            return
+        }
+        #expect(cache.batchOffset.asArray(Int32.self) == [2])
+        #expect(cache.offset == 2)
+    }
+
+    @Test("A window smaller than the history keeps the one-token mask")
+    func windowKeepsOneTokenMask() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let (keys, values) = makeDistinctKV(batchSize: 1, heads: 2, seqLen: 8, headDim: 4)
+        _ = cache.update(keys: keys, values: values)
+        guard case .none = cache.makeMask(n: 1, windowSize: 9, returnArray: false) else {
+            Issue.record("a window covering every key needs no mask")
+            return
+        }
+        guard case .array(let mask) = cache.makeMask(n: 1, windowSize: 4, returnArray: false)
+        else {
+            Issue.record("a window smaller than the history must keep the mask")
+            return
+        }
+        try #require(mask.shape.last == 9)
+        // The query at position 8 sees positions 5...8 only.
+        #expect(mask[0, 0, 0, 4].item(Bool.self) == false)
+        #expect(mask[0, 0, 0, 5].item(Bool.self) == true)
+        #expect(mask[0, 0, 0, 8].item(Bool.self) == true)
+    }
+
     @Test("The mask excludes each row's left padding, also for one token")
     func maskExcludesLeftPadding() throws {
         let cache = BatchKVCache(leftPadding: [1, 3, 0])
@@ -185,6 +242,30 @@ struct BatchKVCacheTests {
             return
         }
         #expect(offsets.asArray(Int32.self) == [2, 3])
+    }
+
+    @Test("ropeOffset is scalar while every row shares one position")
+    func ropeOffsetScalarForSharedPosition() {
+        let kv = makeKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        let batch = BatchKVCache(leftPadding: [0, 0])
+        _ = batch.update(keys: kv.0, values: kv.1)
+        guard case .scalar(let offset) = batch.ropeOffset else {
+            Issue.record("rows at one position must use the scalar offset")
+            return
+        }
+        #expect(offset == 3)
+        #expect(batch.batchOffset.asArray(Int32.self) == [3, 3])
+
+        // A shorter row joining the batch gives the rows different positions.
+        let added = BatchKVCache(leftPadding: [0])
+        let addedKV = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = added.update(keys: addedKV.0, values: addedKV.1)
+        batch.extend(other: added)
+        guard case .batch(let offsets) = batch.ropeOffset else {
+            Issue.record("rows at different positions must use per-row offsets")
+            return
+        }
+        #expect(offsets.asArray(Int32.self) == [3, 3, 2])
     }
 
     @Test("createCausalMask masks each row's left padding")
