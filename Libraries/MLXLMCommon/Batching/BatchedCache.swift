@@ -77,15 +77,33 @@ public func mergeCaches(_ caches: [any KVCache]) throws -> any BatchedCache {
 
 extension ArraysCache: BatchedCache {
     /// The rows of `caches` as one cache. Recurrent state has no padding to
-    /// align, so this is the first cache's copy extended by the rest; a batch
-    /// of `MambaCache` stays a `MambaCache`.
+    /// align, so this is the first row extended by the rest; a batch of
+    /// `MambaCache` stays a `MambaCache`. A row with no state yet counts as
+    /// one row only once it holds arrays, so when any row is populated the
+    /// empty ones get zero state of the same shape first. An all-empty merge
+    /// stays empty and takes its row count from the first update.
     public static func merge(_ caches: [ArraysCache]) -> ArraysCache {
         precondition(!caches.isEmpty, "merge needs a cache")
-        guard let merged = caches[0].copy() as? ArraysCache else {
-            preconditionFailure("An ArraysCache copy must stay an ArraysCache")
+        func isEmpty(_ cache: ArraysCache) -> Bool {
+            (0 ..< cache.slotCount).allSatisfy { cache[$0] == nil }
         }
-        for cache in caches.dropFirst() {
-            merged.extend(other: cache)
+        let template = caches.first { !isEmpty($0) }
+        let rows: [ArraysCache] = caches.map { cache in
+            guard let row = cache.copy() as? ArraysCache else {
+                preconditionFailure("An ArraysCache copy must stay an ArraysCache")
+            }
+            guard let template, isEmpty(row) else { return row }
+            for slot in 0 ..< row.slotCount {
+                if let example = template[slot] {
+                    row[slot] = MLXArray.zeros(
+                        [1] + Array(example.shape.dropFirst()), dtype: example.dtype)
+                }
+            }
+            return row
+        }
+        let merged = rows[0]
+        for row in rows.dropFirst() {
+            merged.extend(other: row)
         }
         return merged
     }

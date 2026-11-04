@@ -43,6 +43,33 @@ struct BatchedHybridCacheTests {
         #expect(mask.asArray(Bool.self) == [true, false, true, true])
     }
 
+    @Test("merge keeps every empty recurrent row ahead of a populated one")
+    func mergeKeepsEmptyRecurrentRows() throws {
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        populated[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
+
+        let merged = try #require(
+            ArraysCache.merge([MambaCache(), MambaCache(), populated]) as? MambaCache)
+        #expect(merged.batchSize == 4)
+        let first = try #require(merged[0])
+        #expect(first.shape == [4, 4])
+        #expect(first[0 ..< 2].sum().item(Float.self) == 0, "empty rows hold zero state")
+        #expect(maxAbsDifference(first[2 ..< 4], try #require(populated[0])) == 0)
+        #expect(maxAbsDifference(try #require(merged[1])[2 ..< 4], try #require(populated[1])) == 0)
+
+        // A hybrid list merged the same way keeps its children's rows aligned:
+        // two empty sequences and one with recurrent state make three rows.
+        let one = MambaCache()
+        one[0] = MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4])
+        let list = try CacheList.merge([
+            CacheList(KVCacheSimple(), MambaCache()), CacheList(KVCacheSimple(), MambaCache()),
+            CacheList(KVCacheSimple(), one),
+        ])
+        #expect((list[0] as? BatchKVCache)?.batchSize == 3)
+        #expect((list[1] as? MambaCache)?.batchSize == 3)
+    }
+
     @Test("A recurrent batch with zero rows stays empty until extended")
     func recurrentZeroRows() throws {
         let empty = MambaCache(leftPadding: [])
