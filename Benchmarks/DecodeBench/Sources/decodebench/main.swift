@@ -78,6 +78,8 @@ func median(_ values: [Double]) -> Double {
     let cache = rows[0].indices.map { layer in
         KVCacheSimple.merge(rows.map { $0[layer] }) as any KVCache
     }
+    // The merge is lazy; settle it so batch assembly is not charged to the decode.
+    eval(cache)
 
     var tokens = [[Int]](repeating: [], count: prompts.count)
     var current = MLXArray(first)
