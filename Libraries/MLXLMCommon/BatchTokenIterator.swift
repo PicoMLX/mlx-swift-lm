@@ -9,9 +9,10 @@ import MLXNN
 /// The batched form of ``TokenIterator``: port of mlx-vlm's `BatchGenerator`
 /// (`mlx_vlm/generate/ar.py`) and mlx-lm's (`mlx_lm/generate.py`), without their prompt
 /// scheduling. Prompts queued with ``insert(prompts:maxTokens:caches:samplers:processors:)``
-/// are prefilled together on the next call to ``next()``, right-padded in chunks, then their
-/// caches are merged into the decoding batch. Every ``next()`` decodes one token for every
-/// row; a row leaves when it emits a stop token or reaches its limit, or when it is removed.
+/// are prefilled on the next call to ``next()``, one at a time through the model's own
+/// prefill, then their caches are merged into the decoding batch. Every ``next()`` decodes
+/// one token for every row; a row leaves when it emits a stop token or reaches its limit, or
+/// when it is removed.
 ///
 /// One sampler draws the whole `[B, V]` batch when every row shares one; otherwise each row
 /// is sampled on its own, so a row with a seeded sampler draws the tokens it would draw
@@ -165,27 +166,26 @@ public struct BatchTokenIterator {
     private mutating func admit() throws {
         let admitted = pending
         pending = []
-        let caches = try admitted.map { try $0.cache ?? model.newCache(parameters: nil) }
+
+        // Everything but each prompt's last token goes into its own cache first, through the
+        // model's prefill (chunked; the cache is evaluated, the logits never are), and the
+        // rows merge after. Rows are not prefilled together right-padded: the recurrent
+        // models' scans do not honour the prepared lengths yet. The last token is the first
+        // decode step's input, as in mlx-lm, so its logits give the first sample.
+        let caches = try admitted.map { pending -> [KVCache] in
+            let cache = try pending.cache ?? model.newCache(parameters: nil)
+            let body = pending.prompt.dropLast().map { Int32($0) }
+            guard !body.isEmpty else { return cache }
+            let prepared = try model.prepare(
+                LMInput(tokens: MLXArray(body)), cache: cache, state: nil, prefill: prefill)
+            if case .tokens(let remainder) = prepared {
+                _ = model(remainder.tokens[.newAxis], cache: cache)
+            }
+            eval(cache)
+            return cache
+        }
         let merged = try caches[0].indices.map { layer in
             try mergeCaches(caches.map { $0[layer] })
-        }
-
-        // Everything but each prompt's last token goes into the cache now; the last token is
-        // the first decode step's input, as in mlx-lm, so its logits give the first sample.
-        let bodies = admitted.map { $0.prompt.dropLast().map { Int32($0) } }
-        let longest = bodies.map(\.count).max() ?? 0
-        if longest > 0 {
-            let padded = MLXArray(
-                bodies.flatMap { $0 + Array(repeating: 0, count: longest - $0.count) }
-            ).reshaped([bodies.count, longest])
-            try withPreparedCache(merged, lengths: bodies.map(\.count)) {
-                let processed = try prefill.forEachChunk(total: longest, reserving: 0) { range in
-                    eval(model(padded[0..., range], cache: merged))
-                }
-                if processed < longest {
-                    eval(model(padded[0..., processed...], cache: merged))
-                }
-            }
         }
 
         // The new rows take their first step alone: the decoding rows' next tokens are

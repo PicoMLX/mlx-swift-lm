@@ -157,6 +157,21 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("A ragged batch of a recurrent model starts every row like the prompt alone")
+    func recurrentRows() throws {
+        // On the default device: the state-space scan is a Metal kernel. The first token of
+        // each row comes from its own prefill, so it must match exactly; later steps run a
+        // two-row scan whose arithmetic differs from the one-row scan.
+        let model = try tinyMamba2()
+        let prompts: [[Int]] = [[1, 2, 3], [4, 5, 6, 7, 8]]
+        let expected = try prompts.map { prompt in
+            try generateAlone(model, prompt: prompt, sampler: ArgMaxSampler(), maxTokens: 4)
+        }
+        let actual = try batchGenerate(model: model, prompts: prompts, maxTokens: 4)
+        #expect(actual.map(\.count) == [4, 4])
+        #expect(actual.map { $0[0] } == expected.map { $0[0] })
+    }
+
     @Test("Top-p keeps the top token when its threshold would remove every token")
     func topPKeepsTopToken() {
         // 1 - 1e-9 rounds to 1 in float32, which no cumulative probability exceeds.
@@ -194,6 +209,25 @@ struct BatchTokenIteratorTests {
         #expect(throws: KVCacheError.self) { _ = try mergeCaches([QuantizedKVCache()]) }
         #expect(throws: KVCacheError.self) { _ = try mergeCaches([ChunkedKVCache(chunkSize: 4)]) }
         #expect(throws: KVCacheError.self) { _ = try QuantizedKVCache.merge([QuantizedKVCache()]) }
+    }
+}
+
+private func tinyMamba2() throws -> Mamba2Model {
+    let configuration = try JSONDecoder().decode(
+        Mamba2Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "mamba2", "num_heads": 4, "head_dim": 4, "vocab_size": 32,
+              "hidden_size": 16, "state_size": 8, "num_hidden_layers": 2,
+              "layer_norm_epsilon": 1e-5, "conv_kernel": 4, "n_groups": 1, "use_bias": false,
+              "use_conv_bias": true, "tie_word_embeddings": false, "time_step_limit": [0.0, 100.0]
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 601)) {
+        let model = Mamba2Model(configuration)
+        eval(model)
+        return model
     }
 }
 
