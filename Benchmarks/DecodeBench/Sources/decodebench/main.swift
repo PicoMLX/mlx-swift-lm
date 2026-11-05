@@ -86,13 +86,16 @@ func median(_ values: [Double]) -> Double {
     eval(current)
     let start = ContinuousClock.now
     for _ in 0 ..< decodeTokens {
-        let logits = model(current[0..., .newAxis], cache: cache)
-        let next = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
-        asyncEval(next)
-        for (row, token) in current.asArray(Int32.self).enumerated() {
-            tokens[row].append(Int(token))
+        // Settle the cache with the token and drain temporaries each step, as TokenIterator does.
+        autoreleasepool {
+            let logits = model(current[0..., .newAxis], cache: cache)
+            let next = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
+            asyncEval([next] + cache.flatMap { $0.state })
+            for (row, token) in current.asArray(Int32.self).enumerated() {
+                tokens[row].append(Int(token))
+            }
+            current = next
         }
-        current = next
     }
     eval(current)
     let elapsed = seconds(since: start)

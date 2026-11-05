@@ -92,8 +92,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
                 batchOffset = batchOffset - roll
             }
 
-            // Keep `window - 1` old positions, so every new token sees a full window.
-            let trimSize = idx - window + 1
+            // Keep `window - 1` old positions, so every new token sees a full window. A ragged
+            // prefill keeps everything until it finalizes: a row that is complete would lose
+            // real tokens to the padding chunks of the rows still being filled.
+            let trimSize = lengths == nil ? idx - window + 1 : 0
             if trimSize > 0 {
                 leftPadding = leftPadding - Int32(trimSize)
                 self.keys = concatenated([self.keys![.ellipsis, trimSize..., 0...], keys], axis: 2)
@@ -233,9 +235,18 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         return min(written, max(0, shortest))
     }
 
+    /// Positions the longest row no longer retains.
+    public override var evictedTokenCount: Int {
+        guard batchSize > 0 else { return 0 }
+        let retained = rotated ? (keys?.dim(2) ?? 0) : idx
+        return Swift.max(0, Int(batchOffset.max().item(Int32.self)) - retained)
+    }
+
+    /// Rewinds the newest `n` positions, at most ``maxTrimCount``: nothing once the window has
+    /// filled, because the ring then holds no history to give back.
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(trimLimit, n)
+        let trimmed = min(maxTrimCount, n)
         written -= trimmed
         idx -= trimmed
         batchOffset = batchOffset - Int32(trimmed)
@@ -397,7 +408,9 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let windowSize = windowSize ?? window
-        let offset = min(window - 1, written)
+        // A ragged prefill presents every position it has kept; otherwise at most the window.
+        let retained = rotated ? (keys?.dim(2) ?? 0) : idx
+        let offset = lengths == nil ? min(window - 1, written) : retained
         let rinds = MLXArray(Int32(0) ..< Int32(offset + n))[.newAxis]
         let linds = MLXArray(Int32(offset) ..< Int32(offset + n))[0..., .newAxis]
         var mask = (linds .>= rinds) & (linds .< rinds + Int32(windowSize))
@@ -406,7 +419,9 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         // trims it to `window - 1` positions. Predict that trim.
         let concatenates = n != 1 || lengths != nil
         var padding = leftPadding
-        let trimSize = (concatenates && rotated ? window : idx) - window + (concatenates ? 1 : 0)
+        let trimSize =
+            lengths != nil
+            ? 0 : (concatenates && rotated ? window : idx) - window + (concatenates ? 1 : 0)
         if trimSize > 0 {
             padding = padding - Int32(trimSize)
         }
