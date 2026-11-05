@@ -306,6 +306,9 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         // and empty rows join empty rows; a mix would need all-padding rows inside the window.
         guard other.batchSize > 0 else { return }
         precondition(
+            lengths == nil && other.lengths == nil,
+            "BatchRotatingKVCache.extend takes finalized rows; finalize a ragged prefill first")
+        precondition(
             other.keys != nil || keys == nil,
             "BatchRotatingKVCache.extend cannot add empty rows to prefilled rows")
         precondition(
