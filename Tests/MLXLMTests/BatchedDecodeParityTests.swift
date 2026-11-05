@@ -57,10 +57,12 @@ struct BatchedDecodeParityTests {
             eval(model(MLXArray([1, 2, 3]).reshaped([1, 3]), cache: singles[1]))
 
             func batched(_ cache: any KVCache) throws -> any BatchedCache {
-                if let rotating = cache as? RotatingKVCache {
-                    return try #require(BatchRotatingKVCache.fromSingle(rotating))
-                }
-                return BatchKVCache.fromSingle(try #require(cache as? KVCacheSimple))
+                let merged = try mergeCaches([cache])
+                let positioned = try #require(merged as? any BatchPositionedKVCache)
+                #expect(
+                    positioned.batchOffset.asArray(Int.self) == [cache.offset],
+                    "a one-row merge keeps the row's position")
+                return merged
             }
             let batch = try singles[0].map(batched)
             for layer in batch.indices {
@@ -135,8 +137,9 @@ private func expectBatchedRowsMatchSingles(_ model: any LanguageModel) throws {
         expected.append(logits[0..., (prompt.count - 1) ..< prompt.count, 0...])
     }
 
-    let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-    let batched = factories.map { $0([0, 0]) }
+    // One fresh single cache per row, merged per layer into the empty batch.
+    let fresh = try prompts.map { _ in try model.newCache(parameters: nil) }
+    let batched = try fresh[0].indices.map { layer in try mergeCaches(fresh.map { $0[layer] }) }
     let caches = batched.map { $0 as any KVCache }
     batched.forEach { $0.prepare(lengths: prompts.map(\.count)) }
     let padded = prompts.flatMap { $0 + Array(repeating: 0, count: longest - $0.count) }

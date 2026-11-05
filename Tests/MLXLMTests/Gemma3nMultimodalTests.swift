@@ -139,8 +139,8 @@ struct Gemma3nMultimodalTests {
             for (row, prompt) in prompts.enumerated() {
                 expected.append(model(MLXArray(prompt).reshaped(1, -1), cache: singles[row])[0, -1])
             }
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-            let batched = factories.map { $0([0, 0]) }
+            let probe = try model.newCache(parameters: nil)
+            let batched = try probe.map { try mergeCaches([$0, $0]) }
             #expect(batched.count == 2)
             batched.forEach { $0.prepare(lengths: [3, 7]) }
             let padded = prompts.flatMap { $0 + Array(repeating: 0, count: 7 - $0.count) }
@@ -274,8 +274,8 @@ struct Gemma3nMultimodalTests {
                 return
             }
             eval(model(MLXArray(textIDs).reshaped(1, 2), cache: singles[1]))
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-            let batch = factories.map { $0([0, 0]) }
+            let probe = try model.newCache(parameters: nil)
+            let batch = try probe.map { try mergeCaches([$0, $0]) }
             let caches = batch.map { $0 as any KVCache }
             let input = LMInput(
                 text: .init(
