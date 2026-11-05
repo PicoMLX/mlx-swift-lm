@@ -233,8 +233,11 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
 
     public override var isTrimmable: Bool { isTrimmable(after: 0) }
 
+    /// A row that has evicted history cannot rewind exactly: replaying a trimmed token would
+    /// see a window without the positions it saw. A merged row can hold less than a window
+    /// and still have evicted, so `written` alone does not say.
     public override func isTrimmable(after positions: Int) -> Bool {
-        written + positions < window
+        written + positions < window && evictedTokenCount == 0
     }
 
     /// What ``trim(_:)`` removes, while the window has not filled.
