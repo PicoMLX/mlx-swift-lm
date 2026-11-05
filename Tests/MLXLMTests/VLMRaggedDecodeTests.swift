@@ -105,10 +105,12 @@ private func expectRaggedDecode(
         return cache
     }
     func batched(_ cache: any KVCache) throws -> any BatchedCache {
-        if let rotating = cache as? RotatingKVCache {
-            return try #require(BatchRotatingKVCache.fromSingle(rotating))
-        }
-        return BatchKVCache.fromSingle(try #require(cache as? KVCacheSimple))
+        let merged = try mergeCaches([cache])
+        let positioned = try #require(merged as? any BatchPositionedKVCache)
+        #expect(
+            positioned.batchOffset.asArray(Int.self) == [cache.offset],
+            "a one-row merge keeps the row's position")
+        return merged
     }
 
     let singles = try inputs.map(prefill)

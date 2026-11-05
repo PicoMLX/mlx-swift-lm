@@ -75,8 +75,8 @@ func decode(_ model: Gemma3nTextModel, batched: Bool, media: Bool) throws -> [ML
         }
         return outputs
     }
-    let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-    let batch = factories.map { $0([0, 0]) }
+    let probe = try model.newCache(parameters: nil)
+    let batch = try probe.map { try mergeCaches([$0, $0]) }
     batch.forEach { $0.prepare(lengths: [3, 7]) }
     let cache = batch.map { $0 as any KVCache }
     let row: [Int32] = media ? [1, 50, 50, 0, 0, 0, 0] : [1, 2, 3, 0, 0, 0, 0]
