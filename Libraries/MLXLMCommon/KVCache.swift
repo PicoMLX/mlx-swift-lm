@@ -690,6 +690,9 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     package var preservedPrefixTokens: Int { keep }
 
+    /// The number of positions the buffer grows by.
+    package var allocationStep: Int { step }
+
     public override var maxSize: Int? { maxCacheSize }
 
     public override var evictedTokenCount: Int {

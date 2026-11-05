@@ -117,6 +117,11 @@ public func validateKVCacheCompatibility(
             case .rotating(let rotating):
                 return rotating.maxSize != capacity.maxTokens
                     || rotating.preservedPrefixTokens != capacity.preservedPrefixTokens
+            case .batchedRotating(let batch) where batch.capacityOrigin == .modelNative:
+                return false
+            case .batchedRotating(let batch):
+                // A batch keeps no prefix, so a requested prefix is not applied to it.
+                return batch.maxSize != capacity.maxTokens || capacity.preservedPrefixTokens != 0
             default:
                 return true
             }
@@ -214,6 +219,8 @@ extension KVCacheLeaf {
                 nil
             case .rotating(let rotating):
                 rotating.capacityOrigin == .requested ? .requested : .modelDefined
+            case .batchedRotating(let batch):
+                batch.capacityOrigin == .requested ? .requested : .modelDefined
             default:
                 cache.maxSize == nil ? .unbounded : .implementationDefined
             }
@@ -262,7 +269,7 @@ extension KVCacheLeaf {
                 resolvedStrategy: .affine,
                 reason: isBoundaryProtection
                     ? .boundaryProtection : (matches ? nil : .differentStrategy))
-        case .rotating:
+        case .rotating, .batchedRotating:
             return status(
                 state: requested == .fullPrecision ? .active : .skipped,
                 resolvedStrategy: .fullPrecision,
