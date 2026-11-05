@@ -60,10 +60,12 @@ extension ArraysCache {
                 preconditionFailure("An ArraysCache copy must stay an ArraysCache")
             }
             guard let template, isEmpty(row) else { return row }
+            // An empty cache may already stand for several rows (its padding says how many).
+            let rowCount = row.batchSize
             for slot in 0 ..< row.slotCount {
                 if let example = template[slot] {
                     row[slot] = MLXArray.zeros(
-                        [1] + Array(example.shape.dropFirst()), dtype: example.dtype)
+                        [rowCount] + Array(example.shape.dropFirst()), dtype: example.dtype)
                 }
             }
             return row

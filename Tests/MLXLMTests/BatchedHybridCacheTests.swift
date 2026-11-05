@@ -195,6 +195,42 @@ struct BatchedHybridCacheTests {
                 == 0)
     }
 
+    @Test("merge gives an empty input's rows zero state, however many it stands for")
+    func mergeKeepsEmptyInputRows() throws {
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])
+        let merged = try #require(
+            ArraysCache.merge([MambaCache(leftPadding: [0, 0]), populated]) as? MambaCache)
+        #expect(merged.batchSize == 3)
+        #expect(try #require(merged[0]).shape == [3, 4])
+        #expect(merged.leftPadding?.shape == [3])
+        #expect(maxAbsDifference(try #require(merged[0])[2 ..< 3], try #require(populated[0])) == 0)
+
+        let none = try #require(
+            ArraysCache.merge([MambaCache(leftPadding: []), populated]) as? MambaCache)
+        #expect(none.batchSize == 1)
+        #expect(try #require(none[0]).shape == [1, 4])
+    }
+
+    @Test("A nested CacheList masks with its batched attention descendant")
+    func nestedCompositeMask() throws {
+        let longer = KVCacheSimple()
+        let kv = makePositionKV(positions: 0 ..< 1, heads: 2, headDim: 4)
+        _ = longer.update(keys: kv.0, values: kv.1)
+        let list = try CacheList.merge([
+            CacheList(MambaCache(), CacheList(KVCacheSimple())),
+            CacheList(MambaCache(), CacheList(longer)),
+        ])
+        guard case .array(let mask) = list.makeMask(n: 1, windowSize: nil, returnArray: false)
+        else {
+            Issue.record("A nested batched CacheList must use its attention descendant's mask")
+            return
+        }
+        #expect(mask.dim(0) == 2)
+        #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+        #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
+    }
+
     @Test("A merged CacheList masks with its attention child's left padding")
     func compositeMask() throws {
         // Row 1 holds one token, row 0 none, so the merge pads row 0 by one.
