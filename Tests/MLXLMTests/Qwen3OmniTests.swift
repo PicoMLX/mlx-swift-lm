@@ -215,8 +215,8 @@ struct Qwen3OmniTests {
                         state: nil
                     ).logits[0, -1])
             }
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-            let batched = factories.map { $0([0, 0]) }
+            let probe = try model.newCache(parameters: nil)
+            let batched = try probe.map { try mergeCaches([$0, $0]) }
             let caches = batched.map { $0 as KVCache }
             for cache in batched { cache.prepare(lengths: [3, 6]) }
             let padded = prompts.flatMap { $0 + Array(repeating: 0, count: 6 - $0.count) }
@@ -249,14 +249,7 @@ struct Qwen3OmniTests {
             _ = try model.prepare(
                 mediaInput(f), cache: mediaCache, state: nil, prefill: .init(stepSize: 7))
             let references = [mediaCache.map { $0.copy() }, singles[0].map { $0.copy() }]
-            func adopt(_ cache: KVCache) throws -> any BatchedCache {
-                if let list = cache as? CacheList {
-                    return BatchedCacheList(caches: [
-                        try adopt(list[0]), try #require(list[1].copy() as? ArraysCache),
-                    ])
-                }
-                return BatchKVCache.fromSingle(try #require(cache as? KVCacheSimple))
-            }
+            func adopt(_ cache: KVCache) throws -> any BatchedCache { try mergeCaches([cache]) }
             let mixed = try mediaCache.map(adopt)
             for index in mixed.indices { mixed[index].extend(other: try adopt(singles[0][index])) }
             for step in 0 ..< 4 {

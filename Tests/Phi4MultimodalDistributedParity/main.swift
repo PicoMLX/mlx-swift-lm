@@ -30,8 +30,10 @@ func makeModel(quantized: Bool) throws -> Phi4Multimodal {
 }
 
 func decode(_ model: Phi4Multimodal, modes: [Float], media: Bool = false) throws -> [MLXArray] {
-    let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-    let batch = factories.map { $0([0, 0]) }
+    let emptyRows = try (0 ..< 2).map { _ in try model.newCache(parameters: nil) }
+    let batch = try emptyRows[0].indices.map { layer in
+        try mergeCaches(emptyRows.map { $0[layer] })
+    }
     let caches = batch.map { $0 as any KVCache }
     for cache in caches {
         guard let composite = cache as? CacheList, let state = composite[1] as? ArraysCache else {
