@@ -209,12 +209,11 @@ struct DeepSeekOCRTests {
                 Self.imageInput(ocr2: ocr2), cache: singles[0], state: nil, prefill: .init())
             eval(model(MLXArray([6, 7, 8, 9]).reshaped(1, -1), cache: singles[1]))
             let batch = try singles[1].map {
-                BatchKVCache.fromSingle(try #require($0 as? KVCacheSimple))
+                try mergeCaches([$0])
             }
             for index in batch.indices {
                 batch[index].extend(
-                    other: BatchKVCache.fromSingle(
-                        try #require(singles[0][index] as? KVCacheSimple)))
+                    other: try mergeCaches([singles[0][index]]))
             }
             let output = model(
                 MLXArray([12, 13]).reshaped(2, 1), cache: batch.map { $0 as any KVCache })

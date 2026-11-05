@@ -54,9 +54,9 @@ func outputs(_ model: DeepSeekOCR, ocr2: Bool) throws -> [MLXArray] {
     let textCache = try model.newCache(parameters: nil)
     results.append(
         model(MLXArray([6, 7, 8]).reshaped(1, -1), cache: textCache)[0, -1].asType(.float32))
-    let batch = mediaCache.map { BatchKVCache.fromSingle($0 as! KVCacheSimple) }
+    let batch = try mediaCache.map { try mergeCaches([$0]) }
     for index in batch.indices {
-        batch[index].extend(other: BatchKVCache.fromSingle(textCache[index] as! KVCacheSimple))
+        batch[index].extend(other: try mergeCaches([textCache[index]]))
     }
     for step in 0 ..< 4 {
         let output = model(
