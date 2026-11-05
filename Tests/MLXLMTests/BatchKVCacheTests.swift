@@ -70,11 +70,11 @@ struct BatchKVCacheTests {
 
         cache.finalize()
 
-        let first = cache.extract(0)
+        let first = try #require(cache.extract(0) as? KVCacheSimple)
         #expect(first.offset == 3)
         #expect(try #require(first.keys).asArray(Float.self) == [10, 11, 12])
         #expect(try #require(first.values).asArray(Float.self) == [20, 22, 24])
-        let second = cache.extract(1)
+        let second = try #require(cache.extract(1) as? KVCacheSimple)
         #expect(second.offset == 5)
         #expect(try #require(second.keys).asArray(Float.self) == [20, 21, 22, 23, 24])
         #expect(try #require(second.values).asArray(Float.self) == [40, 42, 44, 46, 48])

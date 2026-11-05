@@ -275,8 +275,8 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
         offset = end
     }
 
-    /// The row at `index` without its left padding, as a single-sequence cache.
-    public func extract(_ index: Int) -> KVCacheSimple {
+    /// The row at `index` without its left padding, as a ``KVCacheSimple``.
+    public func extract(_ index: Int) -> any KVCache {
         let cache = KVCacheSimple()
         let padding = Int(leftPaddingValues[index])
         if let keys, let values {

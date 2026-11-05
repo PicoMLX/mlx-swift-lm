@@ -70,7 +70,7 @@ func median(_ values: [Double]) -> Double {
     var rows: [[KVCacheSimple]] = []
     var first: [Int32] = []
     for prompt in prompts {
-        let cache = try model.newCache(parameters: nil).map { $0 as! KVCacheSimple }
+        let cache = try model.newCache(parameters: nil).compactMap { $0 as? KVCacheSimple }
         let logits = model(MLXArray(prompt)[.newAxis], cache: cache)
         first.append(argMax(logits[0, -1]).item(Int32.self))
         rows.append(cache)
@@ -102,6 +102,23 @@ func median(_ values: [Double]) -> Double {
 
 let singlePrompt = prompt(seed: 1)
 let fourPrompts = (1 ... 4).map { prompt(seed: UInt64($0)) }
+// Only plain caches merge so far; other topologies time the single path alone.
+let topology = try model.newCache(parameters: nil)
+guard topology.allSatisfy({ $0 is KVCacheSimple }) else {
+    let kinds = Set(topology.map { String(describing: type(of: $0)) }).sorted()
+    print("cache topology \(kinds) has no batched form yet; timing the single path only")
+    _ = try runSingle(prompt: singlePrompt)
+    var single: [Double] = []
+    for round in 0 ..< rounds {
+        let plain = try runSingle(prompt: singlePrompt)
+        single.append(plain.tokensPerSecond)
+        print(String(format: "round %d  single %.2f tok/s", round + 1, plain.tokensPerSecond))
+        Memory.clearCache()
+    }
+    print(String(format: "median  single %.2f tok/s", median(single)))
+    exit(0)
+}
+
 // Warm up every path once so kernel compilation is not timed.
 _ = try runSingle(prompt: singlePrompt)
 _ = try runBatched(prompts: [singlePrompt])
