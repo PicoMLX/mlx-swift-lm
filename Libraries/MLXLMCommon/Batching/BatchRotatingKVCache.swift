@@ -97,9 +97,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             }
 
             // Keep `window - 1` old positions, so every new token sees a full window. A ragged
-            // prefill keeps everything until it finalizes: a row that is complete would lose
-            // real tokens to the padding chunks of the rows still being filled.
-            let trimSize = lengths == nil ? idx - window + 1 : 0
+            // prefill keeps a full window: its completed rows were just rolled behind their
+            // padding, and they get padding, not tokens, from this chunk. The buffer thus
+            // stays within a window and a chunk, whatever the longest row's length.
+            let trimSize = idx - window + (lengths == nil ? 1 : 0)
             if trimSize > 0 {
                 leftPadding = consumePadding(trimSize)
                 self.keys = concatenated([self.keys![.ellipsis, trimSize..., 0...], keys], axis: 2)
@@ -428,20 +429,22 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let windowSize = windowSize ?? window
-        // A ragged prefill presents every position it has kept; otherwise at most the window.
+        // The matching update concatenates: it puts a wrapped buffer in order and then
+        // trims it to `window - 1` positions, or to a window during a ragged prefill.
+        // Predict that trim.
         let retained = rotated ? (keys?.dim(2) ?? 0) : idx
-        let offset = lengths == nil ? min(window - 1, written) : retained
+        let concatenates = n != 1 || lengths != nil
+        let trimSize =
+            lengths != nil
+            ? Swift.max(0, retained - window)
+            : (concatenates && rotated ? window : idx) - window + (concatenates ? 1 : 0)
+        // A ragged prefill presents every position it keeps; otherwise at most the window.
+        let offset = lengths == nil ? min(window - 1, written) : retained - trimSize
         let rinds = MLXArray(Int32(0) ..< Int32(offset + n))[.newAxis]
         let linds = MLXArray(Int32(offset) ..< Int32(offset + n))[0..., .newAxis]
         var mask = (linds .>= rinds) & (linds .< rinds + Int32(windowSize))
 
-        // The matching update concatenates: it puts a wrapped buffer in order and then
-        // trims it to `window - 1` positions. Predict that trim.
-        let concatenates = n != 1 || lengths != nil
         var padding = leftPadding
-        let trimSize =
-            lengths != nil
-            ? 0 : (concatenates && rotated ? window : idx) - window + (concatenates ? 1 : 0)
         if trimSize > 0 {
             padding = consumePadding(trimSize)
         }
@@ -483,6 +486,17 @@ extension RotatingKVCache {
     ///   which a batch cannot hold, or when the rows mix empty and prefilled caches.
     public static func merge(_ caches: [RotatingKVCache]) throws -> BatchRotatingKVCache {
         precondition(!caches.isEmpty, "merge needs a cache")
+        let first = caches[0]
+        guard
+            caches.allSatisfy({
+                $0.maxSize == first.maxSize && $0.allocationStep == first.allocationStep
+                    && $0.capacityOrigin == first.capacityOrigin
+            })
+        else {
+            throw KVCacheError(
+                message: "RotatingKVCache.merge needs rows that share one window, step and origin"
+            )
+        }
         // Rows join by `extend`, which takes all-empty or all-prefilled rows; a
         // mix would need an all-padding row inside the window.
         let prefilled = caches.filter { $0.offset > 0 }.count

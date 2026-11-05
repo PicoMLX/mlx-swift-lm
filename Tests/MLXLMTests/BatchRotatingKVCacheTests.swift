@@ -313,6 +313,49 @@ struct BatchRotatingKVCacheTests {
         #expect(throws: KVCacheError.self) {
             _ = try RotatingKVCache.merge([prefilled, RotatingKVCache(maxSize: 8)])
         }
+        // Rows must share one window, empty or not, and one allocation step.
+        #expect(throws: KVCacheError.self) {
+            _ = try RotatingKVCache.merge([
+                RotatingKVCache(maxSize: 8), RotatingKVCache(maxSize: 16),
+            ])
+        }
+        let wider = RotatingKVCache(maxSize: 16)
+        append(0 ..< 3, to: wider)
+        #expect(throws: KVCacheError.self) { _ = try RotatingKVCache.merge([prefilled, wider]) }
+        #expect(throws: KVCacheError.self) {
+            _ = try RotatingKVCache.merge([
+                RotatingKVCache(maxSize: 8, step: 2), RotatingKVCache(maxSize: 8, step: 4),
+            ])
+        }
+    }
+
+    @Test(
+        "A ragged prefill keeps at most a window and a chunk per row",
+        arguments: [[12, 4], [10, 6]])
+    func raggedPrefillBoundsStorage(lengths: [Int]) throws {
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0, 0])
+        let longest = try #require(lengths.max())
+        let all = makePositionKV(
+            positions: 0 ..< longest, heads: 1, headDim: 1, batchSize: 2, rowStride: 10)
+        cache.prepare(lengths: lengths)
+        for start in stride(from: 0, to: longest, by: 4) {
+            let end = min(start + 4, longest)
+            _ = cache.update(
+                keys: all.0[.ellipsis, start ..< end, 0...],
+                values: all.1[.ellipsis, start ..< end, 0...])
+            #expect(try #require(cache.state.first).dim(2) <= 8, "a window and a chunk at most")
+        }
+        cache.finalize()
+        #expect(cache.batchOffset.asArray(Int.self) == lengths)
+
+        let decode = MLXArray([Float(longest), Float(10 + lengths[1])]).reshaped([2, 1, 1, 1])
+        _ = cache.update(keys: decode, values: decode + 100)
+        #expect(
+            try view(try row(cache, 0)).0.asArray(Float.self)
+                == Array(longest - 3 ... longest).map(Float.init))
+        #expect(
+            try view(try row(cache, 1)).0.asArray(Float.self)
+                == Array(10 + lengths[1] - 3 ... 10 + lengths[1]).map(Float.init))
     }
 
     @Test("A trimmed wrapped source keeps its rows through batching and decode")
