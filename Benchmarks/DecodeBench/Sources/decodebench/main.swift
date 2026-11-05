@@ -1,9 +1,9 @@
 // Copyright © 2026 Apple Inc.
 
 // Greedy decode throughput on a local model, as a median over rounds: the single-sequence
-// `TokenIterator`, and a batch of merged caches at one and four rows. Decode is timed after
-// the prefill and the first token. The single and the one-row batch must decode the same
-// tokens, and every round must repeat them.
+// `TokenIterator`, and `BatchTokenIterator` at one and four rows. Decode is timed after the
+// prefill and the first token. The single and the one-row batch must decode the same tokens,
+// and every round must repeat them.
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
 //       [decode tokens: 128] [rounds: 5] [prompt tokens: 145]
@@ -63,63 +63,30 @@ func median(_ values: [Double]) -> Double {
     return (Double(decodeTokens) / seconds(since: start), tokens)
 }
 
-/// Prefills each prompt alone, merges the caches into one batch and times `decodeTokens`
-/// greedy steps over it. Tokens per second count one row.
+/// Queues the prompts in a `BatchTokenIterator`, takes the first step (the prefill and the
+/// first token) and times `decodeTokens` further steps. Tokens per second count one row.
 @MainActor func runBatched(prompts: [[Int32]]) throws -> (tokensPerSecond: Double, tokens: [[Int]])
 {
-    var rows: [[KVCacheSimple]] = []
-    var first: [Int32] = []
-    for prompt in prompts {
-        let cache = try model.newCache(parameters: nil).compactMap { $0 as? KVCacheSimple }
-        let logits = model(MLXArray(prompt)[.newAxis], cache: cache)
-        first.append(argMax(logits[0, -1]).item(Int32.self))
-        rows.append(cache)
-    }
-    let cache = rows[0].indices.map { layer in
-        KVCacheSimple.merge(rows.map { $0[layer] }) as any KVCache
-    }
-    // The merge is lazy; settle it so batch assembly is not charged to the decode.
-    eval(cache)
-
+    var iterator = BatchTokenIterator(model: model, maxTokens: decodeTokens + 1)
+    let uids = iterator.insert(prompts: prompts.map { $0.map { Int($0) } })
     var tokens = [[Int]](repeating: [], count: prompts.count)
-    var current = MLXArray(first)
-    eval(current)
-    let start = ContinuousClock.now
-    for _ in 0 ..< decodeTokens {
-        let logits = model(current[0..., .newAxis], cache: cache)
-        let next = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
-        asyncEval(next)
-        for (row, token) in current.asArray(Int32.self).enumerated() {
-            tokens[row].append(Int(token))
+    func record(_ responses: [BatchTokenIterator.Response]) {
+        for response in responses {
+            tokens[uids.firstIndex(of: response.uid)!].append(response.token)
         }
-        current = next
     }
-    eval(current)
-    let elapsed = seconds(since: start)
-    for (row, token) in current.asArray(Int32.self).enumerated() {
-        tokens[row].append(Int(token))
+    record(try iterator.next())
+    let start = ContinuousClock.now
+    while true {
+        let responses = try iterator.next()
+        if responses.isEmpty { break }
+        record(responses)
     }
-    return (Double(decodeTokens) / elapsed, tokens.map { Array($0.dropFirst()) })
+    return (Double(decodeTokens) / seconds(since: start), tokens.map { Array($0.dropFirst()) })
 }
 
 let singlePrompt = prompt(seed: 1)
 let fourPrompts = (1 ... 4).map { prompt(seed: UInt64($0)) }
-// Only plain caches merge so far; other topologies time the single path alone.
-let topology = try model.newCache(parameters: nil)
-guard topology.allSatisfy({ $0 is KVCacheSimple }) else {
-    let kinds = Set(topology.map { String(describing: type(of: $0)) }).sorted()
-    print("cache topology \(kinds) has no batched form yet; timing the single path only")
-    _ = try runSingle(prompt: singlePrompt)
-    var single: [Double] = []
-    for round in 0 ..< rounds {
-        let plain = try runSingle(prompt: singlePrompt)
-        single.append(plain.tokensPerSecond)
-        print(String(format: "round %d  single %.2f tok/s", round + 1, plain.tokensPerSecond))
-        Memory.clearCache()
-    }
-    print(String(format: "median  single %.2f tok/s", median(single)))
-    exit(0)
-}
 
 // Warm up every path once so kernel compilation is not timed.
 _ = try runSingle(prompt: singlePrompt)

@@ -434,7 +434,9 @@ public struct TopPSampler: LogitSampler {
         return sample(logProbabilities: logSoftmax(logits))
     }
 
-    fileprivate func sample(logProbabilities: MLXArray) -> MLXArray {
+    /// Samples from log-probabilities that are normalized already, in any leading shape:
+    /// `[V]` or `[B, V]` gives `[]` or `[B]` tokens.
+    public func sample(logProbabilities: MLXArray) -> MLXArray {
         withRandomState(randomState) {
             var logprobs = logProbabilities
 
@@ -462,7 +464,10 @@ public struct TopPSampler: LogitSampler {
         let cumulativeProbs = cumsum(sortedProbs, axis: -1)
 
         // Mask low-probability tail in sorted order, scatter back to original vocab order.
-        let filtered = MLX.where(cumulativeProbs .> (1 - topP), sortedLogprobs, negInf)
+        // The top token always stays: a threshold that rounds to one would drop every token.
+        let last = MLXArray(Int32(0) ..< Int32(logprobs.dim(-1))) .== Int32(logprobs.dim(-1) - 1)
+        let kept = (cumulativeProbs .> (1 - topP)) .|| last
+        let filtered = MLX.where(kept, sortedLogprobs, negInf)
         return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
     }
 

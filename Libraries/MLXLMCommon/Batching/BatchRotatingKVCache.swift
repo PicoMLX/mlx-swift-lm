@@ -267,7 +267,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
     }
 
     /// Keeps only the rows at `batchIndices`, in that order.
-    public func filter(batchIndices: MLXArray) {
+    public override func filter(batchIndices: MLXArray) {
         let rows = batchIndices.asArray(Int32.self)
         guard !rows.isEmpty else {
             keys = nil
@@ -290,6 +290,14 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
 
     /// Appends the rows of `other`, which must be prefilled or empty like this cache's and
     /// share the window, step and capacity origin.
+    public override func extend(other: any KVCache) {
+        guard let other = other as? BatchRotatingKVCache else {
+            preconditionFailure(
+                "BatchRotatingKVCache can only be extended with a BatchRotatingKVCache")
+        }
+        extend(other: other)
+    }
+
     public func extend(other: BatchRotatingKVCache) {
         precondition(
             other.keys != nil || other.batchSize == 0,
@@ -335,7 +343,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
 
     /// The row at `index` in temporal order without its left padding, as a
     /// ``RotatingKVCache`` with this cache's window, step and capacity origin.
-    public func extract(_ index: Int) -> any KVCache {
+    public override func extract(_ index: Int) -> any KVCache {
         let cache = RotatingKVCache(maxSize: window, step: step)
         // Left padding goes negative once the window wraps.
         let padding = max(0, Int(leftPadding[index].item(Int32.self)))

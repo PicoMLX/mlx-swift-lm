@@ -5,38 +5,29 @@ import MLX
 
 /// The rows of `caches`, single-sequence caches of one layer, as one batched cache.
 ///
-/// Port of mlx-lm's `_merge_caches` for one layer: dispatches on the exact cache type, so a
+/// Port of mlx-lm's `_merge_caches` for one layer: the rows merge on their exact class, so a
 /// `ChunkedKVCache` or a compressed cache is refused rather than treated as the class it
 /// subclasses. Empty caches merge into an empty batch with one row each.
 ///
 /// - Throws: ``KVCacheError`` when the type has no batched form, when the rows do not share
 ///   one type, or when a rotating cache keeps a prefix or a rewind reserve.
-func mergeCaches(_ caches: [any KVCache]) throws -> any KVCache {
+public func mergeCaches(_ caches: [any KVCache]) throws -> any KVCache {
     guard let first = caches.first else {
         throw KVCacheError(message: "merge needs a cache")
     }
-    let cacheType = String(describing: type(of: first))
-    func rows<T: KVCache>(as _: T.Type) throws -> [T] {
-        try caches.map { cache in
-            guard type(of: cache) == T.self, let row = cache as? T else {
-                throw KVCacheError(message: "Rows of a batch must share one cache type")
-            }
-            return row
-        }
+    guard caches.allSatisfy({ type(of: $0) == type(of: first) }) else {
+        throw KVCacheError(message: "Rows of a batch must share one cache type")
     }
-    switch first {
-    case is CacheList:
-        return try CacheList.merge(try rows(as: CacheList.self))
-    case is MambaCache:
-        return ArraysCache.merge(try rows(as: MambaCache.self))
-    case is ArraysCache:
-        return ArraysCache.merge(try rows(as: ArraysCache.self))
-    case is RotatingKVCache:
-        return try RotatingKVCache.merge(try rows(as: RotatingKVCache.self))
-    case is KVCacheSimple where type(of: first) == KVCacheSimple.self:
-        return KVCacheSimple.merge(try rows(as: KVCacheSimple.self))
-    default:
-        throw KVCacheError(message: "\(cacheType) has no batched form")
+    return try type(of: first).merge(caches)
+}
+
+/// `caches` as rows of exactly `T`, for a `merge` that takes only its own class.
+func batchRows<T: KVCache>(_ caches: [any KVCache], of _: T.Type) throws -> [T] {
+    try caches.map { cache in
+        guard type(of: cache) == T.self, let row = cache as? T else {
+            throw KVCacheError(message: "\(type(of: cache)) has no batched form")
+        }
+        return row
     }
 }
 
@@ -76,18 +67,6 @@ extension ArraysCache {
         merged.offset = caches.map(\.offset).max() ?? 0
         return merged
     }
-
-    /// The row at `index`, as a ``MambaCache`` when this is one.
-    public func extract(_ index: Int) -> any KVCache {
-        let row = self is MambaCache ? MambaCache() : ArraysCache(size: slotCount)
-        for slot in 0 ..< slotCount {
-            row[slot] = self[slot]?[index ..< index + 1]
-        }
-        row.offset = offset
-        row.leftPadding = leftPadding?[index ..< index + 1]
-        row.lengths = lengths?[index ..< index + 1]
-        return row
-    }
 }
 
 // MARK: - Composite caches
@@ -108,54 +87,5 @@ extension CacheList {
             try mergeCaches(caches.map { $0.children[index] })
         }
         return CacheList(caches: merged)
-    }
-
-    /// Keeps only the rows at `batchIndices`, in that order, in every child.
-    public func filter(batchIndices: MLXArray) {
-        for child in children {
-            switch child {
-            case let batch as BatchKVCache: batch.filter(batchIndices: batchIndices)
-            case let batch as BatchRotatingKVCache: batch.filter(batchIndices: batchIndices)
-            case let batch as ArraysCache: batch.filter(batchIndices: batchIndices)
-            case let batch as CacheList: batch.filter(batchIndices: batchIndices)
-            default: preconditionFailure("\(type(of: child)) is not a batched cache")
-            }
-        }
-    }
-
-    /// Appends the rows of `other`, a `CacheList` of the same layout, child by child.
-    public func extend(other: CacheList) {
-        precondition(
-            other.children.count == children.count,
-            "A CacheList can only be extended with a CacheList of the same layout")
-        for (child, added) in zip(children, other.children) {
-            switch (child, added) {
-            case (let batch as BatchKVCache, let added as BatchKVCache):
-                batch.extend(other: added)
-            case (let batch as BatchRotatingKVCache, let added as BatchRotatingKVCache):
-                batch.extend(other: added)
-            case (let batch as ArraysCache, let added as ArraysCache):
-                batch.extend(other: added)
-            case (let batch as CacheList, let added as CacheList):
-                batch.extend(other: added)
-            default:
-                preconditionFailure(
-                    "\(type(of: child)) cannot be extended with \(type(of: added))")
-            }
-        }
-    }
-
-    /// The row at `index` as a composite of single-sequence caches.
-    public func extract(_ index: Int) -> any KVCache {
-        CacheList(
-            caches: children.map { child -> any KVCache in
-                switch child {
-                case let batch as BatchKVCache: batch.extract(index)
-                case let batch as BatchRotatingKVCache: batch.extract(index)
-                case let batch as ArraysCache: batch.extract(index)
-                case let batch as CacheList: batch.extract(index)
-                default: preconditionFailure("\(type(of: child)) is not a batched cache")
-                }
-            })
     }
 }

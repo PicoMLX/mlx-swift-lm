@@ -118,9 +118,39 @@ public protocol KVCache: Evaluatable {
 
     /// Clear transient cache metadata after generation.
     func finalize()
+
+    /// Keep only the rows at `batchIndices`, in that order. Batched caches only.
+    func filter(batchIndices: MLXArray)
+
+    /// Append the rows of `other`, a batched cache of this type. Batched caches only.
+    func extend(other: any KVCache)
+
+    /// The row at `index` as a single-sequence cache. Batched caches only.
+    func extract(_ index: Int) -> any KVCache
+
+    /// The rows of `caches`, single-sequence caches of exactly this type, as one batched cache.
+    ///
+    /// - Throws: ``KVCacheError`` when this type has no batched form or a row cannot be batched.
+    static func merge(_ caches: [any KVCache]) throws -> any KVCache
 }
 
 extension KVCache {
+    public func filter(batchIndices: MLXArray) {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    public func extend(other: any KVCache) {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    public func extract(_ index: Int) -> any KVCache {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    public static func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        throw KVCacheError(message: "\(Self.self) has no batched form")
+    }
+
     public static var serializedClassName: String? { nil }
 
     public static func restore(state: [MLXArray], metaState: [String]) throws -> any KVCache {
@@ -298,6 +328,22 @@ open class BaseKVCache: KVCache {
     open func prepare(lengths: MLXArray?) {}
 
     open func finalize() {}
+
+    open func filter(batchIndices: MLXArray) {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    open func extend(other: any KVCache) {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    open func extract(_ index: Int) -> any KVCache {
+        preconditionFailure("\(Self.self) is not a batched cache")
+    }
+
+    open class func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        throw KVCacheError(message: "\(Self.self) has no batched form")
+    }
 
     /// Default implementation for caches without special mask requirements
     open func makeMask(
@@ -551,6 +597,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
+    }
+
+    /// ``merge(_:)-swift.type.method`` for rows typed as `KVCache`; exactly `KVCacheSimple` rows.
+    public override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        merge(try batchRows(caches, of: KVCacheSimple.self))
     }
 
     /// Convert to a quantized cache for maximum efficiency.
@@ -997,6 +1048,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.wrappedFlag = nil
             }
         }
+    }
+
+    /// ``merge(_:)-swift.type.method`` for rows typed as `KVCache`.
+    public override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        try merge(try batchRows(caches, of: RotatingKVCache.self))
     }
 
     public override var isTrimmable: Bool {
@@ -1647,12 +1703,36 @@ public class ArraysCache: BaseKVCache {
     }
 
     /// In-place filter to keep just the given indices in the cache
-    public func filter(batchIndices: MLXArray) {
+    public override func filter(batchIndices: MLXArray) {
         cache = cache.map { c in
             c?[batchIndices]
         }
         leftPadding = leftPadding?[batchIndices]
         lengths = lengths?[batchIndices]
+    }
+
+    public override func extend(other: any KVCache) {
+        guard let other = other as? ArraysCache else {
+            preconditionFailure("\(Self.self) can only be extended with an ArraysCache")
+        }
+        extend(other: other)
+    }
+
+    /// The row at `index`, as a ``MambaCache`` when this is one.
+    public override func extract(_ index: Int) -> any KVCache {
+        let row = self is MambaCache ? MambaCache() : ArraysCache(size: slotCount)
+        for slot in 0 ..< slotCount {
+            row[slot] = self[slot]?[index ..< index + 1]
+        }
+        row.offset = offset
+        row.leftPadding = leftPadding?[index ..< index + 1]
+        row.lengths = lengths?[index ..< index + 1]
+        return row
+    }
+
+    /// ``merge(_:)-swift.type.method`` for rows typed as `KVCache`; rows of exactly this class.
+    public override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        merge(try batchRows(caches, of: Self.self))
     }
 
     /// In-place extend this cache with the other cache
@@ -1997,6 +2077,34 @@ public class CacheList: BaseKVCache {
 
     /// Internal accessor for child caches (used by serialization and policy reporting).
     internal var children: [KVCache] { caches }
+
+    /// Keeps only the rows at `batchIndices`, in that order, in every child.
+    public override func filter(batchIndices: MLXArray) {
+        for child in caches {
+            child.filter(batchIndices: batchIndices)
+        }
+    }
+
+    /// Appends the rows of `other`, a `CacheList` of the same layout, child by child.
+    public override func extend(other: any KVCache) {
+        guard let other = other as? CacheList, other.caches.count == caches.count else {
+            preconditionFailure(
+                "A CacheList can only be extended with a CacheList of the same layout")
+        }
+        for (child, added) in zip(caches, other.caches) {
+            child.extend(other: added)
+        }
+    }
+
+    /// The row at `index` as a composite of single-sequence caches.
+    public override func extract(_ index: Int) -> any KVCache {
+        CacheList(caches: caches.map { $0.extract(index) })
+    }
+
+    /// ``merge(_:)-swift.type.method`` for rows typed as `KVCache`.
+    public override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
+        try merge(try batchRows(caches, of: CacheList.self))
+    }
 
     // MARK: - Serialization
 

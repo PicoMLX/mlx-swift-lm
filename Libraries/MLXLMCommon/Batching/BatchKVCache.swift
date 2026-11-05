@@ -209,7 +209,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
     }
 
     /// Keeps only the rows at `batchIndices`, in that order.
-    public func filter(batchIndices: MLXArray) {
+    public override func filter(batchIndices: MLXArray) {
         let rows = batchIndices.asArray(Int32.self).map { Int($0) }
         guard !rows.isEmpty else {
             keys = nil
@@ -239,6 +239,13 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
     }
 
     /// Appends the rows of `other`, whose rows must be prefilled or empty like this cache's.
+    public override func extend(other: any KVCache) {
+        guard let other = other as? BatchKVCache else {
+            preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
+        }
+        extend(other: other)
+    }
+
     public func extend(other: BatchKVCache) {
         precondition(
             other.keys != nil || other.batchSize == 0,
@@ -276,7 +283,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
     }
 
     /// The row at `index` without its left padding, as a ``KVCacheSimple``.
-    public func extract(_ index: Int) -> any KVCache {
+    public override func extract(_ index: Int) -> any KVCache {
         let cache = KVCacheSimple()
         let padding = Int(leftPaddingValues[index])
         if let keys, let values {
