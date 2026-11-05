@@ -59,8 +59,9 @@ func makeModel(_ variant: String, quantized: Bool, moe: Bool = false) throws -> 
     return model
 }
 func run(_ model: MiniCPM) throws -> [MLXArray] {
-    let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-    let batch = factories.map { $0([0, 0]) }
+    let batch = try model.newCache(parameters: nil).map {
+        try mergeCaches(Array(repeating: $0, count: 2))
+    }
     let cache = batch.map { $0 as any KVCache }
     for layer in batch { layer.prepare(lengths: [3, 5]) }
     let prefill = model(

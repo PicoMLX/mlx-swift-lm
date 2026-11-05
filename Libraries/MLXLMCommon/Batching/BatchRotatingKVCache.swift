@@ -56,7 +56,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     public var batchSize: Int { leftPadding.dim(0) }
 
     /// Per-row positions, also when the cache is typed as `KVCache`.
-    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+    public override var ropeOffset: RoPEOffset { .batch(batchOffset) }
 
     public override func innerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
@@ -369,22 +369,21 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
 
     /// A batch of one row holding the window of `cache`, or `nil` when `cache` has a
     /// pinned prefix or a rewind reserve, which a batch cannot hold.
-    public static func fromSingle(_ cache: RotatingKVCache) -> BatchRotatingKVCache? {
+    fileprivate convenience init?(row cache: RotatingKVCache) {
         guard cache.preservedPrefixTokens == 0, cache.rewindCapacity == 0,
             let window = cache.maxSize
         else { return nil }
-        let batch = BatchRotatingKVCache(maxSize: window, leftPadding: [0])
-        batch.capacityOrigin = cache.capacityOrigin
-        batch.step = cache.allocationStep
+        self.init(maxSize: window, leftPadding: [0])
+        capacityOrigin = cache.capacityOrigin
+        step = cache.allocationStep
         if let (keys, values) = cache.logicalView(tail: window) {
             // New array objects, so writes to the batch leave `cache` unchanged.
-            batch.keys = keys[.ellipsis]
-            batch.values = values[.ellipsis]
-            batch.idx = keys.dim(2)
-            batch.written = keys.dim(2)
-            batch.batchOffset = MLXArray([Int32(cache.offset)])
+            self.keys = keys[.ellipsis]
+            self.values = values[.ellipsis]
+            idx = keys.dim(2)
+            written = keys.dim(2)
+            batchOffset = MLXArray([Int32(cache.offset)])
         }
-        return batch
     }
 
     /// The mask for `n` new tokens: the window, the causal order and each row's left
@@ -433,5 +432,45 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         copy.step = step
         copy.capacityOrigin = capacityOrigin
         return copy
+    }
+}
+
+extension RotatingKVCache {
+    /// The rows of `caches` as one batch, each keeping its chronological window and
+    /// absolute position. Port of mlx-lm's `RotatingKVCache.merge`.
+    ///
+    /// - Throws: ``BatchedCacheError`` when a cache keeps a prefix or a rewind reserve,
+    ///   which a batch cannot hold.
+    public static func merge(_ caches: [RotatingKVCache]) throws -> BatchRotatingKVCache {
+        precondition(!caches.isEmpty, "merge needs a cache")
+        // Rows join by `extend`, which takes all-empty or all-prefilled rows; a
+        // mix would need an all-padding row inside the window, left for later.
+        let prefilled = caches.filter { $0.offset > 0 }.count
+        guard prefilled == 0 || prefilled == caches.count else {
+            throw BatchedCacheError.unsupportedCache(
+                cacheType: "RotatingKVCache",
+                reason: "Rows must all be empty or all prefilled.")
+        }
+        let rows = try caches.map { cache in
+            guard let row = BatchRotatingKVCache(row: cache) else {
+                throw BatchedCacheError.unsupportedCache(
+                    cacheType: "RotatingKVCache",
+                    reason: "A pinned prefix or a rewind reserve has no batched form.")
+            }
+            return row
+        }
+        guard prefilled > 0 else {
+            // Empty rows have nothing to join; size the batch directly.
+            let batch = BatchRotatingKVCache(
+                maxSize: rows[0].maxSize ?? 0, leftPadding: Array(repeating: 0, count: rows.count))
+            batch.step = rows[0].step
+            batch.capacityOrigin = rows[0].capacityOrigin
+            return batch
+        }
+        let batch = rows[0]
+        for row in rows.dropFirst() {
+            batch.extend(other: row)
+        }
+        return batch
     }
 }

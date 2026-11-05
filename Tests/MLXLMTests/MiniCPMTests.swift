@@ -80,8 +80,9 @@ struct MiniCPMTests {
                     model, LMInput(tokens: MLXArray(prompt).reshaped(1, prompt.count)),
                     cache: singles[row])[0, -1]
             }
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-            let batch = factories.map { $0([0, 0, 0]) }
+            let batch = try model.newCache(parameters: nil).map {
+                try mergeCaches(Array(repeating: $0, count: prompts.count))
+            }
             let cache = batch.map { $0 as any KVCache }
             let padded = prompts.flatMap { $0 + Array(repeating: 0, count: 5 - $0.count) }
             for layer in batch { layer.prepare(lengths: prompts.map(\.count)) }
@@ -115,7 +116,7 @@ struct MiniCPMTests {
             #expect(
                 maxAbsDifference(model(next, cache: extracted), model(next, cache: singles[2]))
                     < 3e-4)
-            let added = factories.map { $0([0]) }
+            let added = try model.newCache(parameters: nil).map { try mergeCaches([$0]) }
             let addedCache = added.map { $0 as any KVCache }
             _ = try miniCPMPrepared(
                 model, LMInput(tokens: MLXArray([Int32(2), 3]).reshaped(1, 2)), cache: addedCache)
@@ -163,11 +164,10 @@ struct MiniCPMTests {
                         audio: .init(
                             features: sin(MLXArray(0 ..< 96).asType(.float32)).reshaped(1, 12, 8))))
             }
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
             var prepared: [[any BatchedCache]] = []
             var reference: [[any KVCache]] = []
             for input in inputs {
-                let row = factories.map { $0([0]) }
+                let row = try model.newCache(parameters: nil).map { try mergeCaches([$0]) }
                 let cache = row.map { $0 as any KVCache }
                 _ = try miniCPMPrepared(model, input, cache: cache, chunk: 2)
                 prepared.append(row)
