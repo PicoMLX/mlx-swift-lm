@@ -302,8 +302,9 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
     /// Appends the rows of `other`, which must be prefilled or empty like this cache's and
     /// share the window, step and capacity origin.
     public func extend(other: BatchRotatingKVCache) {
-        // Prefilled rows join prefilled rows, empty rows join empty rows; a mix would need
-        // all-padding rows inside the window.
+        // A batch with no rows changes nothing. Otherwise prefilled rows join prefilled rows
+        // and empty rows join empty rows; a mix would need all-padding rows inside the window.
+        guard other.batchSize > 0 else { return }
         precondition(
             other.keys != nil || keys == nil,
             "BatchRotatingKVCache.extend cannot add empty rows to prefilled rows")
