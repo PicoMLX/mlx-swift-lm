@@ -156,7 +156,3 @@ private func expectRowsMatchSingles(
         }
     }
 }
-
-private func maxAbsDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
-    abs(lhs.asType(.float32) - rhs.asType(.float32)).max().item(Float.self)
-}

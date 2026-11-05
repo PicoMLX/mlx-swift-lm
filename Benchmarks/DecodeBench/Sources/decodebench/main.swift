@@ -1,7 +1,9 @@
 // Copyright © 2026 Apple Inc.
 
-// Greedy decode throughput of `TokenIterator` on a local model, as a median over rounds.
-// Decode is timed after the prefill and the first token. Tokens are checked across rounds.
+// Greedy decode throughput on a local model, as a median over rounds: the single-sequence
+// `TokenIterator`, and a batch of merged caches at one and four rows. Decode is timed after
+// the prefill and the first token. The single and the one-row batch must decode the same
+// tokens, and every round must repeat them.
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
 //       [decode tokens: 128] [rounds: 5] [prompt tokens: 145]
@@ -61,21 +63,88 @@ func median(_ values: [Double]) -> Double {
     return (Double(decodeTokens) / seconds(since: start), tokens)
 }
 
+/// Prefills each prompt alone, merges the caches into one batch and times `decodeTokens`
+/// greedy steps over it. Tokens per second count one row.
+@MainActor func runBatched(prompts: [[Int32]]) throws -> (tokensPerSecond: Double, tokens: [[Int]])
+{
+    var rows: [[KVCacheSimple]] = []
+    var first: [Int32] = []
+    for prompt in prompts {
+        let cache = try model.newCache(parameters: nil).map { $0 as! KVCacheSimple }
+        let logits = model(MLXArray(prompt)[.newAxis], cache: cache)
+        first.append(argMax(logits[0, -1]).item(Int32.self))
+        rows.append(cache)
+    }
+    let cache = rows[0].indices.map { layer in
+        KVCacheSimple.merge(rows.map { $0[layer] }) as any KVCache
+    }
+
+    var tokens = [[Int]](repeating: [], count: prompts.count)
+    var current = MLXArray(first)
+    eval(current)
+    let start = ContinuousClock.now
+    for _ in 0 ..< decodeTokens {
+        let logits = model(current[0..., .newAxis], cache: cache)
+        let next = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
+        asyncEval(next)
+        for (row, token) in current.asArray(Int32.self).enumerated() {
+            tokens[row].append(Int(token))
+        }
+        current = next
+    }
+    eval(current)
+    let elapsed = seconds(since: start)
+    for (row, token) in current.asArray(Int32.self).enumerated() {
+        tokens[row].append(Int(token))
+    }
+    return (Double(decodeTokens) / elapsed, tokens.map { Array($0.dropFirst()) })
+}
+
 let singlePrompt = prompt(seed: 1)
-_ = try runSingle(prompt: singlePrompt)  // warm up: kernel compilation is not timed
+let fourPrompts = (1 ... 4).map { prompt(seed: UInt64($0)) }
+// Warm up every path once so kernel compilation is not timed.
+_ = try runSingle(prompt: singlePrompt)
+_ = try runBatched(prompts: [singlePrompt])
+_ = try runBatched(prompts: fourPrompts)
 
 var single: [Double] = []
+var batchOfOne: [Double] = []
+var batchOfFour: [Double] = []
 var reference: [Int]? = nil
+var fourReference: [[Int]]? = nil
 var mismatchedRounds: [Int] = []
 for round in 0 ..< rounds {
-    let result = try runSingle(prompt: singlePrompt)
-    single.append(result.tokensPerSecond)
-    if reference == nil { reference = result.tokens }
-    if result.tokens != reference { mismatchedRounds.append(round + 1) }
-    print(String(format: "round %d  single %.2f tok/s", round + 1, result.tokensPerSecond))
+    // Alternate the order so a thermal or background-load slope lands on both paths.
+    let batchedFirst = round % 2 == 1
+    let batched = batchedFirst ? try runBatched(prompts: [singlePrompt]) : nil
+    let plain = try runSingle(prompt: singlePrompt)
+    let one = try batched ?? runBatched(prompts: [singlePrompt])
+    let four = try runBatched(prompts: fourPrompts)
+
+    single.append(plain.tokensPerSecond)
+    batchOfOne.append(one.tokensPerSecond)
+    batchOfFour.append(four.tokensPerSecond)
+    if reference == nil { reference = plain.tokens }
+    if fourReference == nil { fourReference = four.tokens }
+    let expected = Array(plain.tokens.dropFirst())
+    if plain.tokens != reference || one.tokens[0] != expected || four.tokens[0] != expected
+        || four.tokens != fourReference
+    {
+        mismatchedRounds.append(round + 1)
+    }
+    print(
+        String(
+            format:
+                "round %d  single %.2f tok/s   batch(1) %.2f tok/s   batch(4) %.2f tok/s per row, %.2f total   (%@ first)",
+            round + 1, plain.tokensPerSecond, one.tokensPerSecond, four.tokensPerSecond,
+            4 * four.tokensPerSecond, batchedFirst ? "batched" : "single"))
     Memory.clearCache()
 }
-print(String(format: "median  single %.2f tok/s", median(single)))
 print(
-    "tokens identical in every round: \(mismatchedRounds.isEmpty)"
+    String(
+        format:
+            "median  single %.2f tok/s   batch(1) %.2f tok/s   batch(4) %.2f tok/s per row, %.2f total",
+        median(single), median(batchOfOne), median(batchOfFour), 4 * median(batchOfFour)))
+print(
+    "tokens identical across paths and rounds: \(mismatchedRounds.isEmpty)"
         + (mismatchedRounds.isEmpty ? "" : ", not in rounds \(mismatchedRounds)"))

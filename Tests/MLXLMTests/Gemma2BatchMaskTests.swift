@@ -58,10 +58,6 @@ struct Gemma2BatchMaskTests {
     }
 }
 
-private func maxAbsDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
-    abs(lhs.asType(.float32) - rhs.asType(.float32)).max().item(Float.self)
-}
-
 /// Two layers of grouped-query attention: four heads over two key-value heads.
 func tinyGemma2Configuration() throws -> Gemma2Configuration {
     try JSONDecoder().decode(
