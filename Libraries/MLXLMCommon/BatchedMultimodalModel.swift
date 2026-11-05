@@ -18,7 +18,7 @@ public struct BatchedMediaCapabilities: OptionSet, Sendable {
 ///
 /// Conforming models keep request-specific continuation data in their caches. Their
 /// media `prepare` returns logits without a separate `LMOutput.State`, and the caches
-/// support `makeBatchedCacheFactories(for:)`, row filtering, extraction and extension.
+/// support `mergeCaches(_:)`, row filtering, extraction and extension.
 /// Media encoders may run separately before those caches join a running decode batch.
 public protocol BatchedMultimodalModel: LanguageModel {
     var batchedMediaCapabilities: BatchedMediaCapabilities { get }
