@@ -9,7 +9,10 @@ import MLX
 /// the window of ``RotatingKVCache``. Every row keeps its last ``maxSize`` positions.
 /// Unlike ``RotatingKVCache`` it has no pinned prefix (`keep`) and no rewind reserve.
 public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
-    /// Each row's left padding, shape `[B]`. It goes negative once the window wraps.
+    /// Each row's left padding, shape `[B]`: the padding positions the buffer still holds.
+    /// Writes consume the oldest positions first, so it falls to zero as the window fills
+    /// (mlx-lm lets it go negative; this keeps a count, so a later ragged prefill or
+    /// extension adds its padding to the real figure).
     public private(set) var leftPadding: MLXArray
 
     /// Each row's position, shape `[B]`. It starts at `-leftPadding`.
@@ -35,11 +38,12 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
 
     public override var maxSize: Int? { window }
 
-    /// The positions in use, at most the window. Reads like ``RotatingKVCache`` would
-    /// for a mask built from the offset.
+    /// The position of the longest row, as ``RotatingKVCache/offset`` counts it: every
+    /// token written, not only the window's. Rows keep their own positions in
+    /// ``batchOffset``, so the batch as a whole cannot be moved.
     public override var offset: Int {
-        get { min(written, window) }
-        set { written = newValue }
+        get { batchSize > 0 ? Swift.max(0, Int(batchOffset.max().item(Int32.self))) : 0 }
+        set { preconditionFailure("BatchRotatingKVCache positions are per row; see batchOffset") }
     }
 
     /// - Parameters:
@@ -97,7 +101,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             // real tokens to the padding chunks of the rows still being filled.
             let trimSize = lengths == nil ? idx - window + 1 : 0
             if trimSize > 0 {
-                leftPadding = leftPadding - Int32(trimSize)
+                leftPadding = consumePadding(trimSize)
                 self.keys = concatenated([self.keys![.ellipsis, trimSize..., 0...], keys], axis: 2)
                 self.values = concatenated(
                     [self.values![.ellipsis, trimSize..., 0...], values], axis: 2)
@@ -140,7 +144,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             self.keys = self.keys![.ellipsis, trimSize..., 0...]
             self.values = self.values![.ellipsis, trimSize..., 0...]
             idx = window
-            leftPadding = leftPadding - Int32(trimSize)
+            leftPadding = consumePadding(trimSize)
         }
 
         if idx == window {
@@ -148,7 +152,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             idx = 0
         }
         if rotated {
-            leftPadding = leftPadding - Int32(count)
+            leftPadding = consumePadding(count)
         }
 
         self.keys![.ellipsis, idx ..< idx + count, 0...] = keys
@@ -163,6 +167,12 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             )
         }
         return (self.keys!, self.values!)
+    }
+
+    /// The padding each row keeps after its `count` oldest positions are overwritten or
+    /// dropped: padding goes first, and none is left to count below zero.
+    private func consumePadding(_ count: Int) -> MLXArray {
+        MLX.maximum(leftPadding - Int32(count), MLXArray(Int32(0)))
     }
 
     /// Puts a wrapped buffer back in temporal order.
@@ -235,11 +245,13 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
         return min(written, max(0, shortest))
     }
 
-    /// Positions the longest row no longer retains.
+    /// The most positions any row no longer retains. A row retains the buffer's width
+    /// less its own padding.
     public override var evictedTokenCount: Int {
         guard batchSize > 0 else { return 0 }
-        let retained = rotated ? (keys?.dim(2) ?? 0) : idx
-        return Swift.max(0, Int(batchOffset.max().item(Int32.self)) - retained)
+        let width = rotated ? (keys?.dim(2) ?? 0) : idx
+        let evicted = batchOffset + leftPadding - Int32(width)
+        return Swift.max(0, Int(evicted.max().item(Int32.self)))
     }
 
     /// Rewinds the newest `n` positions, at most ``maxTrimCount``: nothing once the window has
@@ -357,8 +369,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
     /// ``RotatingKVCache`` with this cache's window, step and capacity origin.
     public func extract(_ index: Int) -> any KVCache {
         let cache = RotatingKVCache(maxSize: window, step: step)
-        // Left padding goes negative once the window wraps.
-        let padding = max(0, Int(leftPadding[index].item(Int32.self)))
+        let padding = Int(leftPadding[index].item(Int32.self))
         let rowOffset = max(0, Int(batchOffset[index].item(Int32.self)))
         var rowIdx = min(rowOffset, window)
 
@@ -432,13 +443,13 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache {
             lengths != nil
             ? 0 : (concatenates && rotated ? window : idx) - window + (concatenates ? 1 : 0)
         if trimSize > 0 {
-            padding = padding - Int32(trimSize)
+            padding = consumePadding(trimSize)
         }
 
-        // The matching update writes in place and wraps.
+        // The matching update writes in place and wraps, over the oldest position.
         let wraps = !concatenates && (rotated || idx >= window)
         if wraps {
-            padding = padding - 1
+            padding = MLX.maximum(padding - 1, MLXArray(Int32(0)))
         }
         mask = mask & (rinds .>= padding[0..., .newAxis, .newAxis, .newAxis])
         if wraps {

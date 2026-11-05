@@ -104,9 +104,61 @@ struct BatchRotatingKVCacheTests {
         #expect(single.evictedTokenCount == 3)
         let batch = try RotatingKVCache.merge([single])
         #expect(batch.evictedTokenCount == 3)
+        // The offset counts every position like the row's, as the global layers' caches do.
+        #expect(batch.offset == single.offset)
         append(11 ..< 12, to: batch)
         #expect(batch.evictedTokenCount == 4)
+        #expect(batch.offset == 12)
         #expect(BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 2]).evictedTokenCount == 0)
+    }
+
+    @Test("Evictions count each row's padding against the buffer it shares")
+    func evictedTokensWithPadding() throws {
+        // A wrapped row that a two-token write widened to nine positions, ten evicted...
+        let wrapped = RotatingKVCache(maxSize: 8)
+        for position in 0 ..< 17 { append(position ..< position + 1, to: wrapped) }
+        let narrow = try RotatingKVCache.merge([wrapped])
+        append(17 ..< 19, to: narrow)
+        #expect(narrow.evictedTokenCount == 10)
+        // ...joins a ten-wide row and takes one position of padding.
+        let batch = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        append(0 ..< 10, to: batch)
+        batch.extend(other: narrow)
+        #expect(batch.leftPadding.asArray(Int32.self) == [0, 1])
+        #expect(batch.evictedTokenCount == 10)
+        #expect(batch.offset == 19)
+        #expect(
+            try view(try row(batch, 1)).0.asArray(Float.self) == Array(11 ... 18).map(Float.init))
+    }
+
+    @Test("A ragged prefill after a wrap pads a completed row by the full roll")
+    func raggedPrefillAfterWrap() throws {
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0, 0])
+        let first = makePositionKV(
+            positions: 0 ..< 4, heads: 1, headDim: 1, batchSize: 2, rowStride: 10)
+        _ = cache.update(keys: first.0, values: first.1)
+        let decode = MLXArray([Float(4), 14]).reshaped([2, 1, 1, 1])
+        _ = cache.update(keys: decode, values: decode + 100)
+        #expect(cache.leftPadding.asArray(Int32.self) == [0, 0])
+
+        // Row 1 is complete; its two positions in the chunk are padding.
+        cache.prepare(lengths: [2, 0])
+        let chunk = MLXArray([Float(5), 6, 99, 99]).reshaped([2, 1, 2, 1])
+        _ = cache.update(keys: chunk, values: chunk + 100)
+        cache.finalize()
+        #expect(cache.leftPadding.asArray(Int32.self) == [0, 2])
+        #expect(cache.batchOffset.asArray(Int.self) == [7, 5])
+
+        // The extracted row holds its history only, no padding ahead of it.
+        let extracted = try row(cache, 1)
+        let keys = try #require(extracted.state.first)
+        #expect(keys[0, 0, 0..., 0].asArray(Float.self) == [11, 12, 13, 14])
+        #expect(extracted.offset == 5)
+
+        let next = MLXArray([Float(7), 15]).reshaped([2, 1, 1, 1])
+        _ = cache.update(keys: next, values: next + 100)
+        #expect(try view(try row(cache, 0)).0.asArray(Float.self) == [4, 5, 6, 7])
+        #expect(try view(try row(cache, 1)).0.asArray(Float.self) == [12, 13, 14, 15])
     }
 
     @Test("maxTrimCount reports only what trim can remove")
