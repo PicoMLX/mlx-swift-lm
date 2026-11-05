@@ -10,6 +10,64 @@ import Testing
 
 @Suite(.serialized)
 struct Phi4MultimodalReferenceTests {
+    private struct PixelFixture: Decodable {
+        struct Case: Decodable {
+            let name: String
+            let height: Int
+            let width: Int
+            let targetHeight: Int
+            let targetWidth: Int
+            let pixels: [UInt8]
+            let resized: [UInt8]
+        }
+        let cases: [Case]
+    }
+
+    private func pixelCase(_ name: String) throws -> PixelFixture.Case {
+        let url = try #require(
+            Bundle.module.url(forResource: "phi4mm-pixels", withExtension: "json"))
+        let fixture = try JSONDecoder().decode(PixelFixture.self, from: Data(contentsOf: url))
+        return try #require(fixture.cases.first { $0.name == name })
+    }
+
+    @Test(
+        "RGB pixels match Pillow byte for byte after both resize passes",
+        arguments: ["mild_downscale", "upscale", "asymmetric", "singleton", "identity"])
+    func pillowPixels(name: String) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let fixture = try pixelCase(name)
+            let pixels =
+                MLXArray(fixture.pixels).asType(.float32)
+                .reshaped(1, fixture.height, fixture.width, 3).transposed(0, 3, 1, 2) / 255
+            let resized = Phi4MultimodalPixelResampling.resize(
+                pixels, height: fixture.targetHeight, width: fixture.targetWidth)
+            let actual = floor(resized * 255 + 0.5).asType(.uint8).transposed(0, 2, 3, 1)
+                .flattened()
+            #expect(
+                arrayEqual(actual, MLXArray(fixture.resized)).item(Bool.self), "\(fixture.name)")
+        }
+    }
+
+    @Test("The image processor uses the RGB filter for a high-frequency 1.2x downscale")
+    func pillowProcessorPixels() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let fixture = try pixelCase("mild_downscale")
+            var configuration = Phi4MultimodalProcessorConfiguration()
+            configuration.patchSize = 1
+            configuration.minimumPatches = fixture.targetHeight * fixture.targetWidth
+            configuration.maximumPatches = configuration.minimumPatches
+            configuration.imageMean = [0, 0, 0]
+            configuration.imageStd = [1, 1, 1]
+            let processor = Phi4MultimodalProcessor(configuration, tokenizer: PixelTestTokenizer())
+            let image = UserInput.Image.array(
+                MLXArray(fixture.pixels).reshaped(fixture.height, fixture.width, 3))
+            let (patches, grid) = try processor.imagePatches(image)
+            #expect(grid.h == fixture.targetHeight && grid.w == fixture.targetWidth)
+            let actual = floor(patches * 255 + 0.5).asType(.uint8).flattened()
+            #expect(arrayEqual(actual, MLXArray(fixture.resized)).item(Bool.self))
+        }
+    }
+
     @Test(
         "Phi-4 multimodal components and modality adapters match the pinned Python implementation")
     func pythonReference() throws {
@@ -101,5 +159,21 @@ struct Phi4MultimodalReferenceTests {
                 #expect(maxAbsDifference(gpuMel, expectedMel) / scale < 1e-4)
             }
         }
+    }
+}
+
+private struct PixelTestTokenizer: Tokenizer {
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        throw TokenizerError.missingChatTemplate
     }
 }

@@ -217,11 +217,13 @@ let package = Package(
             path: "Tests/MLXLMTests",
             exclude: [
                 "README.md", "Resources/generate_phi4mm_reference.py",
+                "Resources/generate_phi4mm_pixels.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
                 .copy("Resources/phi4mm-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.json"),
+                .copy("Resources/phi4mm-pixels.json"),
             ]
         ),
         .macro(
