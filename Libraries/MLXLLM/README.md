@@ -56,6 +56,7 @@ Currently supported model types are:
 - Qwen2
 - Qwen3
 - Qwen3-Next
+- Ricursive (Ripple-65B Preview)
 - Starcoder2
 - MiMo
 - MiMo_v2_flash
@@ -64,6 +65,13 @@ Currently supported model types are:
 - GLM4MOE
 - AceReason
 - NemotronH
+
+Ripple-65B Preview uses the `ricursive` architecture. Load the official BF16
+checkpoint or an MLX affine-quantized conversion, such as
+`LLMRegistry.ripple_65b_preview_4bit`. The factory preserves Ripple's tool and
+reasoning-history chat format. Its local attention caches retain 1,024 tokens;
+global attention caches grow with the prompt. The advertised 1M context and
+DFlash2 speculative decoding are not validated by this port.
 
 See [llm-tool](../../Tools/llm-tool)
 

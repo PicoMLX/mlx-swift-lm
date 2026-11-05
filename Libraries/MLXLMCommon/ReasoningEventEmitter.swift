@@ -26,8 +26,9 @@
 /// is answer/tool content and stays in the stream to be re-scanned outside.
 /// `pendingPrefix` holds text that may be a delimiter split across a chunk
 /// boundary. For a delimiter pair, a start delimiter always (re)opens a reasoning
-/// span, so multiple blocks each route. For a labeled channel, a start delimiter
-/// inside an open channel also ends it, since channels do not nest.
+/// span under the default `.anywhere` start policy. `.responseStart` recognizes
+/// only one initial span. For a labeled channel, a start delimiter inside an
+/// open channel also ends it, since channels do not nest.
 ///
 /// **Delimiters as tokens.** Scanning text misroutes a delimiter the model only
 /// spells out in its answer. The generation loop avoids that when both delimiters
@@ -70,6 +71,9 @@ public struct ReasoningEventEmitter: Sendable {
     private let startDelimiter: String
     private let endDelimiter: String
     private let endDelimiters: [String]
+    private let startPolicy: ReasoningConfig.StartPolicy
+    private let whitespacePolicy: ReasoningConfig.WhitespacePolicy
+    private var canStartReasoning: Bool
 
     /// False when the caller reports the framing delimiters by token id. Their text
     /// is then content, and only ``scannedImplicitEndDelimiters`` are scanned for.
@@ -130,6 +134,9 @@ public struct ReasoningEventEmitter: Sendable {
             [config.endDelimiter] + implicitEndDelimiters
             + nestedOpener.filter { $0 != config.endDelimiter }
         self.channel = config.channel
+        self.startPolicy = config.startPolicy
+        self.whitespacePolicy = config.whitespacePolicy
+        self.canStartReasoning = !primedInside
         // A prompt can only prime a *reasoning* span: prefilling the answer
         // channel would mean the template wrote the answer.
         self.state = primedInside ? .inside(.reasoning) : .outside
@@ -161,6 +168,7 @@ public struct ReasoningEventEmitter: Sendable {
         var trimmed = Substring(tail)
         while let last = trimmed.last, last.isWhitespace { trimmed = trimmed.dropLast() }
         if trimmed.hasSuffix(config.startDelimiter) { return true }
+        if config.startPolicy == .responseStart { return false }
 
         // A prefilled channel may also carry its label, a single word as in
         // `<|channel>thought\n`. Markers and other tokens are not labels.
@@ -248,6 +256,23 @@ public struct ReasoningEventEmitter: Sendable {
                 state = resolved
 
             case .outside, .inside:
+                if case .outside = state, startPolicy == .responseStart {
+                    if working.isEmpty { break scan }
+                    if !canStartReasoning || startDelimiter.isEmpty || !scansFramingText {
+                        canStartReasoning = false
+                        appendSegment(String(working), trimmingTrailing: false, into: &output)
+                        break scan
+                    }
+                    if !working.hasPrefix(startDelimiter) {
+                        if startDelimiter.hasPrefix(working) {
+                            pendingPrefix = String(working)
+                        } else {
+                            canStartReasoning = false
+                            appendSegment(String(working), trimmingTrailing: false, into: &output)
+                        }
+                        break scan
+                    }
+                }
                 // Only set while inside a thought, and it comes before all of `working`.
                 var held = heldWhitespace
                 heldWhitespace = ""
@@ -262,10 +287,17 @@ public struct ReasoningEventEmitter: Sendable {
                     // so the recorded thought does not depend on how tokens split it.
                     var holdIndex = splitIndex
                     if case .inside(.reasoning) = state {
-                        while holdIndex > working.startIndex,
-                            working[working.index(before: holdIndex)].isWhitespace
-                        {
-                            holdIndex = working.index(before: holdIndex)
+                        switch whitespacePolicy {
+                        case .trim:
+                            while holdIndex > working.startIndex,
+                                working[working.index(before: holdIndex)].isWhitespace
+                            {
+                                holdIndex = working.index(before: holdIndex)
+                            }
+                        case .singleNewline:
+                            if working[..<holdIndex].unicodeScalars.last == "\n" {
+                                holdIndex = working.unicodeScalars.index(before: holdIndex)
+                            }
                         }
                     }
                     if holdIndex > working.startIndex {
@@ -353,7 +385,8 @@ public struct ReasoningEventEmitter: Sendable {
             let leftover = heldWhitespace + pendingPrefix
             pendingPrefix = ""
             heldWhitespace = ""
-            appendSegment(leftover, trimmingTrailing: true, into: &output)
+            appendSegment(
+                leftover, trimmingTrailing: whitespacePolicy == .trim, into: &output)
         }
         return output
     }
@@ -386,6 +419,7 @@ public struct ReasoningEventEmitter: Sendable {
     private mutating func stateAfterDelimiter(_ delimiter: String) -> State {
         switch state {
         case .outside:
+            canStartReasoning = false
             guard channel != nil else { return .inside(.reasoning) }
             // Stray end delimiter (see `watchedDelimiters`): consumed, opens nothing.
             return delimiter == startDelimiter ? .label : .outside
@@ -482,10 +516,25 @@ public struct ReasoningEventEmitter: Sendable {
         if text.isEmpty { return }
         var t = Substring(text)
         if pendingLeadingTrim {
-            t = t.drop(while: { $0.isWhitespace })
+            switch whitespacePolicy {
+            case .trim:
+                t = t.drop(while: { $0.isWhitespace })
+            case .singleNewline:
+                if t.unicodeScalars.first == "\n" {
+                    t = t[t.unicodeScalars.index(after: t.startIndex)...]
+                }
+                pendingLeadingTrim = false
+            }
         }
         if trimmingTrailing {
-            while let last = t.last, last.isWhitespace { t.removeLast() }
+            switch whitespacePolicy {
+            case .trim:
+                while let last = t.last, last.isWhitespace { t.removeLast() }
+            case .singleNewline:
+                if case .inside(.reasoning) = state, t.unicodeScalars.last == "\n" {
+                    t = t[..<t.unicodeScalars.index(before: t.endIndex)]
+                }
+            }
         }
         // All-whitespace after trimming: emit nothing, keep the leading-trim
         // pending so it applies to the next real text.

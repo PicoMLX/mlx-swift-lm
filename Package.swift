@@ -183,7 +183,10 @@ let package = Package(
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .process("Resources/Ricursive"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
