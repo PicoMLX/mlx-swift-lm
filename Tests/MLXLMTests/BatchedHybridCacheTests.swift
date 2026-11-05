@@ -212,6 +212,33 @@ struct BatchedHybridCacheTests {
         #expect(try #require(none[0]).shape == [1, 4])
     }
 
+    @Test("Extending an empty composite batch with prefilled rows keeps its children aligned")
+    func extendEmptyCompositeRows() throws {
+        let list = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let added = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let kv = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
+        _ = try #require(added[0] as? BatchKVCache).update(keys: kv.0, values: kv.1)
+        try #require(added[1] as? MambaCache)[0] = MLXArray(20 ..< 24).asType(.float32).reshaped([
+            1, 4,
+        ])
+        list.extend(other: added)
+
+        let attention = try #require(list[0] as? BatchKVCache)
+        let recurrent = try #require(list[1] as? MambaCache)
+        #expect(attention.batchSize == 2)
+        #expect(recurrent.batchSize == 2)
+        #expect(attention.leftPadding.asArray(Int32.self) == [3, 0])
+        #expect(try #require(recurrent[0]).shape == [2, 4])
+        #expect(try #require(recurrent[0])[0 ..< 1].sum().item(Float.self) == 0)
+        list.filter(batchIndices: batchRows(1))
+        #expect(attention.batchSize == 1)
+        #expect(recurrent.batchSize == 1)
+        #expect(
+            maxAbsDifference(
+                try #require(recurrent[0]), MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4]))
+                == 0)
+    }
+
     @Test("A nested CacheList masks with its batched attention descendant")
     func nestedCompositeMask() throws {
         let longer = KVCacheSimple()

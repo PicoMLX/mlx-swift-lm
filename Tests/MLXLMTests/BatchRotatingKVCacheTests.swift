@@ -133,6 +133,11 @@ struct BatchRotatingKVCacheTests {
         _ = cache.update(keys: kv.0, values: kv.1)
         #expect(cache.batchOffset.asArray(Int32.self) == [3, 2])
         #expect(try row(cache, 1).offset == 2)
+
+        // A batch with no rows changes nothing, prefilled or not.
+        cache.extend(other: BatchRotatingKVCache(maxSize: 8, leftPadding: []))
+        #expect(cache.batchSize == 2)
+        #expect(cache.batchOffset.asArray(Int32.self) == [3, 2])
     }
 
     @Test("An empty cache extended from another does not share its arrays")

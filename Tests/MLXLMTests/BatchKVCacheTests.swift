@@ -165,6 +165,37 @@ struct BatchKVCacheTests {
         #expect(cache.extract(1).offset == 2)
     }
 
+    @Test("Prefilled rows join empty rows as padding, and a zero-row batch changes nothing")
+    func extendMixedRows() throws {
+        let cache = BatchKVCache(leftPadding: [0])
+        let added = BatchKVCache(leftPadding: [0])
+        let kv = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
+        _ = added.update(keys: kv.0, values: kv.1)
+        cache.extend(other: added)
+        #expect(cache.batchSize == 2)
+        #expect(cache.leftPadding.asArray(Int32.self) == [3, 0])
+        #expect(cache.batchOffset.asArray(Int32.self) == [0, 3])
+        #expect(cache.extract(0).offset == 0)
+        #expect(maxAbsDifference(try #require(cache.extract(1).state.first), kv.0) == 0)
+
+        // The empty row's first token lands after its padding, the other row's after its history.
+        let next = makePositionKV(positions: 10 ..< 11, heads: 2, headDim: 4, batchSize: 2)
+        _ = cache.update(keys: next.0, values: next.1)
+        #expect(cache.batchOffset.asArray(Int32.self) == [1, 4])
+        #expect(
+            try #require(cache.extract(0).state.first)[0, 0, 0..., 0].asArray(Float.self) == [10])
+        #expect(cache.extract(1).offset == 4)
+
+        // The other way round, and a batch with no rows.
+        let populated = BatchKVCache(leftPadding: [0])
+        _ = populated.update(keys: kv.0, values: kv.1)
+        populated.extend(other: BatchKVCache(leftPadding: [0]))
+        populated.extend(other: BatchKVCache(leftPadding: []))
+        #expect(populated.batchSize == 2)
+        #expect(populated.leftPadding.asArray(Int32.self) == [0, 3])
+        #expect(populated.batchOffset.asArray(Int32.self) == [3, 0])
+    }
+
     @Test("An empty cache extended from another does not share its arrays")
     func extendEmptyCacheCopies() throws {
         let source = BatchKVCache(leftPadding: [0])

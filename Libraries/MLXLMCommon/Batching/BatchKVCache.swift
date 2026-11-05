@@ -238,7 +238,6 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
         setLeftPadding(padding)
     }
 
-    /// Appends the rows of `other`, whose rows must be prefilled or empty like this cache's.
     public override func extend(other: any KVCache) {
         guard let other = other as? BatchKVCache else {
             preconditionFailure("BatchKVCache can only be extended with a BatchKVCache")
@@ -246,31 +245,41 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
         extend(other: other)
     }
 
+    /// Appends the rows of `other`. Port of mlx-lm's `BatchKVCache.extend`: rows without keys
+    /// yet join as all-padding rows, so empty and prefilled rows can share a batch, and a
+    /// batch with no rows changes nothing.
     public func extend(other: BatchKVCache) {
-        // Prefilled rows join prefilled rows, empty rows join empty rows; a mix would need
-        // all-padding rows, which a prefill cannot fill afterwards.
-        precondition(
-            other.keys != nil || keys == nil,
-            "BatchKVCache.extend cannot add empty rows to prefilled rows")
-        precondition(
-            keys != nil || batchSize == 0 || other.keys == nil,
-            "BatchKVCache.extend cannot add prefilled rows to empty rows")
-        guard let ownKeys = keys, let ownValues = values, let otherKeys = other.keys,
-            let otherValues = other.values
-        else {
-            if keys == nil, other.keys == nil {
-                setLeftPadding(leftPaddingValues + other.leftPaddingValues)
-                setPositions(positions + other.positions)
-            } else if let otherKeys = other.keys, let otherValues = other.values {
-                // New array objects, so writes to either cache leave the other unchanged.
-                keys = otherKeys[.ellipsis]
-                values = otherValues[.ellipsis]
-                offset = other.offset
-                setLeftPadding(other.leftPaddingValues)
-                setPositions(other.positions)
-            }
+        guard other.batchSize > 0 else { return }
+        guard batchSize > 0 else {
+            // New array objects, so writes to either cache leave the other unchanged.
+            keys = other.keys?[.ellipsis]
+            values = other.values?[.ellipsis]
+            offset = other.offset
+            setLeftPadding(other.leftPaddingValues)
+            setPositions(other.positions)
+            setRightPadding(other.rightPaddingValues)
             return
         }
+        guard let templateKeys = keys ?? other.keys, let templateValues = values ?? other.values
+        else {
+            setLeftPadding(leftPaddingValues + other.leftPaddingValues)
+            setPositions(positions + other.positions)
+            return
+        }
+        // Rows without keys take zero-width arrays, which the padding below fills.
+        func arrays(_ cache: BatchKVCache) -> (MLXArray, MLXArray) {
+            if let keys = cache.keys, let values = cache.values { return (keys, values) }
+            return (
+                MLXArray.zeros(
+                    [cache.batchSize, templateKeys.dim(1), 0, templateKeys.dim(3)],
+                    dtype: templateKeys.dtype),
+                MLXArray.zeros(
+                    [cache.batchSize, templateValues.dim(1), 0, templateValues.dim(3)],
+                    dtype: templateValues.dtype)
+            )
+        }
+        let (ownKeys, ownValues) = arrays(self)
+        let (otherKeys, otherValues) = arrays(other)
 
         let end = max(offset, other.offset)
         let width = max(ownKeys.dim(2), otherKeys.dim(2))
