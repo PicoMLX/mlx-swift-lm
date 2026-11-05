@@ -358,6 +358,30 @@ struct BatchRotatingKVCacheTests {
                 == Array(10 + lengths[1] - 3 ... 10 + lengths[1]).map(Float.init))
     }
 
+    @Test("A merged row that has evicted history cannot be rewound")
+    func mergedEvictedRowIsNotTrimmable() throws {
+        let single = RotatingKVCache(maxSize: 8)
+        for position in 0 ..< 17 { append(position ..< position + 1, to: single) }
+        #expect(single.trim(2) == 2)
+        #expect(single.maxTrimCount == 0)
+
+        // The batch holds six positions of a window of eight, but nine are evicted.
+        let batch = try RotatingKVCache.merge([single])
+        #expect(batch.evictedTokenCount == 9)
+        #expect(!batch.isTrimmable)
+        #expect(batch.maxTrimCount == 0)
+        #expect(!canTrimPromptCache([batch], numTokens: 1))
+        #expect(trimPromptCache([batch], numTokens: 1) == 0)
+        #expect(batch.batchOffset.asArray(Int.self) == [15])
+
+        // A merged row that has evicted nothing still rewinds.
+        let short = RotatingKVCache(maxSize: 8)
+        append(0 ..< 5, to: short)
+        let fresh = try RotatingKVCache.merge([short])
+        #expect(fresh.maxTrimCount == 5)
+        #expect(canTrimPromptCache([fresh], numTokens: 2))
+    }
+
     @Test("A trimmed wrapped source keeps its rows through batching and decode")
     func trimmedWrappedSource() throws {
         let single = RotatingKVCache(maxSize: 8)
