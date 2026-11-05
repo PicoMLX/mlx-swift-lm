@@ -172,6 +172,65 @@ struct BatchTokenIteratorTests {
         #expect(actual.map { $0[0] } == expected.map { $0[0] })
     }
 
+    @Test("Ragged rows of a hybrid attention-recurrent model join while others decode")
+    func hybridRowsJoinMidDecode() throws {
+        // On the default device, like `recurrentRows`: each row's first token comes from its
+        // own prefill and must match the prompt alone; later steps run a wider scan.
+        let model = try tinyFalconH1()
+        let prompts: [[Int]] = [[1, 2, 3, 4, 5, 6], [7, 8], [9, 10, 11]]
+        let expected = try prompts.map { prompt in
+            try generateAlone(model, prompt: prompt, sampler: ArgMaxSampler(), maxTokens: 5)
+        }
+
+        var iterator = BatchTokenIterator(model: model, maxTokens: 5)
+        var uids = iterator.insert(prompts: Array(prompts[0 ..< 2]))
+        var tokens = [Int: [Int]]()
+        for _ in 0 ..< 2 {
+            for response in try iterator.next() {
+                tokens[response.uid, default: []].append(response.token)
+            }
+        }
+        uids += iterator.insert(prompts: [prompts[2]])
+        while true {
+            let responses = try iterator.next()
+            if responses.isEmpty { break }
+            for response in responses {
+                tokens[response.uid, default: []].append(response.token)
+            }
+        }
+        let actual = uids.map { tokens[$0] ?? [] }
+        #expect(actual.map(\.count) == [5, 5, 5])
+        #expect(actual.map { $0[0] } == expected.map { $0[0] })
+    }
+
+    @Test("A sampler from outside the library gets each row's raw logits")
+    func customSamplerGetsRawLogits() throws {
+        // The first token with a positive logit: all log-probabilities are negative, so a
+        // sampler handed those instead would always pick token zero.
+        struct FirstPositiveSampler: LogitSampler {
+            func sample(logits: MLXArray) -> MLXArray {
+                argMax(logits .> 0, axis: -1)
+            }
+        }
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            let sampler = FirstPositiveSampler()
+            let expected = try Self.prompts.map { prompt in
+                try generateAlone(model, prompt: prompt, sampler: sampler, maxTokens: 6)
+            }
+            #expect(expected.contains { $0.contains { $0 != 0 } }, "the model has positive logits")
+            // One sampler shared by every row, and one per row.
+            #expect(
+                try batchGenerate(
+                    model: model, prompts: Self.prompts, maxTokens: 6, sampler: sampler)
+                    == expected)
+            var iterator = BatchTokenIterator(model: model, maxTokens: 6)
+            let uids = iterator.insert(
+                prompts: Self.prompts, samplers: Self.prompts.map { _ in FirstPositiveSampler() })
+            #expect(try collect(&iterator, uids: uids) == expected)
+        }
+    }
+
     @Test("A one-token prompt joins a longer one on a sliding-window model")
     func mixedLengthRotatingRows() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -265,6 +324,26 @@ private func tinyMamba2() throws -> Mamba2Model {
             """.utf8))
     return withRandomState(MLXRandom.RandomState(seed: 601)) {
         let model = Mamba2Model(configuration)
+        eval(model)
+        return model
+    }
+}
+
+private func tinyFalconH1() throws -> FalconH1Model {
+    let configuration = try JSONDecoder().decode(
+        FalconH1Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "falcon_h1", "hidden_size": 32, "num_hidden_layers": 2,
+              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+              "vocab_size": 100, "mamba_d_ssm": 16, "mamba_d_state": 8, "mamba_d_head": 8,
+              "mamba_n_heads": 2, "mamba_n_groups": 1, "mamba_d_conv": 4, "mamba_chunk_size": 64,
+              "attention_in_multiplier": 2.0, "key_multiplier": 0.5
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 602)) {
+        let model = FalconH1Model(configuration)
         eval(model)
         return model
     }

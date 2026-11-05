@@ -465,8 +465,11 @@ public struct TopPSampler: LogitSampler {
 
         // Mask low-probability tail in sorted order, scatter back to original vocab order.
         // The top token always stays: a threshold that rounds to one would drop every token.
-        let last = MLXArray(Int32(0) ..< Int32(logprobs.dim(-1))) .== Int32(logprobs.dim(-1) - 1)
-        let kept = (cumulativeProbs .> (1 - topP)) .|| last
+        // It is the last in sorted order, where the cumulative sum reaches its total; no
+        // earlier entry does, since the probabilities ahead of it are at least as large.
+        // (A host-built index array here cost more than the rest of the draw.)
+        let total = cumulativeProbs[.ellipsis, (cumulativeProbs.dim(-1) - 1)...]
+        let kept = (cumulativeProbs .> (1 - topP)) .|| (cumulativeProbs .>= total)
         let filtered = MLX.where(kept, sortedLogprobs, negInf)
         return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
     }

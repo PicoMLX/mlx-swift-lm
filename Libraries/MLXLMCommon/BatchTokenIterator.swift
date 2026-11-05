@@ -249,20 +249,26 @@ public struct BatchTokenIterator {
         return sampled
     }
 
-    /// One batched draw when every row shares a sampler, otherwise one draw per row from
-    /// log-probabilities normalized once.
+    /// One batched draw when every row shares one of the library's samplers, which take a
+    /// `[B, V]` batch; otherwise one draw per row. A row's `TopPSampler` draws from
+    /// log-probabilities normalized once for the batch; any other sampler gets the row's
+    /// raw logits, as ``LogitSampler/sample(logits:)`` promises.
     private func sample(_ logits: MLXArray) -> MLXArray {
-        let shared = rows.allSatisfy { $0.sampler.sharesState(with: rows[0].sampler) }
-        if shared, rows[0].sampler is ArgMaxSampler {
-            return argMax(logits, axis: -1)
+        let first = rows[0].sampler
+        if rows.allSatisfy({ $0.sampler.sharesState(with: first) }) {
+            return first.sample(logits: logits)
         }
-        let logProbabilities = logSoftmax(logits.asType(.float32), axis: -1)
-        if shared {
-            return rows[0].sampler.sample(normalized: logProbabilities)
-        }
+        var logProbabilities: MLXArray? = nil
         return concatenated(
-            rows.indices.map { index in
-                rows[index].sampler.sample(normalized: logProbabilities[index ..< index + 1])
+            rows.indices.map { index -> MLXArray in
+                if let sampler = rows[index].sampler as? TopPSampler {
+                    let normalized =
+                        logProbabilities ?? logSoftmax(logits.asType(.float32), axis: -1)
+                    logProbabilities = normalized
+                    return sampler.sample(logProbabilities: normalized[index ..< index + 1])
+                }
+                return rows[index].sampler.sample(logits: logits[index ..< index + 1])
+                    .reshaped([-1])
             })
     }
 
@@ -282,7 +288,9 @@ public struct BatchTokenIterator {
 }
 
 extension LogitSampler {
-    /// Whether `other` draws from this sampler's random state, so one call can sample a batch.
+    /// Whether `other` is one of the library's samplers drawing from this sampler's random
+    /// state, so one call can sample a batch. Never true for a sampler from outside, whose
+    /// handling of a `[B, V]` batch is unknown.
     fileprivate func sharesState(with other: LogitSampler) -> Bool {
         switch (self, other) {
         case (is ArgMaxSampler, is ArgMaxSampler):
@@ -294,14 +302,6 @@ extension LogitSampler {
         default:
             return false
         }
-    }
-
-    /// Samples from log-probabilities, without normalizing them again.
-    fileprivate func sample(normalized logProbabilities: MLXArray) -> MLXArray {
-        if let sampler = self as? TopPSampler {
-            return sampler.sample(logProbabilities: logProbabilities)
-        }
-        return sample(logits: logProbabilities)
     }
 }
 
