@@ -148,32 +148,32 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 let sequence = try await MediaProcessing.asProcessedSequence(
                     video,
                     processing: input.processing.video,
-                    targetFPS: { _ in Double(2) }
-                ) { frame in
-                    let processed = MediaProcessing.apply(
-                        try frame.image.asCIImage(), processing: input.processing)
-                    if resizedSize == .zero {
-                        let size = processed.extent.size
-                        // Same per-frame vision-token budget cap as the image
-                        // path: the global ViT is just as O(patches²) on a
-                        // video frame. Override-able via
-                        // `processing.maxPixels`.
-                        let factor = config.patchSize * config.mergeSize
-                        let maxPixels =
-                            input.processing.maxPixels
-                            ?? Self.defaultVisionTokenBudgetPixels(
-                                factor: factor, ceiling: config.maxPixels)
-                        let (height, width) = try QwenVL.targetSize(
-                            height: Int(size.height),
-                            width: Int(size.width),
-                            factor: factor,
-                            minPixels: input.processing.minPixels ?? config.minPixels,
-                            maxPixels: maxPixels)
-                        resizedSize = CGSize(width: width, height: height)
-                    }
-                    let finalImage = preprocess(image: processed, resizedSize: resizedSize)
-                    return VideoFrame(image: .ciImage(finalImage), timeStamp: frame.timeStamp)
-                }
+                    targetFPS: { _ in Double(2) },
+                    frameProcessing: { frame in
+                        let processed = MediaProcessing.apply(
+                            try frame.image.asCIImage(), processing: input.processing)
+                        if resizedSize == .zero {
+                            let size = processed.extent.size
+                            // Same per-frame vision-token budget cap as the image
+                            // path: the global ViT is just as O(patches²) on a
+                            // video frame. Override-able via
+                            // `processing.maxPixels`.
+                            let factor = config.patchSize * config.mergeSize
+                            let maxPixels =
+                                input.processing.maxPixels
+                                ?? Self.defaultVisionTokenBudgetPixels(
+                                    factor: factor, ceiling: config.maxPixels)
+                            let (height, width) = try QwenVL.targetSize(
+                                height: Int(size.height),
+                                width: Int(size.width),
+                                factor: factor,
+                                minPixels: input.processing.minPixels ?? config.minPixels,
+                                maxPixels: maxPixels)
+                            resizedSize = CGSize(width: width, height: height)
+                        }
+                        let finalImage = preprocess(image: processed, resizedSize: resizedSize)
+                        return VideoFrame(image: .ciImage(finalImage), timeStamp: frame.timeStamp)
+                    })
                 accumulatedFrames.append(sequence.frames)
             }
 
@@ -383,6 +383,26 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
             case _inChannels = "in_channels"
             case _hiddenAct = "hidden_act"
             case _deepstackVisualIndexes = "deepstack_visual_indexes"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen3_vl"
+            depth = try c.decode(Int.self, forKey: .depth)
+            hiddenSize = try c.decode(Int.self, forKey: .hiddenSize)
+            intermediateSize = try c.decode(Int.self, forKey: .intermediateSize)
+            outHiddenSize = try c.decode(Int.self, forKey: .outHiddenSize)
+            numHeads = try c.decode(Int.self, forKey: .numHeads)
+            patchSize = try c.decode(Int.self, forKey: .patchSize)
+            spatialMergeSize = try c.decode(Int.self, forKey: .spatialMergeSize)
+            temporalPatchSize = try c.decode(Int.self, forKey: .temporalPatchSize)
+            // Omni omits this default although its checkpoint contains 2304 learned rows.
+            numPositionEmbeddings =
+                try c.decodeIfPresent(Int.self, forKey: .numPositionEmbeddings) ?? 2304
+            _inChannels = try c.decodeIfPresent(Int.self, forKey: ._inChannels)
+            _hiddenAct = try c.decodeIfPresent(String.self, forKey: ._hiddenAct)
+            _deepstackVisualIndexes = try c.decodeIfPresent(
+                [Int].self, forKey: ._deepstackVisualIndexes)
         }
     }
 

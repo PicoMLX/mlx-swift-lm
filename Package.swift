@@ -233,6 +233,32 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Tests/MiniCPMCheckpointSmoke", exclude: ["prepare.py", "run.sh"]),
+        .executableTarget(
+            name: "Qwen3OmniDistributedParity",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniDistributedParity", exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "Qwen3OmniCheckpointSmoke",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniCheckpointSmoke", exclude: ["run.sh", "prepare.py"]
+        ),
+        .executableTarget(
+            name: "Qwen3OmniSDPABenchmark",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniSDPABenchmark"
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -253,9 +279,12 @@ let package = Package(
                 "Resources/generate_phi4mm_reference.py",
                 "Resources/generate_deepseek_ocr_reference.py",
                 "Resources/generate_minicpm_reference.py",
+                "Resources/generate_qwen3_omni_fixture.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/qwen3-omni-reference.safetensors"),
+                .copy("Resources/qwen3-omni-reference.json"),
                 .copy("Resources/gemma3n-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.safetensors"),
                 .copy("Resources/phi4mm-reference.json"),

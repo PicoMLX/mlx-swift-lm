@@ -1,0 +1,17 @@
+Qwen3 Omni Thinker input-to-text implementation
+
+Audio/vision/language structures were adapted from mlx-vlm, MIT license,
+https://github.com/Blaizzy/mlx-vlm/tree/4693cd0eaf022ae7ef61c6fdb55e17e6399879a7/mlx_vlm/models/qwen3_omni_moe
+Copyright (c) 2024 Blaizzy.
+
+Time-aware MRoPE positions, synchronized audiovisual token interleaving, and
+Whisper log-mel feature extraction follow Hugging Face Transformers,
+https://github.com/huggingface/transformers/tree/main/src/transformers/models/qwen3_omni_moe
+and src/transformers/models/whisper/feature_extraction_whisper.py.
+Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team.
+Apache License, Version 2.0 (included).
+
+The Swift implementation shares Qwen3-VL vision and Qwen3-VL MoE language
+modules already present in this package. It excludes speech synthesis.
+No pretrained model weights are included; fixtures use deterministic tiny
+random models. Model checkpoint licenses continue to apply separately.

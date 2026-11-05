@@ -93,6 +93,8 @@ public enum VLMTypeRegistry {
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_vl_moe": create(Qwen3VLMoEConfiguration.self, Qwen3VLMoE.init),
+        "qwen3_omni_moe": create(Qwen3OmniConfiguration.self, Qwen3Omni.init),
+        "qwen3_omni_moe_thinker": create(Qwen3OmniConfiguration.self, Qwen3Omni.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "qwen3_8": create(Qwen35Configuration.self, Qwen35.init),
@@ -142,6 +144,9 @@ public enum VLMProcessorTypeRegistry {
             Qwen2VLProcessorConfiguration.self, Qwen2VLProcessor.init),
         "Qwen2_5_VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
+        "Qwen3OmniMoeProcessor": create(
+            Qwen3OmniProcessorConfiguration.self, Qwen3OmniProcessor.init),
+        "Qwen3OmniProcessor": create(Qwen3OmniProcessorConfiguration.self, Qwen3OmniProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
         "Qwen3_5VLProcessor": create(
@@ -615,12 +620,18 @@ func resolveProcessorConfiguration(
     guard let processorType else {
         throw missingProcessorTypeError(filename: configuration.filename)
     }
-    let data =
-        context.modelType == "gemma3n"
-        ? try Gemma3nProcessorConfiguration.mergedData(
+    let data: Data
+    if context.modelType == "gemma3n" {
+        data = try Gemma3nProcessorConfiguration.mergedData(
             directory: modelDirectory,
             modelConfiguration: context.configurationData, selected: configuration.data)
-        : configuration.data
+    } else if context.modelType == "qwen3_omni_moe" || context.modelType == "qwen3_omni_moe_thinker" {
+        data = try Qwen3OmniProcessorConfiguration.mergedData(
+            directory: modelDirectory,
+            modelConfiguration: context.configurationData, selected: configuration.data)
+    } else {
+        data = configuration.data
+    }
     return VLMProcessorConfiguration(data: data, processorType: processorType)
 }
 
