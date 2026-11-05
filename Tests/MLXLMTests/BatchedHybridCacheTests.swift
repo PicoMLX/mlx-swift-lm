@@ -33,8 +33,7 @@ struct BatchedHybridCacheTests {
     @Test("A merged empty recurrent batch masks by the prepared lengths")
     func mergedRecurrentMasksByLengths() throws {
         let cache = try #require(ArraysCache.merge([MambaCache(), MambaCache()]) as? MambaCache)
-        #expect(
-            cache.leftPadding?.asArray(Int32.self) == [0, 0], "every empty row has zero padding")
+        #expect(cache.leftPadding == nil, "empty rows carry no padding that would hide lengths")
         #expect(cache.batchSize == 2)
         cache.prepare(lengths: [1, 2])
         #expect(cache.batchSize == 2)

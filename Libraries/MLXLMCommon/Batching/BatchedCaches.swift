@@ -74,11 +74,10 @@ extension ArraysCache {
         for row in rows.dropFirst() {
             merged.extend(other: row)
         }
-        // An all-empty merge has no arrays to count rows by, so every row carries zero
-        // padding until its first prefill finalizes, as in mlx-lm.
-        if template == nil, merged.leftPadding == nil {
-            let rowCount = caches.reduce(0) { $0 + $1.batchSize }
-            merged.leftPadding = MLXArray([Int32](repeating: 0, count: rowCount))
+        // An all-empty merge has no arrays to count rows by, so it records how many it holds
+        // (mlx-lm gives every row zero padding; see `emptyRowCount`).
+        if template == nil {
+            merged.emptyRowCount = caches.reduce(0) { $0 + $1.batchSize }
         }
         // Recurrent state keeps one position counter for the batch: the longest row's.
         merged.offset = caches.map(\.offset).max() ?? 0

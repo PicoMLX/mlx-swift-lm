@@ -1604,6 +1604,11 @@ public class ArraysCache: BaseKVCache {
     fileprivate var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
+    /// The rows an empty cache stands for when no array records them, as after a merge of
+    /// empty rows. mlx-lm records them as zero left padding; here padding takes precedence
+    /// over lengths in ``makeMask(N:)``, so it would hide the lengths of a later ragged
+    /// prefill.
+    internal var emptyRowCount: Int?
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
@@ -1640,10 +1645,12 @@ public class ArraysCache: BaseKVCache {
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         new.lengths = self.lengths
+        new.emptyRowCount = self.emptyRowCount
     }
 
     internal var batchSize: Int {
-        cache.lazy.compactMap { $0?.dim(0) }.first ?? leftPadding?.size ?? lengths?.size ?? 1
+        cache.lazy.compactMap { $0?.dim(0) }.first ?? leftPadding?.size ?? lengths?.size
+            ?? emptyRowCount ?? 1
     }
 
     /// In-place filter to keep just the given indices in the cache
@@ -1653,6 +1660,9 @@ public class ArraysCache: BaseKVCache {
         }
         leftPadding = leftPadding?[batchIndices]
         lengths = lengths?[batchIndices]
+        if emptyRowCount != nil {
+            emptyRowCount = batchIndices.size
+        }
     }
 
     /// In-place extend this cache with the other cache
@@ -1677,6 +1687,9 @@ public class ArraysCache: BaseKVCache {
         }
         leftPadding = concatenate(leftPadding, other.leftPadding)
         lengths = concatenate(lengths, other.lengths)
+        if emptyRowCount != nil || other.emptyRowCount != nil {
+            emptyRowCount = aBatch + bBatch
+        }
     }
 
     public override func prepare(lengths: [Int]?) {
@@ -1724,15 +1737,13 @@ public class ArraysCache: BaseKVCache {
     /// Create attention mask based on left padding or prepared sequence lengths
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
-        var mask: MLXArray? = nil
         if let leftPadding {
-            mask = positions .>= leftPadding[0..., .newAxis]
+            return positions .>= leftPadding[0..., .newAxis]
+        } else if let lengths {
+            return positions .< lengths[0..., .newAxis]
+        } else {
+            return nil
         }
-        if let lengths {
-            let inLength = positions .< lengths[0..., .newAxis]
-            mask = mask.map { $0 .&& inLength } ?? inLength
-        }
-        return mask
     }
 
     // MARK: - Serialization
