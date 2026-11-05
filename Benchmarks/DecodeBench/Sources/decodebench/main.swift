@@ -2,8 +2,8 @@
 
 // Greedy decode throughput on a local model, as a median over rounds: the single-sequence
 // `TokenIterator`, and `BatchTokenIterator` at one and four rows. Decode is timed after the
-// prefill and the first token. The single and the one-row batch must decode the same tokens,
-// and every round must repeat them.
+// prefill and the first token. Every path must repeat its tokens in every round; how far the
+// paths agree with each other is reported.
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
 //       [decode tokens: 128] [rounds: 5] [prompt tokens: 145]
@@ -98,7 +98,10 @@ var batchOfOne: [Double] = []
 var batchOfFour: [Double] = []
 var reference: [Int]? = nil
 var fourReference: [[Int]]? = nil
+var oneReference: [[Int]]? = nil
 var mismatchedRounds: [Int] = []
+var agreement: [Int] = []
+var rowAgreement: [Int] = []
 for round in 0 ..< rounds {
     // Alternate the order so a thermal or background-load slope lands on both paths.
     let batchedFirst = round % 2 == 1
@@ -112,12 +115,16 @@ for round in 0 ..< rounds {
     batchOfFour.append(four.tokensPerSecond)
     if reference == nil { reference = plain.tokens }
     if fourReference == nil { fourReference = four.tokens }
-    let expected = Array(plain.tokens.dropFirst())
-    if plain.tokens != reference || one.tokens[0] != expected || four.tokens[0] != expected
-        || four.tokens != fourReference
-    {
+    // Each path must repeat itself across rounds exactly. Between paths the arithmetic
+    // differs (the batch prefills all but each prompt's last token, and four rows run other
+    // matmul shapes than one), so under TF32 their greedy streams can part ways; how far
+    // they agree is reported, not asserted.
+    if oneReference == nil { oneReference = one.tokens }
+    if plain.tokens != reference || one.tokens != oneReference || four.tokens != fourReference {
         mismatchedRounds.append(round + 1)
     }
+    agreement.append(zip(plain.tokens.dropFirst(), one.tokens[0]).prefix { $0 == $1 }.count)
+    rowAgreement.append(zip(one.tokens[0], four.tokens[0]).prefix { $0 == $1 }.count)
     print(
         String(
             format:
@@ -132,5 +139,8 @@ print(
             "median  single %.2f tok/s   batch(1) %.2f tok/s   batch(4) %.2f tok/s per row, %.2f total",
         median(single), median(batchOfOne), median(batchOfFour), 4 * median(batchOfFour)))
 print(
-    "tokens identical across paths and rounds: \(mismatchedRounds.isEmpty)"
+    "each path repeats its tokens in every round: \(mismatchedRounds.isEmpty)"
         + (mismatchedRounds.isEmpty ? "" : ", not in rounds \(mismatchedRounds)"))
+print(
+    "single and batch(1) agree on the first \(agreement.min() ?? 0) of \(decodeTokens) tokens; "
+        + "batch(1) and row 0 of batch(4) on the first \(rowAgreement.min() ?? 0)")

@@ -222,7 +222,8 @@ public struct BatchTokenIterator {
                     return rows[index].processor?.process(logits: row) ?? row
                 })
         }
-        let sampled = sample(logits)
+        // Int32 in the graph, so reading the tokens back next step converts nothing.
+        let sampled = sample(logits).asType(.int32)
         for index in rows.indices {
             rows[index].processor?.didSample(token: sampled[index ..< index + 1])
         }
