@@ -57,6 +57,58 @@ struct BatchRotatingKVCacheTests {
         #expect(try #require(second.state.last)[0, 0, 0..., 0].asArray(Float.self) == [110, 111])
     }
 
+    @Test("trim removes nothing once the window has filled")
+    func trimAfterWrap() throws {
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0])
+        append(0 ..< 4, to: cache)
+        append(4 ..< 5, to: cache)
+        #expect(cache.maxTrimCount == 0)
+        #expect(cache.trim(2) == 0)
+        #expect(cache.batchOffset.asArray(Int.self) == [5])
+        append(5 ..< 6, to: cache)
+        #expect(try view(try row(cache)).0.asArray(Float.self) == [2, 3, 4, 5])
+    }
+
+    @Test("A ragged prefill keeps a completed row's full window")
+    func raggedPrefillKeepsCompletedRows() throws {
+        let cache = BatchRotatingKVCache(maxSize: 4, leftPadding: [0, 0])
+        cache.prepare(lengths: [8, 4])
+        let first = makePositionKV(
+            positions: 0 ..< 4, heads: 1, headDim: 1, batchSize: 2, rowStride: 10)
+        _ = cache.update(keys: first.0, values: first.1)
+        // Row 1 is complete; its entries in this chunk are padding.
+        let second = MLXArray([Float(4), 5, 6, 7, 99, 99, 99, 99]).reshaped([2, 1, 4, 1])
+        guard case .array(let mask) = cache.makeMask(n: 4, windowSize: nil, returnArray: true)
+        else {
+            Issue.record("Expected an array mask")
+            return
+        }
+        #expect(mask.shape == [2, 1, 4, 8])
+        _ = cache.update(keys: second, values: second + 100)
+        cache.finalize()
+
+        #expect(try view(try row(cache, 0)).0.asArray(Float.self) == [4, 5, 6, 7])
+        #expect(try view(try row(cache, 1)).0.asArray(Float.self) == [10, 11, 12, 13])
+        #expect(cache.batchOffset.asArray(Int.self) == [8, 4])
+
+        let decode = MLXArray([Float(8), 14]).reshaped([2, 1, 1, 1])
+        _ = cache.update(keys: decode, values: decode + 100)
+        #expect(try view(try row(cache, 0)).0.asArray(Float.self) == [5, 6, 7, 8])
+        #expect(try view(try row(cache, 1)).0.asArray(Float.self) == [11, 12, 13, 14])
+    }
+
+    @Test("A merged batch reports the tokens its rows have evicted")
+    func evictedTokens() throws {
+        let single = RotatingKVCache(maxSize: 8)
+        for position in 0 ..< 11 { append(position ..< position + 1, to: single) }
+        #expect(single.evictedTokenCount == 3)
+        let batch = try RotatingKVCache.merge([single])
+        #expect(batch.evictedTokenCount == 3)
+        append(11 ..< 12, to: batch)
+        #expect(batch.evictedTokenCount == 4)
+        #expect(BatchRotatingKVCache(maxSize: 8, leftPadding: [0, 2]).evictedTokenCount == 0)
+    }
+
     @Test("maxTrimCount reports only what trim can remove")
     func maxTrimCountMatchesTrim() {
         let cache = BatchRotatingKVCache(maxSize: 16, leftPadding: [2, 0])
