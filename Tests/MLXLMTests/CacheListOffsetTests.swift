@@ -48,10 +48,8 @@ struct CacheListOffsetTests {
     @Test("Extracting a composite batch reports the selected row's cache position")
     func extractedRowPosition() throws {
         try Device.withDefaultDevice(.cpu) {
-            let factories = try makeBatchedCacheFactories(for: [
-                CacheList(KVCacheSimple(), ArraysCache(size: 1))
-            ])
-            let cache = try #require(factories[0]([0, 0]) as? BatchedCacheList)
+            let rows = (0 ..< 2).map { _ in CacheList(KVCacheSimple(), ArraysCache(size: 1)) }
+            let cache = try #require(try mergeCaches(rows) as? CacheList)
             cache.prepare(lengths: [2, 5])
             _ = cache[0].update(
                 keys: MLXArray.ones([2, 2, 5, 4]), values: MLXArray.ones([2, 2, 5, 4]))
@@ -79,8 +77,8 @@ struct CacheListOffsetTests {
             let original = source(length: 5, mode: 9)
             let added = source(length: 2, mode: 17)
             let originalKeys = original[0].state[0] + 0
-            let batch = try #require(makeBatchedCache(from: original) as? BatchedCacheList)
-            let nested = try #require(batch[0] as? BatchedCacheList)
+            let batch = try #require(makeBatchedCache(from: original) as? CacheList)
+            let nested = try #require(batch[0] as? CacheList)
             #expect(nested[0] is BatchKVCache)
             #expect(batch[1] is MambaCache)
             #expect(batch.offset == 5)

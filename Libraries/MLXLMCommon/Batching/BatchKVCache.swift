@@ -14,33 +14,82 @@ import MLX
 /// [2, 6, 8, 9]
 /// ```
 /// with ``leftPadding`` `[1, 3, 0]`. ``KVCache/offset`` is the width of the buffer in use.
+///
+/// Row positions and padding live on the host. The arrays the model reads are
+/// built from them on demand, so a decode step advances positions without a
+/// kernel per layer, and a batch whose rows carry no padding decodes one token
+/// with no mask at all.
 public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     /// Each row's left padding, shape `[B]`.
     public private(set) var leftPadding: MLXArray
 
+    /// Each row's left padding on the host; `leftPadding` mirrors it.
+    private var leftPaddingValues: [Int32]
+
+    /// Each row's position on the host. It starts at `-leftPadding`.
+    private var positions: [Int32]
+
+    /// `positions` as an array, built on first use after every change.
+    private var positionsArray: MLXArray?
+
     /// Each row's position, shape `[B]`. It starts at `-leftPadding`.
-    public private(set) var batchOffset: MLXArray
+    public var batchOffset: MLXArray {
+        if let positionsArray { return positionsArray }
+        let array = MLXArray(positions)
+        positionsArray = array
+        return array
+    }
 
     var keys: MLXArray?
     var values: MLXArray?
 
     /// The right padding of a ragged prefill, from `prepare` until `finalize`.
     private var rightPadding: MLXArray?
+    private var rightPaddingValues: [Int32]?
 
     public var step = 256
 
     /// - Parameter leftPadding: the left padding of each row
     public init(leftPadding: [Int]) {
-        self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
-        self.batchOffset = MLXArray(leftPadding.map { -Int32($0) })
+        let padding = leftPadding.map { Int32($0) }
+        self.leftPaddingValues = padding
+        self.leftPadding = MLXArray(padding)
+        self.positions = padding.map { -$0 }
         super.init()
     }
 
     /// The number of rows.
-    public var batchSize: Int { leftPadding.dim(0) }
+    public var batchSize: Int { positions.count }
+
+    /// Whether any row carries left padding.
+    private var hasLeftPadding: Bool { leftPaddingValues.contains { $0 != 0 } }
+
+    fileprivate func setPositions(_ new: [Int32]) {
+        positions = new
+        positionsArray = nil
+    }
+
+    private func setLeftPadding(_ new: [Int32]) {
+        leftPaddingValues = new
+        leftPadding = MLXArray(new)
+    }
+
+    private func setRightPadding(_ new: [Int32]?) {
+        rightPaddingValues = new
+        rightPadding = new.map { MLXArray($0) }
+    }
 
     /// Per-row positions, also when the cache is typed as `KVCache`.
-    public override var ropeOffset: RoPEOffset { .batch(batchOffset + 0) }
+    ///
+    /// Rows at one shared position, such as a batch of one, get the scalar
+    /// form, so no array is built per layer per step. Otherwise no copy:
+    /// every change replaces the array rather than mutating it.
+    public override var ropeOffset: RoPEOffset {
+        if let first = positions.first, positions.allSatisfy({ $0 == first }) {
+            return .scalar(Int(first))
+        }
+        return .batch(batchOffset)
+    }
 
     public override func innerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
@@ -67,8 +116,9 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             }
         }
 
+        let n = Int32(keys.dim(2))
         offset += keys.dim(2)
-        batchOffset = batchOffset + Int32(keys.dim(2))
+        setPositions(positions.map { $0 + n })
         self.keys![.ellipsis, previous ..< offset, 0...] = keys
         self.values![.ellipsis, previous ..< offset, 0...] = values
         return (self.keys![.ellipsis, ..<offset, 0...], self.values![.ellipsis, ..<offset, 0...])
@@ -88,14 +138,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
                 keys = nil
                 values = nil
                 offset = 0
-                batchOffset = newValue[0]
-                leftPadding = newValue[1]
+                setPositions(newValue[0].asArray(Int32.self))
+                setLeftPadding(newValue[1].asArray(Int32.self))
             case 4:
                 keys = newValue[0]
                 values = newValue[1]
                 offset = newValue[0].dim(2)
-                batchOffset = newValue[2]
-                leftPadding = newValue[3]
+                setPositions(newValue[2].asArray(Int32.self))
+                setLeftPadding(newValue[3].asArray(Int32.self))
             default:
                 fatalError("BatchKVCache state must have 2 or 4 arrays, got \(newValue.count)")
             }
@@ -106,7 +156,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 
     /// No row can lose more tokens than the shortest row holds.
     public override var maxTrimCount: Int {
-        let shortest = batchSize > 0 ? Int(batchOffset.min().item(Int32.self)) : 0
+        let shortest = Int(positions.min() ?? 0)
         return min(offset, max(0, shortest))
     }
 
@@ -114,15 +164,21 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(maxTrimCount, n)
         offset -= trimmed
-        batchOffset = batchOffset - Int32(trimmed)
+        setPositions(positions.map { $0 - Int32(trimmed) })
         return trimmed
     }
 
-    /// An explicit mask even for one token, so the left padding stays masked.
+    /// No mask for one token when no row is padded and the window, if any,
+    /// covers every retained key; otherwise an explicit mask, so left padding
+    /// and the window stay masked. This cache never evicts, so a window
+    /// smaller than the history still needs the mask.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        .array(
+        if n == 1, !hasLeftPadding, windowSize.map({ $0 >= offset + n }) ?? true {
+            return .none
+        }
+        return .array(
             createCausalMask(
                 n: n, offset: offset, windowSize: windowSize, leftPadding: leftPadding))
     }
@@ -131,7 +187,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func prepare(lengths: [Int]?) {
         guard let lengths, let longest = lengths.max(), lengths.contains(where: { $0 < longest })
         else { return }
-        rightPadding = MLXArray(lengths.map { Int32(longest - $0) })
+        setRightPadding(lengths.map { Int32(longest - $0) })
     }
 
     public override func prepare(lengths: MLXArray?) {
@@ -140,44 +196,45 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 
     /// Moves the right padding of a prefill to the left, where the mask excludes it.
     public override func finalize() {
-        guard let rightPadding else { return }
+        guard let rightPadding, let rightPaddingValues else { return }
         // A circular roll of the whole buffer lands each row's tokens at
         // `padding ..< offset`; what wraps around is masked or unused.
         if let keys, let values {
             self.keys = dynamicRoll(keys, shifts: rightPadding[0..., .newAxis], axis: 2)
             self.values = dynamicRoll(values, shifts: rightPadding[0..., .newAxis], axis: 2)
         }
-        batchOffset = batchOffset - rightPadding
-        leftPadding = leftPadding + rightPadding
-        self.rightPadding = nil
+        setPositions(zip(positions, rightPaddingValues).map { $0 - $1 })
+        setLeftPadding(zip(leftPaddingValues, rightPaddingValues).map { $0 + $1 })
+        setRightPadding(nil)
     }
 
     public func filter(batchIndices: MLXArray) {
-        let rows = batchIndices.asArray(Int32.self)
+        let rows = batchIndices.asArray(Int32.self).map { Int($0) }
         guard !rows.isEmpty else {
             keys = nil
             values = nil
-            rightPadding = nil
+            setRightPadding(nil)
             offset = 0
-            leftPadding = MLXArray([Int32]())
-            batchOffset = MLXArray([Int32]())
+            setLeftPadding([])
+            setPositions([])
             return
         }
-        let indices = MLXArray(rows)
+        let indices = MLXArray(rows.map { Int32($0) })
         keys = keys?[indices]
         values = values?[indices]
-        batchOffset = batchOffset[indices]
-        leftPadding = leftPadding[indices]
-        rightPadding = rightPadding?[indices]
+        setPositions(rows.map { positions[$0] })
+        var padding = rows.map { leftPaddingValues[$0] }
+        setRightPadding(rightPaddingValues.map { values in rows.map { values[$0] } })
 
         // Drop the left padding that every remaining row has.
-        let shared = Int(leftPadding.min().item(Int32.self))
+        let shared = padding.min() ?? 0
         if shared > 0, keys != nil {
-            keys = keys?[.ellipsis, shared..., 0...]
-            values = values?[.ellipsis, shared..., 0...]
-            offset -= shared
-            leftPadding = leftPadding - Int32(shared)
+            keys = keys?[.ellipsis, Int(shared)..., 0...]
+            values = values?[.ellipsis, Int(shared)..., 0...]
+            offset -= Int(shared)
+            padding = padding.map { $0 - shared }
         }
+        setLeftPadding(padding)
     }
 
     /// Appends the rows of `other`, a `BatchKVCache` with prefilled rows.
@@ -192,15 +249,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
             let otherValues = other.values
         else {
             if keys == nil, other.keys == nil {
-                leftPadding = concatenated([leftPadding, other.leftPadding])
-                batchOffset = concatenated([batchOffset, other.batchOffset])
+                setLeftPadding(leftPaddingValues + other.leftPaddingValues)
+                setPositions(positions + other.positions)
             } else if let otherKeys = other.keys, let otherValues = other.values {
                 // New array objects, so writes to either cache leave the other unchanged.
                 keys = otherKeys[.ellipsis]
                 values = otherValues[.ellipsis]
                 offset = other.offset
-                leftPadding = other.leftPadding
-                batchOffset = other.batchOffset
+                setLeftPadding(other.leftPaddingValues)
+                setPositions(other.positions)
             }
             return
         }
@@ -211,17 +268,19 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         let added = rightJustify(otherKeys, otherValues, end: other.offset, to: end, width: width)
         keys = concatenated([own.keys, added.keys])
         values = concatenated([own.values, added.values])
-        leftPadding = concatenated([
-            leftPadding + Int32(end - offset), other.leftPadding + Int32(end - other.offset),
-        ])
-        batchOffset = concatenated([batchOffset, other.batchOffset])
+        let ownShift = Int32(end - offset)
+        let addedShift = Int32(end - other.offset)
+        setLeftPadding(
+            leftPaddingValues.map { $0 + ownShift }
+                + other.leftPaddingValues.map { $0 + addedShift })
+        setPositions(positions + other.positions)
         offset = end
     }
 
     /// The row at `index` without its left padding, as a ``KVCacheSimple``.
     public func extract(_ index: Int) -> any KVCache {
         let cache = KVCacheSimple()
-        let padding = Int(leftPadding[index].item(Int32.self))
+        let padding = Int(leftPaddingValues[index])
         if let keys, let values {
             cache.keys = MLX.contiguous(keys[index ..< index + 1, 0..., padding ..< offset, 0...])
             cache.values = MLX.contiguous(
@@ -231,33 +290,66 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         return cache
     }
 
-    /// A batch of one row holding the sequence in `cache`.
-    public static func fromSingle(_ cache: KVCacheSimple) -> BatchKVCache {
-        // Exact type: a ChunkedKVCache can report an offset beyond the arrays it holds.
-        precondition(
-            type(of: cache) == KVCacheSimple.self,
-            "BatchKVCache.fromSingle requires a KVCacheSimple")
-        let batch = BatchKVCache(leftPadding: [0])
-        if let keys = cache.keys, let values = cache.values {
-            // New array objects, so writes to the batch leave `cache` unchanged.
-            batch.keys = keys[.ellipsis]
-            batch.values = values[.ellipsis]
-            batch.offset = cache.offset
-            batch.batchOffset = MLXArray([Int32(cache.offset)])
+    /// The rows of `caches` as one batch, left-padded to the longest row.
+    fileprivate convenience init(merging caches: [KVCacheSimple]) {
+        let longest = caches.map(\.offset).max() ?? 0
+        self.init(leftPadding: caches.map { longest - $0.offset })
+        // An all-empty merge is an empty batch; the first update sizes it.
+        guard let template = caches.first(where: { $0.keys != nil }),
+            let templateKeys = template.keys, let templateValues = template.values
+        else { return }
+        var keys: [MLXArray] = []
+        var values: [MLXArray] = []
+        for cache in caches {
+            if let rowKeys = cache.keys, let rowValues = cache.values, cache.offset > 0 {
+                // Slice off allocation slack, then pad on the left to `longest`.
+                let row = rightJustify(
+                    rowKeys[.ellipsis, ..<cache.offset, 0...],
+                    rowValues[.ellipsis, ..<cache.offset, 0...],
+                    end: cache.offset, to: longest, width: longest)
+                keys.append(row.keys)
+                values.append(row.values)
+            } else {
+                keys.append(
+                    MLXArray.zeros(
+                        [1, templateKeys.dim(1), longest, templateKeys.dim(3)],
+                        dtype: templateKeys.dtype))
+                values.append(
+                    MLXArray.zeros(
+                        [1, templateValues.dim(1), longest, templateValues.dim(3)],
+                        dtype: templateValues.dtype))
+            }
         }
-        return batch
+        self.keys = concatenated(keys)
+        self.values = concatenated(values)
+        offset = longest
+        setPositions(caches.map { Int32($0.offset) })
     }
 
     public override func copy() -> any KVCache {
         let copy = BatchKVCache(leftPadding: [])
-        copy.leftPadding = leftPadding[0...]
-        copy.batchOffset = batchOffset[0...]
+        copy.setLeftPadding(leftPaddingValues)
+        copy.setPositions(positions)
         copy.keys = keys?[.ellipsis]
         copy.values = values?[.ellipsis]
-        copy.rightPadding = rightPadding?[0...]
+        copy.setRightPadding(rightPaddingValues)
         copy.offset = offset
         copy.step = step
         return copy
+    }
+}
+
+extension KVCacheSimple {
+    /// The rows of `caches` as one batch, left-padded so every row ends at the
+    /// longest row's position. Port of mlx-lm's `KVCache.merge`. Every cache
+    /// must be exactly a `KVCacheSimple`; empty caches become empty rows.
+    public static func merge(_ caches: [KVCacheSimple]) -> BatchKVCache {
+        precondition(!caches.isEmpty, "merge needs a cache")
+        // Exact type: a ChunkedKVCache can report an offset beyond the arrays it holds.
+        precondition(
+            caches.allSatisfy { type(of: $0) == KVCacheSimple.self },
+            "KVCacheSimple.merge takes exactly KVCacheSimple rows")
+        return BatchKVCache(merging: caches)
     }
 }
 

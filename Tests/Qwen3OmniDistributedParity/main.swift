@@ -52,9 +52,8 @@ func decode(_ model: Qwen3Omni, batched: Bool, media: Bool) throws -> [MLXArray]
     let caches: [KVCache]
     let batch: [any BatchedCache]
     if batched {
-        batch = try makeBatchedCacheFactories(for: model.newCache(parameters: nil)).map {
-            $0([0, 0])
-        }
+        let probe = try model.newCache(parameters: nil)
+        batch = try probe.map { try mergeCaches([$0, $0]) }
         for cache in batch { cache.prepare(lengths: [length, second.count]) }
         caches = batch.map { $0 as KVCache }
     } else {

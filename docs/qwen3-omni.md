@@ -32,10 +32,11 @@ MRoPE follows the authoritative Transformers Omni time/audio rules, rather than
 the pinned mlx-vlm wrapper's generic image/video-only position builder. A single
 request's continuation delta lives in an `ArraysCache` beside its first KV
 cache, inside `CacheList`. Every forward supplies explicit per-row positions;
-`LMOutput.State` is unnecessary. Generic batch cache row filtering, extension,
-extraction and media-prefill adoption carry the positional metadata with the
-corresponding KV row. Prompt prefill chunks slice both positions and deepstack
-residuals. Deepstack residual scatter handles multiple batch rows.
+`LMOutput.State` is unnecessary. Generic `mergeCaches(_:)` conversion and row
+filtering, extension, extraction and media-prefill adoption carry the positional
+metadata with the corresponding KV row. Prompt prefill chunks slice both
+positions and deepstack residuals. Deepstack residual scatter handles multiple
+batch rows.
 
 Qwen3 vision's 72-wide attention heads depend on the resolved MLX attention
 padding fix for M5 matrix kernels. The current mlx-swift revision `12f53de5`
