@@ -2043,15 +2043,24 @@ public class CacheList: BaseKVCache {
         caches.forEach { $0.finalize() }
     }
 
-    /// The mask of the first child with per-row positions, so a batched list excludes its
-    /// rows' left padding; otherwise the default.
+    /// The mask of the first descendant with per-row positions, so a batched list excludes
+    /// its rows' left padding; otherwise the default.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        if let child = caches.first(where: { $0 is any BatchPositionedKVCache }) {
+        if let child = positionedDescendant {
             return child.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
         }
         return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    /// The first child, or child of a nested list, with per-row positions.
+    private var positionedDescendant: (any KVCache)? {
+        for child in caches {
+            if child is any BatchPositionedKVCache { return child }
+            if let nested = (child as? CacheList)?.positionedDescendant { return nested }
+        }
+        return nil
     }
 
     public override var isTrimmable: Bool {
