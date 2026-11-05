@@ -141,7 +141,8 @@ public struct BatchTokenIterator {
         }
         guard !rows.isEmpty else { return [] }
 
-        let tokens = step()
+        // Drain the forward's autoreleased temporaries every step, as TokenIterator does.
+        let tokens = autoreleasepool { step() }
         var responses: [Response] = []
         var keep: [Int] = []
         for (index, token) in tokens.enumerated() {
