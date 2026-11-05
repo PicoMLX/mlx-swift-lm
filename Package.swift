@@ -226,7 +226,8 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "Resources/generate_qwen3_omni_fixture.py",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
