@@ -121,6 +121,20 @@ struct BatchRotatingKVCacheTests {
         #expect(cache.trim(1) == 1)
     }
 
+    @Test("Empty rows join empty rows, and the batch fills on its first update")
+    func extendEmptyRows() throws {
+        let cache = BatchRotatingKVCache(maxSize: 8, leftPadding: [0])
+        cache.extend(other: BatchRotatingKVCache(maxSize: 8, leftPadding: [1]))
+        #expect(cache.batchSize == 2)
+        #expect(cache.leftPadding.asArray(Int32.self) == [0, 1])
+        #expect(cache.batchOffset.asArray(Int32.self) == [0, -1])
+
+        let kv = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = cache.update(keys: kv.0, values: kv.1)
+        #expect(cache.batchOffset.asArray(Int32.self) == [3, 2])
+        #expect(try row(cache, 1).offset == 2)
+    }
+
     @Test("An empty cache extended from another does not share its arrays")
     func extendEmptyCacheCopies() throws {
         // One token at a time, so the source's buffer has room past its tokens.
