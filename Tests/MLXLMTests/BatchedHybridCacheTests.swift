@@ -33,7 +33,9 @@ struct BatchedHybridCacheTests {
     @Test("A merged empty recurrent batch masks by the prepared lengths")
     func mergedRecurrentMasksByLengths() throws {
         let cache = try #require(ArraysCache.merge([MambaCache(), MambaCache()]) as? MambaCache)
-        #expect(cache.leftPadding == nil, "empty rows carry no padding")
+        #expect(
+            cache.leftPadding?.asArray(Int32.self) == [0, 0], "every empty row has zero padding")
+        #expect(cache.batchSize == 2)
         cache.prepare(lengths: [1, 2])
         #expect(cache.batchSize == 2)
 
@@ -193,6 +195,31 @@ struct BatchedHybridCacheTests {
         #expect(
             maxAbsDifference(secondState, MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4]))
                 == 0)
+    }
+
+    @Test("An all-empty merge keeps its row count through a later merge and extension")
+    func allEmptyMergeKeepsRows() throws {
+        let empty = try #require(ArraysCache.merge([MambaCache(), MambaCache()]) as? MambaCache)
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])
+        let merged = try #require(ArraysCache.merge([empty, populated]) as? MambaCache)
+        #expect(merged.batchSize == 3)
+        #expect(try #require(merged[0]).shape == [3, 4])
+
+        // An all-empty composite batch takes prefilled rows with its children aligned.
+        let list = try CacheList.merge([
+            CacheList(KVCacheSimple(), MambaCache()), CacheList(KVCacheSimple(), MambaCache()),
+        ])
+        let added = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = try #require(added[0] as? BatchKVCache).update(keys: kv.0, values: kv.1)
+        try #require(added[1] as? MambaCache)[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([
+            1, 4,
+        ])
+        list.extend(other: added)
+        #expect((list[0] as? BatchKVCache)?.batchSize == 3)
+        #expect((list[1] as? MambaCache)?.batchSize == 3)
+        #expect(try #require((list[1] as? MambaCache)?[0]).shape == [3, 4])
     }
 
     @Test("merge gives an empty input's rows zero state, however many it stands for")
