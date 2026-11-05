@@ -126,6 +126,71 @@ package enum Phi4MultimodalAudioFeatures {
     }
 }
 
+/// Pillow RGB bilinear uses antialiased triangle coefficients and rounds each pass to bytes.
+/// See ThirdPartyNotices/Phi4Multimodal-Pillow-LICENSE.txt for Pillow's MIT-CMU notice.
+package enum Phi4MultimodalPixelResampling {
+    private static let precision = 22
+
+    private static func coefficients(input: Int, output: Int) -> (MLXArray, MLXArray) {
+        let scale = Double(input) / Double(output)
+        let support = max(scale, 1)
+        var rows: [(indices: [Int32], weights: [Int32])] = []
+        for destination in 0 ..< output {
+            let center = (Double(destination) + 0.5) * scale
+            let first = max(0, Int(center - support + 0.5))
+            let end = min(input, Int(center + support + 0.5))
+            let weights = (first ..< end).map { source in
+                max(0, 1 - abs((Double(source) + 0.5 - center) / support))
+            }
+            let total = weights.reduce(0, +)
+            rows.append(
+                (
+                    (first ..< end).map(Int32.init),
+                    weights.map { Int32(floor($0 / total * Double(1 << precision) + 0.5)) }
+                ))
+        }
+        let taps = rows.map { $0.indices.count }.max()!
+        let indices = rows.flatMap {
+            $0.indices + Array(repeating: 0, count: taps - $0.indices.count)
+        }
+        let weights = rows.flatMap {
+            $0.weights + Array(repeating: 0, count: taps - $0.weights.count)
+        }
+        return (MLXArray(indices, [output, taps]), MLXArray(weights, [output, taps]))
+    }
+
+    private static func pass(_ pixels: MLXArray, axis: Int, count: Int) -> MLXArray {
+        if pixels.dim(axis) == count { return pixels }
+        let (indices, weights) = coefficients(input: pixels.dim(axis), output: count)
+        var parts: [MLXArray] = []
+        // Bound gather intermediates for large source photos.
+        for start in stride(from: 0, to: count, by: 64) {
+            let end = min(start + 64, count)
+            var shape = Array(repeating: 1, count: pixels.ndim + 1)
+            shape[axis] = end - start
+            shape[axis + 1] = weights.dim(1)
+            let gathered = pixels.take(indices[start ..< end], axis: axis)
+            let sum = (gathered * weights[start ..< end].reshaped(shape)).sum(axis: axis + 1)
+            let rounded = clip((sum + (1 << (precision - 1))) >> precision, min: 0, max: 255)
+            eval(rounded)
+            parts.append(rounded)
+        }
+        return concatenated(parts, axis: axis)
+    }
+
+    static func resize(_ pixels: MLXArray, height: Int, width: Int) -> MLXArray {
+        let bytes = floor(clip(pixels * 255, min: 0, max: 255) + 0.5).asType(.int32)
+        // Pillow 13 changes pass order when the height reduction dominates.
+        let verticalReduction = pixels.dim(2) - height
+        if verticalReduction > 0 && verticalReduction > 2 * (pixels.dim(3) - width) {
+            let vertical = pass(bytes, axis: 2, count: height)
+            return pass(vertical, axis: 3, count: width).asType(.float32) / 255
+        }
+        let horizontal = pass(bytes, axis: 3, count: width)
+        return pass(horizontal, axis: 2, count: height).asType(.float32) / 255
+    }
+}
+
 public struct Phi4MultimodalProcessor: UserInputProcessor {
     private let config: Phi4MultimodalProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -165,9 +230,8 @@ public struct Phi4MultimodalProcessor: UserInputProcessor {
             throw VLMError.processing("Phi-4 image aspect ratio exceeds its patch budget")
         }
         let rawPixels = MediaProcessing.asMLXArray(image)
-        var pixels = Phi4MultimodalResampling.resize(
+        var pixels = Phi4MultimodalPixelResampling.resize(
             rawPixels, height: rows * patch, width: columns * patch)
-        pixels = round(clip(pixels * 255, min: 0, max: 255)) / 255
         pixels = pixels[0].transposed(1, 2, 0)
         pixels = (pixels - MLXArray(config.imageMean)) / MLXArray(config.imageStd)
         let patches = pixels.reshaped(rows, patch, columns, patch, 3).transposed(0, 2, 1, 3, 4)

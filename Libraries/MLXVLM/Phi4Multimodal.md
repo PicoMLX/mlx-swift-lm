@@ -50,6 +50,13 @@ The CPU audio frontend retains its absolute 2e-4 NumPy check; a separate Metal
 FFT/frontend check bounds relative log-feature error below 1e-4.
 NaFlex interpolation follows the pinned Gaussian antialias prefilter and its
 singleton-output sampling rule, including rectangular grids.
+RGB image pixels use a separate Pillow-compatible antialiased bilinear filter,
+with fixed-point coefficients, eight-bit rounding after each separable pass, and
+Pillow 13's pass-order selection for asymmetric reductions.
+`generate_phi4mm_pixels.py` produces independent Pillow RGB goldens for mild
+downscaling, upscaling, asymmetric sizes, singleton output, and identity resizing.
+The RGB sampler follows [Pillow 13](https://github.com/python-pillow/Pillow/blob/13.0.0/src/libImaging/Resample.c);
+its [MIT-CMU notice](../../ThirdPartyNotices/Phi4Multimodal-Pillow-LICENSE.txt) is retained.
 
 Build the `Phi4MultimodalDistributedParity` executable with Xcode, then run:
 
