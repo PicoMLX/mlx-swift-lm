@@ -240,9 +240,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
 
     /// Appends the rows of `other`, whose rows must be prefilled or empty like this cache's.
     public func extend(other: BatchKVCache) {
+        // Prefilled rows join prefilled rows, empty rows join empty rows; a mix would need
+        // all-padding rows, which a prefill cannot fill afterwards.
         precondition(
-            other.keys != nil || other.batchSize == 0,
-            "BatchKVCache.extend requires prefilled rows")
+            other.keys != nil || keys == nil,
+            "BatchKVCache.extend cannot add empty rows to prefilled rows")
+        precondition(
+            keys != nil || batchSize == 0 || other.keys == nil,
+            "BatchKVCache.extend cannot add prefilled rows to empty rows")
         guard let ownKeys = keys, let ownValues = values, let otherKeys = other.keys,
             let otherValues = other.values
         else {
