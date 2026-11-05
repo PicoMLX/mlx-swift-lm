@@ -185,10 +185,7 @@ struct Gemma3nMultimodalTests {
             eval(mediaCache, textCache)
             let references = [mediaCache.map { $0.copy() }, textCache.map { $0.copy() }]
             func adopted(_ cache: KVCache) throws -> any BatchedCache {
-                if let rotating = cache as? RotatingKVCache {
-                    return try #require(BatchRotatingKVCache.fromSingle(rotating))
-                }
-                return BatchKVCache.fromSingle(try #require(cache as? KVCacheSimple))
+                try mergeCaches([cache])
             }
             let batch = try mediaCache.map(adopted)
             for layer in batch.indices { batch[layer].extend(other: try adopted(textCache[layer])) }
