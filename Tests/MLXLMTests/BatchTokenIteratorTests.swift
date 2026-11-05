@@ -172,6 +172,45 @@ struct BatchTokenIteratorTests {
         #expect(actual.map { $0[0] } == expected.map { $0[0] })
     }
 
+    @Test("A one-token prompt joins a longer one on a sliding-window model")
+    func mixedLengthRotatingRows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyGemma3()
+            let prompts: [[Int]] = [[1], [2, 3]]
+            let expected = try prompts.map { prompt in
+                try generateAlone(model, prompt: prompt, sampler: ArgMaxSampler(), maxTokens: 4)
+            }
+            let actual = try batchGenerate(model: model, prompts: prompts, maxTokens: 4)
+            #expect(actual == expected)
+        }
+    }
+
+    @Test("Prefill progress ends at (total, total) for short and chunked prompts alike")
+    func prefillProgressCompletes() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyLlama()
+            final class Log: @unchecked Sendable { var events: [[Int]] = [] }
+            let log = Log()
+            var prefill = PrefillParameters(stepSize: 8)
+            prefill.progress = { log.events.append([$0, $1]) }
+            let prompts: [[Int]] = [
+                [1, 2, 3], Array(repeating: [4, 5, 6, 7], count: 5).flatMap { $0 },
+            ]
+
+            _ = try batchGenerate(model: model, prompts: prompts, maxTokens: 1, prefill: prefill)
+
+            // Prompts prefill in order: the short one reports only its completion, the
+            // chunked one its chunks and then its completion, all against its own total.
+            let short = log.events.prefix { $0[1] == 3 }
+            let long = log.events.dropFirst(short.count)
+            #expect(Array(short) == [[3, 3]])
+            #expect(long.count > 1)
+            #expect(long.allSatisfy { $0[1] == 20 })
+            #expect(long.last == [20, 20])
+            #expect(long.map { $0[0] } == long.map { $0[0] }.sorted())
+        }
+    }
+
     @Test("Top-p keeps the top token when its threshold would remove every token")
     func topPKeepsTopToken() {
         // 1 - 1e-9 rounds to 1 in float32, which no cumulative probability exceeds.

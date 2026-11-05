@@ -60,7 +60,7 @@ public struct BatchTokenIterator {
     private var rows: [Row] = []
     /// Their caches, one batched cache per layer.
     private var cache: [KVCache] = []
-    /// The tokens the next step feeds: the last prompt token at first, then the sampled one.
+    /// The tokens the next step feeds: each row's sampled token.
     private var nextTokens: MLXArray?
 
     /// - Parameters:
@@ -167,36 +167,45 @@ public struct BatchTokenIterator {
         let admitted = pending
         pending = []
 
-        // Everything but each prompt's last token goes into its own cache first, through the
-        // model's prefill (chunked; the cache is evaluated, the logits never are), and the
-        // rows merge after. Rows are not prefilled together right-padded: the recurrent
-        // models' scans do not honour the prepared lengths yet. The last token is the first
-        // decode step's input, as in mlx-lm, so its logits give the first sample.
-        let caches = try admitted.map { pending -> [KVCache] in
+        // Each prompt goes into its own cache first, as TokenIterator feeds it: the model's
+        // prefill (chunked) and then the remainder it leaves, whose last position's logits
+        // give the row's first sample. The rows merge after, every one prefilled, so a
+        // one-token prompt joins a longer one on any cache type. Rows are not prefilled
+        // together right-padded: the recurrent models' scans do not honour the prepared
+        // lengths yet.
+        var caches: [[KVCache]] = []
+        var firstLogits: [MLXArray] = []
+        for pending in admitted {
             let cache = try pending.cache ?? model.newCache(parameters: nil)
-            let body = pending.prompt.dropLast().map { Int32($0) }
-            guard !body.isEmpty else { return cache }
-            let prepared = try model.prepare(
-                LMInput(tokens: MLXArray(body)), cache: cache, state: nil, prefill: prefill)
-            if case .tokens(let remainder) = prepared {
-                _ = model(remainder.tokens[.newAxis], cache: cache)
+            let input = LMInput(tokens: MLXArray(pending.prompt.map { Int32($0) }))
+            let logits: MLXArray
+            switch try model.prepare(input, cache: cache, state: nil, prefill: prefill) {
+            case .tokens(let remainder):
+                logits = model(remainder.tokens[.newAxis], cache: cache)[0..., -1, 0...]
+                // A `.tokens` prefill reports its own chunks only; the remainder completes
+                // the prompt (a `.logits` prefill reports its own terminal).
+                let total = pending.prompt.count
+                prefill.progress?(total, total)
+            case .logits(let output):
+                logits = output.logits[0..., -1, 0...]
             }
             eval(cache)
-            return cache
+            eval(logits)
+            caches.append(cache)
+            firstLogits.append(logits)
         }
         let merged = try caches[0].indices.map { layer in
             try mergeCaches(caches.map { $0[layer] })
         }
 
-        // The new rows take their first step alone: the decoding rows' next tokens are
-        // sampled already and must not be fed again.
+        // The new rows sample their first tokens alone: the decoding rows' next tokens are
+        // sampled already.
         var batch = BatchTokenIterator(
             model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
             maxTokens: maxTokens, prefill: prefill)
         batch.rows = admitted.map(\.row)
         batch.cache = merged
-        batch.nextTokens = MLXArray(admitted.map { Int32($0.prompt.last!) })
-        _ = batch.step()
+        batch.nextTokens = batch.sampleNext(concatenated(firstLogits))
 
         if rows.isEmpty {
             rows = batch.rows
@@ -214,7 +223,14 @@ public struct BatchTokenIterator {
     /// Feeds the next tokens, samples their successors and returns the fed tokens.
     private mutating func step() -> [Int] {
         let current = nextTokens!
-        var logits = model(current[0..., .newAxis], cache: cache)[0..., -1, 0...]
+        let logits = model(current[0..., .newAxis], cache: cache)[0..., -1, 0...]
+        nextTokens = sampleNext(logits)
+        return current.asArray(Int32.self).map { Int($0) }
+    }
+
+    /// Every row's next token from its `[B, V]` logits, through the rows' processors.
+    private mutating func sampleNext(_ logits: MLXArray) -> MLXArray {
+        var logits = logits
         if rows.contains(where: { $0.processor != nil }) {
             logits = concatenated(
                 rows.indices.map { index in
@@ -230,9 +246,7 @@ public struct BatchTokenIterator {
         // The cache state settles with the token, as TokenIterator does, so an unevaluated
         // chain of updates never keeps earlier steps alive.
         asyncEval([sampled] + cache.flatMap { $0.state })
-        let tokens = current.asArray(Int32.self).map { Int($0) }
-        nextTokens = sampled
-        return tokens
+        return sampled
     }
 
     /// One batched draw when every row shares a sampler, otherwise one draw per row from
