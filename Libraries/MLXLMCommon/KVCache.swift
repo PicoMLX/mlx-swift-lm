@@ -1804,13 +1804,15 @@ public class ArraysCache: BaseKVCache {
     /// Create attention mask based on left padding or prepared sequence lengths
     public func makeMask(N: Int) -> MLXArray? {
         let positions = MLXArray(0 ..< N)
+        var mask: MLXArray? = nil
         if let leftPadding {
-            return positions .>= leftPadding[0..., .newAxis]
-        } else if let lengths {
-            return positions .< lengths[0..., .newAxis]
-        } else {
-            return nil
+            mask = positions .>= leftPadding[0..., .newAxis]
         }
+        if let lengths {
+            let inLength = positions .< lengths[0..., .newAxis]
+            mask = mask.map { $0 .&& inLength } ?? inLength
+        }
+        return mask
     }
 
     // MARK: - Serialization

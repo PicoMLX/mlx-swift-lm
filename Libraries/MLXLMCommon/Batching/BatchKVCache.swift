@@ -247,9 +247,14 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache {
 
     /// Appends the rows of `other`. Port of mlx-lm's `BatchKVCache.extend`: rows without keys
     /// yet join as all-padding rows, so empty and prefilled rows can share a batch, and a
-    /// batch with no rows changes nothing.
+    /// batch with no rows changes nothing. Both batches must be finalized: a ragged prefill in
+    /// progress cannot take or give rows.
     public func extend(other: BatchKVCache) {
         guard other.batchSize > 0 else { return }
+        // Right padding of a prefill in progress is not combined: finalize first.
+        precondition(
+            rightPadding == nil && other.rightPadding == nil,
+            "BatchKVCache.extend takes finalized rows; finalize a ragged prefill first")
         guard batchSize > 0 else {
             // New array objects, so writes to either cache leave the other unchanged.
             keys = other.keys?[.ellipsis]
