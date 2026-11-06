@@ -242,6 +242,10 @@ public struct GenerateParameters: Sendable {
     /// Recovery and validation rules for generated tool calls.
     public var toolCallPolicy: ToolCallPolicy
 
+    /// Cache evaluation during ``TokenIterator`` decode; speculative iterators ignore it.
+    /// See ``KVCacheEvaluationPolicy`` before opting out of the default state evaluation.
+    public var cacheEvaluationPolicy: KVCacheEvaluationPolicy
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -263,7 +267,8 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefill: PrefillParameters = .init(),
         seed: UInt64? = nil,
-        toolCallPolicy: ToolCallPolicy = .init()
+        toolCallPolicy: ToolCallPolicy = .init(),
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -286,12 +291,13 @@ public struct GenerateParameters: Sendable {
         self.prefill = prefill
         self.seed = seed
         self.toolCallPolicy = toolCallPolicy
+        self.cacheEvaluationPolicy = cacheEvaluationPolicy
     }
 
     @available(
         *, deprecated,
         renamed:
-            "init(maxTokens:maxKVSize:kvBits:kvGroupSize:quantizedKVStart:kvScheme:temperature:topP:topK:minP:repetitionPenalty:repetitionContextSize:presencePenalty:presenceContextSize:frequencyPenalty:frequencyContextSize:prefill:seed:)",
+            "init(maxTokens:maxKVSize:kvCache:kvBits:kvGroupSize:quantizedKVStart:kvScheme:temperature:topP:topK:minP:logProbabilities:repetitionPenalty:repetitionContextSize:presencePenalty:presenceContextSize:frequencyPenalty:frequencyContextSize:prefill:seed:toolCallPolicy:cacheEvaluationPolicy:)",
         message:
             "prefill now defaults to balanced chunking; use prefill.chunking = .remainder for the legacy chunk boundaries"
     )
@@ -313,7 +319,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int?,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
     ) {
         self.init(
             maxTokens: maxTokens, maxKVSize: maxKVSize, kvBits: kvBits,
@@ -322,7 +329,8 @@ public struct GenerateParameters: Sendable {
             repetitionPenalty: repetitionPenalty, repetitionContextSize: repetitionContextSize,
             presencePenalty: presencePenalty, presenceContextSize: presenceContextSize,
             frequencyPenalty: frequencyPenalty, frequencyContextSize: frequencyContextSize,
-            prefill: .init(stepSize: prefillStepSize), seed: seed)
+            prefill: .init(stepSize: prefillStepSize), seed: seed,
+            cacheEvaluationPolicy: cacheEvaluationPolicy)
     }
 
     public func sampler() -> LogitSampler {
@@ -909,6 +917,7 @@ public struct DeferredTokenLogProbabilities {
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
 public struct TokenIterator: TokenIteratorProtocol {
     let model: any LanguageModel
+    let cacheEvaluationPolicy: KVCacheEvaluationPolicy
 
     /// Per-call model state (e.g. M-RoPE rope deltas), seeded from the
     /// initializer's `state`, replaced by prefill, then threaded through
@@ -927,6 +936,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let sampler: LogitSampler
     let logProbabilityTopK: Int?
     private var deferredLogProbabilities: DeferredTokenLogProbabilities?
+    private var pendingRawLogits: MLXArray?
 
     /// Log probabilities for the token returned by the most recent ``next()`` call.
     public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
@@ -972,7 +982,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Initialize a `TokenIterator` with the given input.
     ///
     /// If more control is needed over the generation,
-    /// ``init(input:model:cache:state:processor:sampler:prefill:maxTokens:)``
+    /// ``init(input:model:cache:state:processor:sampler:prefill:maxTokens:cacheEvaluationPolicy:)``
     /// allows a caller to specify ``LogitProcessor`` and ``LogitSampler``
     /// directly.
     ///
@@ -1017,6 +1027,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
         self.maxTokens = parameters.maxTokens
+        self.cacheEvaluationPolicy = parameters.cacheEvaluationPolicy
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, prefill: parameters.prefill)
@@ -1035,12 +1046,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - sampler: the logit sampler
     ///   - prefill: prefill parameters (step size, chunking, progress)
     ///   - maxTokens: maximum number of tokens to generate
+    ///   - cacheEvaluationPolicy: cache evaluation roots; see ``KVCacheEvaluationPolicy``
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         state: LMOutput.State? = nil,
         processor: LogitProcessor?, sampler: LogitSampler,
         prefill: PrefillParameters = .init(),
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
     ) throws {
         self.model = model
         self.state = state
@@ -1052,6 +1065,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = sampler
         self.logProbabilityTopK = nil
         self.maxTokens = maxTokens
+        self.cacheEvaluationPolicy = cacheEvaluationPolicy
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, prefill: prefill)
@@ -1060,7 +1074,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     @available(
         *, deprecated,
-        renamed: "init(input:model:cache:state:processor:sampler:prefill:maxTokens:)",
+        renamed:
+            "init(input:model:cache:state:processor:sampler:prefill:maxTokens:cacheEvaluationPolicy:)",
         message:
             "prefill now defaults to balanced chunking; use prefill.chunking = .remainder for the legacy chunk boundaries"
     )
@@ -1068,12 +1083,14 @@ public struct TokenIterator: TokenIteratorProtocol {
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
         state: LMOutput.State? = nil,
         processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int?,
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
     ) throws {
         try self.init(
             input: input, model: model, cache: cache, state: state,
             processor: processor, sampler: sampler,
-            prefill: .init(stepSize: prefillStepSize), maxTokens: maxTokens)
+            prefill: .init(stepSize: prefillStepSize), maxTokens: maxTokens,
+            cacheEvaluationPolicy: cacheEvaluationPolicy)
     }
 
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
@@ -1116,6 +1133,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
         // process the logits (one hot array of possible tokens)
         var logits = logits[0..., -1, 0...]
+        // Processors and samplers can discard or mutate logits, so preserve the raw graph.
+        pendingRawLogits =
+            cacheEvaluationPolicy == .attentionDependencies ? logits[.ellipsis] : nil
         logits = processor?.process(logits: logits) ?? logits
 
         // Filtered sampling already normalizes logits, so reuse that distribution.
@@ -1139,12 +1159,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         return y
     }
 
-    private func evaluateTokenAndLogProbabilities(_ token: MLXArray) {
-        if let deferredLogProbabilities {
-            asyncEval([token] + deferredLogProbabilities.arrays)
-        } else {
-            asyncEval(token)
+    private mutating func evaluateTokenAndLogProbabilities(
+        _ token: MLXArray, cacheState: [MLXArray] = []
+    ) {
+        var evaluationState = [token] + cacheState
+        if let pendingRawLogits {
+            evaluationState.append(pendingRawLogits)
         }
+        if let deferredLogProbabilities {
+            evaluationState += deferredLogProbabilities.arrays
+        }
+        asyncEval(evaluationState)
+        pendingRawLogits = nil
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
@@ -1176,19 +1202,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             let previousY = y
             let previousLogProbabilities = deferredLogProbabilities
 
+            // Conversion runs after the forward pass and creates independent cache state.
+            let evaluationPolicy =
+                cacheStorage.isApplicationTerminal ? cacheEvaluationPolicy : .allState
+
             // compute the next state and async eval the next token
             let token = step(previous: previousY)
             y = .init(tokens: token)
-            // Evaluate the cache state together with the token: caches update
-            // through functional ops (concatenation, slice assignment), and an
-            // unevaluated chain of those updates keeps every prior step's
-            // intermediates alive. Python mlx-lm settles cache state the same
-            // way in its generation loop.
-            if let deferredLogProbabilities {
-                asyncEval([token] + cache.flatMap { $0.state } + deferredLogProbabilities.arrays)
-            } else {
-                asyncEval([token] + cache.flatMap { $0.state })
-            }
+            // The default settles every cache. Opting in omits only attention
+            // state the caller guarantees is already consumed by the logits.
+            evaluateTokenAndLogProbabilities(
+                token, cacheState: evaluationPolicy.evaluationState(for: cache))
 
             // Periodically return freed buffers that cannot be reused (odd or
             // monotonically growing sizes accumulate in the pool otherwise).
