@@ -61,6 +61,7 @@ public struct BatchTokenIterator {
     private let stopTokens: Set<Int>
     private let maxTokens: Int
     private let prefill: PrefillParameters
+    private let cacheEvaluationPolicy: KVCacheEvaluationPolicy
 
     private struct Row {
         let uid: Int
@@ -95,10 +96,12 @@ public struct BatchTokenIterator {
     ///   - stopTokens: tokens that end a row
     ///   - maxTokens: the token limit for rows inserted without one
     ///   - prefill: how prompts are prefilled
+    ///   - cacheEvaluationPolicy: cache evaluation roots; see ``KVCacheEvaluationPolicy``
     public init(
         model: any LanguageModel, sampler: LogitSampler = ArgMaxSampler(),
         processor: LogitProcessor? = nil, stopTokens: Set<Int> = [], maxTokens: Int = 128,
-        prefill: PrefillParameters = .init()
+        prefill: PrefillParameters = .init(),
+        cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
     ) {
         self.model = model
         self.sampler = sampler
@@ -106,6 +109,7 @@ public struct BatchTokenIterator {
         self.stopTokens = stopTokens
         self.maxTokens = maxTokens
         self.prefill = prefill
+        self.cacheEvaluationPolicy = cacheEvaluationPolicy
     }
 
     /// The uids of every row decoding or queued, in insertion order.
@@ -278,7 +282,7 @@ public struct BatchTokenIterator {
         // sampled already.
         var batch = BatchTokenIterator(
             model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
-            maxTokens: maxTokens, prefill: prefill)
+            maxTokens: maxTokens, prefill: prefill, cacheEvaluationPolicy: cacheEvaluationPolicy)
         batch.rows = admitted.map(\.row)
         batch.cache = merged
         batch.state = admittedState
@@ -315,6 +319,8 @@ public struct BatchTokenIterator {
 
     /// Every row's next token from its `[B, V]` logits, through the rows' processors.
     private mutating func sampleNext(_ logits: MLXArray) -> MLXArray {
+        // Preserve the raw graph even when a processor or sampler replaces its input.
+        let rawLogits = cacheEvaluationPolicy == .attentionDependencies ? logits[.ellipsis] : nil
         var logits = logits
         if rows.contains(where: { $0.processor != nil }) {
             logits = concatenated(
@@ -328,9 +334,10 @@ public struct BatchTokenIterator {
         for index in rows.indices {
             rows[index].processor?.didSample(token: sampled[index ..< index + 1])
         }
-        // The cache state settles with the token, as TokenIterator does, so an unevaluated
-        // chain of updates never keeps earlier steps alive.
-        asyncEval([sampled] + cache.flatMap { $0.state })
+        // Independent cache state stays among the evaluation roots under either policy.
+        var evaluationState = [sampled] + cacheEvaluationPolicy.evaluationState(for: cache)
+        if let rawLogits { evaluationState.append(rawLogits) }
+        asyncEval(evaluationState)
         return sampled
     }
 
@@ -404,15 +411,17 @@ extension LogitSampler {
 ///   - sampler: the sampler for every prompt
 ///   - processor: the processor every prompt gets a copy of
 ///   - prefill: how prompts are prefilled
+///   - cacheEvaluationPolicy: cache evaluation roots; see ``KVCacheEvaluationPolicy``
 /// - Returns: the generated tokens per prompt, in order
 public func batchGenerate(
     model: any LanguageModel, prompts: [[Int]], caches: [[KVCache]?]? = nil,
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
-    processor: LogitProcessor? = nil, prefill: PrefillParameters = .init()
+    processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
 ) throws -> [[Int]] {
     var iterator = BatchTokenIterator(
         model: model, sampler: sampler, processor: processor, stopTokens: stopTokens,
-        maxTokens: maxTokens, prefill: prefill)
+        maxTokens: maxTokens, prefill: prefill, cacheEvaluationPolicy: cacheEvaluationPolicy)
     let uids = iterator.insert(prompts: prompts, caches: caches)
     var results = [Int: [Int]](uniqueKeysWithValues: uids.map { ($0, []) })
     while true {
