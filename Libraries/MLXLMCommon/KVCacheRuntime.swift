@@ -273,6 +273,11 @@ extension KVCacheLeaf {
                 resolvedStrategy: .affine,
                 reason: isBoundaryProtection
                     ? .boundaryProtection : (matches ? nil : .differentStrategy))
+        case .batchedAffine:
+            return status(
+                state: requested == .affine ? .active : .skipped,
+                resolvedStrategy: .affine,
+                reason: requested == .affine ? nil : .differentStrategy)
         case .rotating, .batchedRotating:
             return status(
                 state: requested == .fullPrecision ? .active : .skipped,
