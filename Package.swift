@@ -185,6 +185,32 @@ let package = Package(
             path: "Tests/ShardedDecodeParity",
             exclude: ["run.sh"]
         ),
+        .executableTarget(
+            name: "Qwen3OmniDistributedParity",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniDistributedParity", exclude: ["run.sh"]
+        ),
+        .executableTarget(
+            name: "Qwen3OmniCheckpointSmoke",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniCheckpointSmoke", exclude: ["run.sh", "prepare.py"]
+        ),
+        .executableTarget(
+            name: "Qwen3OmniSDPABenchmark",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen3OmniSDPABenchmark"
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -200,9 +226,14 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "Resources/generate_qwen3_omni_fixture.py",
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .process("Resources/qwen3-omni-reference.safetensors"),
+                .process("Resources/qwen3-omni-reference.json"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

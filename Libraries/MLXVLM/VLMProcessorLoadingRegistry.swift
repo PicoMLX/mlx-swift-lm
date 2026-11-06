@@ -70,8 +70,11 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
     /// Shared instance, preloaded with this package's built-in loading rules.
     public static let shared = VLMProcessorLoadingRegistry(resolvers: [
         Qwen35ProcessorLoadingResolver(),
+        Qwen3OmniProcessorLoadingResolver(),
         ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
+            "qwen3_omni_moe": "Qwen3OmniMoeProcessor",
+            "qwen3_omni_moe_thinker": "Qwen3OmniMoeProcessor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
         ]),
     ])
@@ -154,5 +157,18 @@ public struct Qwen35ProcessorLoadingResolver: VLMProcessorLoadingResolver {
         return VLMProcessorConfiguration(
             data: try JSONEncoder().encode(processorConfiguration),
             processorType: "Qwen3VLProcessor")
+    }
+}
+
+/// Published Omni defaults can be reconstructed from the Thinker metadata.
+public struct Qwen3OmniProcessorLoadingResolver: VLMProcessorLoadingResolver {
+    public init() {}
+    public func fallbackProcessorConfiguration(for context: VLMProcessorLoadingContext) throws
+        -> VLMProcessorConfiguration?
+    {
+        guard context.modelType == "qwen3_omni_moe" || context.modelType == "qwen3_omni_moe_thinker"
+        else { return nil }
+        return VLMProcessorConfiguration(
+            data: Data("{}".utf8), processorType: "Qwen3OmniMoeProcessor")
     }
 }

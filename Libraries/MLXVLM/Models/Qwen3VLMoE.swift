@@ -91,12 +91,23 @@ public struct Qwen3VLMoEConfiguration: Codable, Sendable {
             self.headDim =
                 try container.decodeIfPresent(Int.self, forKey: .headDim)
                 ?? max(1, hiddenSize / max(1, numAttentionHeads))
+            enum ExtraKeys: String, CodingKey { case ropeParameters = "rope_parameters" }
+            struct Parameters: Decodable {
+                let ropeTheta: Double?
+                enum CodingKeys: String, CodingKey { case ropeTheta = "rope_theta" }
+            }
+            let extra = try decoder.container(keyedBy: ExtraKeys.self)
+            let parameters = try extra.decodeIfPresent(Parameters.self, forKey: .ropeParameters)
             self.ropeTheta =
-                try container.decodeIfPresent(Double.self, forKey: .ropeTheta) ?? 1_000_000
+                try container.decodeIfPresent(Double.self, forKey: .ropeTheta) ?? parameters?
+                .ropeTheta ?? 1_000_000
             self.maxPositionEmbeddings =
                 try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32_768
-            self._ropeScaling = try container.decodeIfPresent(
-                Qwen3VLConfiguration.RoPEScaling.self, forKey: ._ropeScaling)
+            self._ropeScaling =
+                try container.decodeIfPresent(
+                    Qwen3VLConfiguration.RoPEScaling.self, forKey: ._ropeScaling)
+                ?? extra.decodeIfPresent(
+                    Qwen3VLConfiguration.RoPEScaling.self, forKey: .ropeParameters)
             self.normTopKProb =
                 try container.decodeIfPresent(Bool.self, forKey: .normTopKProb) ?? true
             self.tieWordEmbeddings =
@@ -171,8 +182,8 @@ enum Qwen3VLMoELanguage {
 
     final class Attention: Module {
 
-        let heads: Int
-        let kvHeads: Int
+        var heads: Int
+        var kvHeads: Int
         let headDim: Int
         let scale: Float
 
@@ -205,6 +216,14 @@ enum Qwen3VLMoELanguage {
                 headDim: headDim,
                 base: config.ropeTheta,
                 ropeScaling: config.ropeScaling)
+        }
+
+        func shard(group: MLXDistributed.Group) throws {
+            try shardLinears(
+                allToSharded: ["q_proj", "k_proj", "v_proj"],
+                shardedToAll: ["o_proj"], group: group)
+            heads /= try group.size
+            kvHeads /= try group.size
         }
 
         func callAsFunction(
@@ -268,6 +287,12 @@ enum Qwen3VLMoELanguage {
             _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         }
 
+        func shard(group: MLXDistributed.Group) throws {
+            try shardLinears(
+                allToSharded: ["gate_proj", "up_proj"],
+                shardedToAll: ["down_proj"], group: group)
+        }
+
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             down(silu(gate(x)) * up(x))
         }
@@ -276,6 +301,7 @@ enum Qwen3VLMoELanguage {
     final class SparseMoeBlock: Module, UnaryLayer {
         let normTopkProb: Bool
         let topK: Int
+        private var shardingGroup: MLXDistributed.Group?
 
         @ModuleInfo(key: "gate") var gate: Linear
         @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -292,6 +318,18 @@ enum Qwen3VLMoELanguage {
             )
         }
 
+        func shard(group: MLXDistributed.Group) throws {
+            shardingGroup = group
+            try shardInPlace(
+                switchMLP,
+                predicate: { path, weight in
+                    if path.hasPrefix("down_proj.") {
+                        return path.hasSuffix(".bias") ? nil : (-1, .count(1))
+                    }
+                    return path.hasSuffix(".bias") ? (-1, .count(1)) : (weight.ndim - 2, .count(1))
+                }, group: group)
+        }
+
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             var gates = gate(x)
             gates = MLX.softmax(gates, axis: -1, precise: true)
@@ -304,7 +342,9 @@ enum Qwen3VLMoELanguage {
             }
 
             let expertOutput = switchMLP(x, indices)
-            return (expertOutput * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            let output = (expertOutput * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            if let shardingGroup { return MLXDistributed.allSum(output, group: shardingGroup) }
+            return output
         }
     }
 
@@ -418,9 +458,9 @@ enum Qwen3VLMoELanguage {
             guard !indices.isEmpty else { return hiddenStates }
 
             let indexArray = MLXArray(indices.map { UInt32($0) })
-            let result = hiddenStates
-            result[0..., indexArray, 0...] = result[0..., indexArray, 0...] + visualEmbeds
-            return result
+            let result = hiddenStates.reshaped(-1, hiddenStates.dim(-1))
+            result[indexArray] = result[indexArray] + visualEmbeds
+            return result.reshaped(hiddenStates.shape)
         }
 
         private func maskIndices(_ mask: MLXArray) -> [Int] {
