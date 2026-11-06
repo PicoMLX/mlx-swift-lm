@@ -266,6 +266,10 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
                 for uid in rows.indices where !rows[uid].finished {
                     finish(uid, reason: .cancelled)
                 }
+            } catch is CancellationError where Task.isCancelled {
+                for uid in rows.indices where !rows[uid].finished {
+                    finish(uid, reason: .cancelled)
+                }
             } catch {
                 failure = error
                 for uid in rows.indices where !rows[uid].finished {

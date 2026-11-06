@@ -1551,6 +1551,83 @@ struct BatchGenerationTests {
         }
     }
 
+    @Test(
+        "Cancellation between prefill chunks completes raw and decoded rows without a model error",
+        arguments: [false, true], [false, true])
+    func prefillCancellation(decoded: Bool, cancelTask: Bool) async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let probe = BatchStreamProbe()
+            let fixture = BatchStreamFixture(
+                scripts: [["a"], ["b"]], probe: probe, chunkedPrefill: true,
+                failPreparationWithCancellation: !cancelTask)
+            let prompts = fixture.prompts.map { Array(repeating: $0[0], count: 5) }
+            let prefill = PrefillParameters(
+                stepSize: 1,
+                progress: { processed, _ in
+                    probe.observePrefillProgress(processed)
+                    withUnsafeCurrentTask { $0?.cancel() }
+                })
+
+            func consume<Output: Sendable>(
+                _ stream: AsyncThrowingStream<BatchGenerationEvent<Output>, Error>,
+                task: Task<Void, Never>
+            ) async {
+                var infos = [Int: BatchCompletionInfo]()
+                var outputCount = 0
+                var threwCancellation = false
+                do {
+                    for try await event in stream {
+                        switch event {
+                        case .output: outputCount += 1
+                        case .info(let uid, let info):
+                            #expect(infos[uid] == nil, "each unfinished row completes exactly once")
+                            infos[uid] = info
+                        }
+                    }
+                } catch {
+                    #expect(error is CancellationError)
+                    threwCancellation = true
+                }
+                await task.value
+
+                #expect(task.isCancelled == cancelTask)
+                #expect(threwCancellation == !cancelTask)
+                #expect(outputCount == 0)
+                if cancelTask {
+                    #expect(Set(infos.keys) == Set(prompts.indices))
+                    for info in infos.values {
+                        #expect(info.stopReason == .cancelled)
+                        #expect(info.promptTokenCount == 5)
+                        #expect(info.generationTokenCount == 0)
+                        #expect(info.timeToFirstToken == nil)
+                    }
+                    #expect(probe.prefillProgress == [1])
+                    #expect(probe.widths == [1], "no second chunk or decode forward is submitted")
+                    #expect(probe.usedCPU)
+                } else {
+                    #expect(
+                        infos.isEmpty, "an uncancelled model's CancellationError still propagates")
+                    #expect(probe.prefillProgress.isEmpty)
+                    #expect(probe.widths.isEmpty)
+                }
+            }
+
+            if decoded {
+                let (stream, task) = try batchGenerateTextTask(
+                    model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                    prefill: prefill)
+                await consume(stream, task: task)
+            } else {
+                let (stream, task) = try batchGenerateTokensTask(
+                    model: fixture.model, prompts: prompts, tokenizer: fixture.tokenizer,
+                    modelConfiguration: .init(id: "batch-stream-test"), maxTokens: 8,
+                    prefill: prefill)
+                await consume(stream, task: task)
+            }
+        }
+    }
+
     @Test("Cancelling a stream consumer stops the blocked shared worker")
     func consumerCancellationStopsWorker() async throws {
         try await Device.withDefaultDevice(.cpu) {
@@ -1773,7 +1850,8 @@ private struct BatchStreamFixture {
 
     init(
         scripts: [[String]], sharedPieces: [String] = [], probe: BatchStreamProbe? = nil,
-        failPreparation: Bool = false, invalidatingBatchStep: Int? = nil
+        failPreparation: Bool = false, invalidatingBatchStep: Int? = nil,
+        chunkedPrefill: Bool = false, failPreparationWithCancellation: Bool = false
     ) {
         var pieces = ["", "<eos>"] + sharedPieces
         var transitions = [0, 1] + Array(repeating: 1, count: sharedPieces.count)
@@ -1808,7 +1886,8 @@ private struct BatchStreamFixture {
         tokenizer = BatchStreamTokenizer(pieces: pieces)
         model = BatchStreamModel(
             transitions: transitions, probe: probe, failPreparation: failPreparation,
-            invalidatingBatchStep: invalidatingBatchStep)
+            invalidatingBatchStep: invalidatingBatchStep, chunkedPrefill: chunkedPrefill,
+            failPreparationWithCancellation: failPreparationWithCancellation)
     }
 }
 
@@ -1837,15 +1916,20 @@ private final class BatchStreamModel: Module, LanguageModel {
     let transitions: [Int]
     let probe: BatchStreamProbe?
     let failPreparation: Bool
+    private let chunkedPrefill: Bool
+    private let failPreparationWithCancellation: Bool
 
     init(
         transitions: [Int], probe: BatchStreamProbe?, failPreparation: Bool,
-        invalidatingBatchStep: Int?
+        invalidatingBatchStep: Int?, chunkedPrefill: Bool,
+        failPreparationWithCancellation: Bool
     ) {
         self.invalidatingBatchStep = invalidatingBatchStep
         self.transitions = transitions
         self.probe = probe
         self.failPreparation = failPreparation
+        self.chunkedPrefill = chunkedPrefill
+        self.failPreparationWithCancellation = failPreparationWithCancellation
         super.init()
     }
 
@@ -1855,7 +1939,13 @@ private final class BatchStreamModel: Module, LanguageModel {
         _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
         if failPreparation { throw BatchStreamTestError.preparation }
-        return .tokens(input.text)
+        if failPreparationWithCancellation { throw CancellationError() }
+        guard chunkedPrefill else { return .tokens(input.text) }
+        let processed = try prefill.forEachChunk(total: input.text.tokens.size) { range in
+            let logits = callAsFunction(input.text.tokens[range][.newAxis], cache: cache)
+            eval([logits] + cache.flatMap { $0.state })
+        }
+        return .tokens(.init(tokens: input.text.tokens[processed...]))
     }
 
     func nextTokenLogits(
@@ -1894,6 +1984,7 @@ private final class BatchStreamProbe: @unchecked Sendable {
     private var observedOnlyCPU = true
     private var observedCancelledAtResume = false
     private var observedBarrierTimedOut = false
+    private var observedPrefillProgress = [Int]()
 
     init(blockFirstBatch: Bool = false) { self.blockFirstBatch = blockFirstBatch }
 
@@ -1902,6 +1993,11 @@ private final class BatchStreamProbe: @unchecked Sendable {
     var usedCPU: Bool { lock.withLock { observedOnlyCPU } }
     var cancelledAtResume: Bool { lock.withLock { observedCancelledAtResume } }
     var barrierTimedOut: Bool { lock.withLock { observedBarrierTimedOut } }
+    var prefillProgress: [Int] { lock.withLock { observedPrefillProgress } }
+
+    func observePrefillProgress(_ processed: Int) {
+        lock.withLock { observedPrefillProgress.append(processed) }
+    }
 
     func observe(batchWidth: Int) {
         let shouldBlock = lock.withLock {
