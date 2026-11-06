@@ -68,8 +68,10 @@ struct Phi4MultimodalTests {
             let expected = prompts.enumerated().map { row, prompt in
                 model(MLXArray(prompt).reshaped(1, prompt.count), cache: singles[row])[0, -1]
             }
-            let factories = try makeBatchedCacheFactories(for: model.newCache(parameters: nil))
-            let batched = factories.map { $0([0, 0, 0]) }
+            let emptyRows = try prompts.map { _ in try model.newCache(parameters: nil) }
+            let batched = try emptyRows[0].indices.map { layer in
+                try mergeCaches(emptyRows.map { $0[layer] })
+            }
             let caches = batched.map { $0 as any KVCache }
             try model.setModes(modes, cache: caches)
             batched.forEach { $0.prepare(lengths: prompts.map(\.count)) }
@@ -97,9 +99,7 @@ struct Phi4MultimodalTests {
             #expect(
                 maxAbsDifference(model(token, cache: extracted), model(token, cache: singles[2]))
                     < 1e-4)
-            let extensionFactories = try makeBatchedCacheFactories(
-                for: model.newCache(parameters: nil))
-            let restored = extensionFactories.map { $0([0]) }
+            let restored = try model.newCache(parameters: nil).map { try mergeCaches([$0]) }
             let restoredKV = restored.map { $0 as any KVCache }
             try model.setModes(MLXArray([Float(1), 1], [1, 2]), cache: restoredKV)
             eval(model(MLXArray([Int32(2), 3]).reshaped(1, 2), cache: restoredKV))
