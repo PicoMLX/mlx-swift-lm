@@ -195,7 +195,8 @@ enum KVCacheRoundStrategyFactory {
             return RotatingRoundStrategy(slot: slot, live: rotating)
         case .recurrent:
             return nil
-        case .simple, .batched, .batchedRotating, .affine, .turboQuant, .varianceNormalized,
+        case .simple, .batched, .batchedRotating, .batchedAffine, .affine, .turboQuant,
+            .varianceNormalized,
             .unsupported:
             // Write-through plus a clamp is sound exactly when a later trim undoes the appended
             // positions -- asked with the round's real width, because the entry that matters is

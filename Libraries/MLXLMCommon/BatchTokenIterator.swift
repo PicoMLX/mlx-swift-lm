@@ -18,6 +18,10 @@ import MLXNN
 /// is sampled on its own, so a row with a seeded sampler draws the tokens it would draw
 /// alone. Logit processors run per row.
 ///
+/// Supply ``QuantizedKVCache`` rows through `caches` to opt into affine 4-bit or 8-bit
+/// batching. Each layer's rows must share their quantization configuration, and the model
+/// must support quantized attention. Fresh caches use the model's default layout.
+///
 /// Model-owned state is carried for a single row. Multiple rows require nil or empty state:
 /// arbitrary per-request state cannot be merged or filtered without a model-specific contract.
 public struct BatchTokenIterator {
