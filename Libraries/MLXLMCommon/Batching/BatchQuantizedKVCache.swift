@@ -105,6 +105,14 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
 
     public override var isTrimmable: Bool { true }
 
+    public override func isTrimmable(after positions: Int) -> Bool {
+        guard positions >= 0 else { return false }
+        if positions == 0 { return true }
+        // Padding writes and zero-row batches cannot rewind the whole proposed suffix.
+        return !self.positions.isEmpty && self.positions.allSatisfy { $0 >= 0 }
+            && storage.isTrimmable(after: positions)
+    }
+
     public override var maxTrimCount: Int {
         min(offset, max(0, Int(positions.min() ?? 0)))
     }
