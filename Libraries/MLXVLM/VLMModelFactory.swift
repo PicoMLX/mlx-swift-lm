@@ -625,7 +625,8 @@ func resolveProcessorConfiguration(
         data = try Gemma3nProcessorConfiguration.mergedData(
             directory: modelDirectory,
             modelConfiguration: context.configurationData, selected: configuration.data)
-    } else if context.modelType == "qwen3_omni_moe" || context.modelType == "qwen3_omni_moe_thinker" {
+    } else if context.modelType == "qwen3_omni_moe" || context.modelType == "qwen3_omni_moe_thinker"
+    {
         data = try Qwen3OmniProcessorConfiguration.mergedData(
             directory: modelDirectory,
             modelConfiguration: context.configurationData, selected: configuration.data)
