@@ -1,13 +1,20 @@
 // Copyright © 2026 Apple Inc.
 
 // Decode throughput and time to first token on a local model, as medians over rounds: the
-// single-sequence `TokenIterator`, and `BatchTokenIterator` at one and four rows. Decode is
-// timed after the prefill and the first token; the time to first token covers the prefill.
-// Every path must repeat its tokens in every round; how far the paths agree with each other
-// is reported.
+// single-sequence `TokenIterator`, and `BatchTokenIterator` at every batch size asked for.
+// Decode is timed after the prefill and the first token; the time to first token covers the
+// prefill. Every path must repeat its tokens in every round; how far each batch row agrees
+// with a single-sequence run of the same prompt is reported.
 //
 //   swift run -c release --package-path Benchmarks/DecodeBench decodebench <model directory> \
-//       [decode tokens: 128] [rounds: 5] [prompt tokens: 145] [sampler: greedy|topp|categorical]
+//       [decode tokens: 128] [rounds: 5] [prompt tokens: 145] [sampler: greedy|topp|categorical] \
+//       [batch sizes: 1,4,8] [prompt lengths: equal|mixed]
+//
+// With `mixed` prompt lengths, the rows of a batch get prompts that shrink evenly from the full
+// length to a sixth of it, so every row but the first is left-padded. With the greedy sampler,
+// a row whose positions or padding mask are wrong parts ways with its single-sequence run at
+// once, while correct rows agree until the different matmul shapes of a batch round a near tie
+// the other way.
 //
 // Built with `-Xswiftc -DSINGLE_ONLY` it times `TokenIterator` alone, so it also builds
 // against a checkout without `BatchTokenIterator`.
@@ -18,24 +25,43 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 
+let usage =
+    "usage: decodebench <model directory> [decode tokens] [rounds] [prompt tokens] [sampler] "
+    + "[batch sizes] [prompt lengths]"
 let arguments = CommandLine.arguments
 guard arguments.count > 1 else {
-    print("usage: decodebench <model directory> [decode tokens] [rounds] [prompt tokens] [sampler]")
+    print(usage)
     exit(1)
 }
 let modelDirectory = URL(fileURLWithPath: arguments[1])
 let decodeTokens = arguments.count > 2 ? Int(arguments[2]) ?? 128 : 128
-let rounds = arguments.count > 3 ? Int(arguments[3]) ?? 5 : 5
+let rounds = max(1, arguments.count > 3 ? Int(arguments[3]) ?? 5 : 5)
 let promptLength = arguments.count > 4 ? Int(arguments[4]) ?? 145 : 145
 let samplerName = arguments.count > 5 ? arguments[5] : "greedy"
+let batchSizes = Set(
+    (arguments.count > 6 ? arguments[6] : "1,4,8").split(separator: ",").compactMap { Int($0) }
+        .filter { $0 > 0 }
+).sorted()
+let lengthsName = arguments.count > 7 ? arguments[7] : "equal"
+guard !batchSizes.isEmpty, ["equal", "mixed"].contains(lengthsName) else {
+    print(usage)
+    print("batch sizes are a comma-separated list such as 1,4,8; prompt lengths equal or mixed")
+    exit(1)
+}
 
 let context = try await LLMModelFactory.shared.load(
     from: modelDirectory, using: NoOpTokenizerLoader())
 let model = context.model
 print("model: \(modelDirectory.lastPathComponent)")
+#if SINGLE_ONLY
 print(
     "prompt tokens: \(promptLength), decode tokens: \(decodeTokens), rounds: \(rounds), "
         + "sampler: \(samplerName)")
+#else
+print(
+    "prompt tokens: \(promptLength), decode tokens: \(decodeTokens), rounds: \(rounds), "
+        + "sampler: \(samplerName), batch sizes: \(batchSizes), prompt lengths: \(lengthsName)")
+#endif
 
 /// A fresh sampler per run, seeded, so every run of a path draws the same tokens.
 @MainActor func makeSampler() -> LogitSampler {
@@ -50,9 +76,9 @@ print(
 }
 
 /// A fixed pseudo-random prompt, so every round and every checkout decodes the same tokens.
-@MainActor func prompt(seed: UInt64) -> [Int32] {
+@MainActor func prompt(seed: UInt64, length: Int = promptLength) -> [Int32] {
     var state = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
-    return (0 ..< promptLength).map { _ in
+    return (0 ..< length).map { _ in
         state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
         return Int32(1000 + (state >> 33) % 20000)
     }
@@ -123,16 +149,39 @@ struct Run {
         tokensPerSecond: Double(decodeTokens) / seconds(since: decodeStart),
         firstToken: firstToken, tokens: tokens)
 }
+
+/// The prompts of a batch: row 0 is the single-sequence prompt and every other row has its
+/// own. With mixed lengths the rows shrink evenly to a sixth of the full length.
+@MainActor func prompts(rows: Int) -> [[Int32]] {
+    (0 ..< rows).map { row in
+        guard lengthsName == "mixed", rows > 1 else { return prompt(seed: UInt64(row + 1)) }
+        let shortest = max(1, promptLength / 6)
+        let length = promptLength - (promptLength - shortest) * row / (rows - 1)
+        return prompt(seed: UInt64(row + 1), length: length)
+    }
+}
 #endif
 
 let singlePrompt = prompt(seed: 1)
-let fourPrompts = (1 ... 4).map { prompt(seed: UInt64($0)) }
 
 // Warm up every path once so kernel compilation is not timed.
 _ = try runSingle(prompt: singlePrompt)
 #if !SINGLE_ONLY
-_ = try runBatched(prompts: [singlePrompt])
-_ = try runBatched(prompts: fourPrompts)
+let batches = batchSizes.map { (rows: $0, prompts: prompts(rows: $0)) }
+for batch in batches {
+    _ = try runBatched(prompts: batch.prompts)
+    if lengthsName == "mixed", batch.rows > 1 {
+        print("batch(\(batch.rows)) prompt lengths: \(batch.prompts.map(\.count))")
+    }
+}
+
+/// Every row's prompt run alone, untimed, to compare the batch rows with.
+var singleTokens: [[Int32]: [Int]] = [:]
+for batch in batches {
+    for prompt in batch.prompts where singleTokens[prompt] == nil {
+        singleTokens[prompt] = try runSingle(prompt: prompt).tokens[0]
+    }
+}
 #endif
 
 /// The tokens of a path in its first round, to check every later round against.
@@ -158,12 +207,12 @@ var mismatchedRounds: [Int] = []
 
 var single: [Double] = []
 var singleFirst: [Double] = []
-var batchOfOne: [Double] = []
-var batchOfOneFirst: [Double] = []
-var batchOfFour: [Double] = []
-var batchOfFourFirst: [Double] = []
-var agreement: [Int] = []
-var rowAgreement: [Int] = []
+#if !SINGLE_ONLY
+var batchRates: [Int: [Double]] = [:]
+var batchFirst: [Int: [Double]] = [:]
+/// Per batch size, the fewest leading tokens each row shares with its single-sequence run.
+var rowAgreement: [Int: [Int]] = [:]
+#endif
 for round in 0 ..< rounds {
     #if SINGLE_ONLY
     let plain = try runSingle(prompt: singlePrompt)
@@ -172,52 +221,58 @@ for round in 0 ..< rounds {
     check("single", plain, round: round + 1)
     print("round \(round + 1)  single \(format(plain, rows: 1))")
     #else
-    // Alternate the order so a thermal or background-load slope lands on both paths.
+    // Alternate the order so a thermal or background-load slope lands on every path.
     let batchedFirst = round % 2 == 1
-    let batched = batchedFirst ? try runBatched(prompts: [singlePrompt]) : nil
+    var runs: [Run] = []
+    if batchedFirst { runs = try batches.map { try runBatched(prompts: $0.prompts) } }
     let plain = try runSingle(prompt: singlePrompt)
-    let one = try batched ?? runBatched(prompts: [singlePrompt])
-    let four = try runBatched(prompts: fourPrompts)
+    if !batchedFirst { runs = try batches.map { try runBatched(prompts: $0.prompts) } }
 
     single.append(plain.tokensPerSecond)
     singleFirst.append(plain.firstToken)
-    batchOfOne.append(one.tokensPerSecond)
-    batchOfOneFirst.append(one.firstToken)
-    batchOfFour.append(four.tokensPerSecond)
-    batchOfFourFirst.append(four.firstToken)
-    // Each path must repeat itself across rounds exactly. Between paths the arithmetic
-    // can differ (four rows run other matmul shapes than one, and a sampler draws a
-    // batch from one random stream), so their streams can part ways; how far they agree
-    // is reported, not asserted.
     check("single", plain, round: round + 1)
-    check("batch(1)", one, round: round + 1)
-    check("batch(4)", four, round: round + 1)
-    agreement.append(zip(plain.tokens[0], one.tokens[0]).prefix { $0 == $1 }.count)
-    rowAgreement.append(zip(one.tokens[0], four.tokens[0]).prefix { $0 == $1 }.count)
-    print(
-        "round \(round + 1)  single \(format(plain, rows: 1))   batch(1) \(format(one, rows: 1))"
-            + "   batch(4) \(format(four, rows: 4))   (\(batchedFirst ? "batched" : "single") first)"
-    )
+    var line = "round \(round + 1)  single \(format(plain, rows: 1))"
+    for (batch, run) in zip(batches, runs) {
+        batchRates[batch.rows, default: []].append(run.tokensPerSecond)
+        batchFirst[batch.rows, default: []].append(run.firstToken)
+        // Each path must repeat itself across rounds exactly. Against a row's single run the
+        // arithmetic can differ (a batch runs other matmul shapes, and a sampler draws a batch
+        // from one random stream), so their streams can part ways; how far they agree is
+        // reported, not asserted.
+        check("batch(\(batch.rows))", run, round: round + 1)
+        let agreement = zip(batch.prompts, run.tokens).map { prompt, tokens in
+            zip(singleTokens[prompt]!, tokens).prefix { $0 == $1 }.count
+        }
+        rowAgreement[batch.rows] =
+            rowAgreement[batch.rows].map { zip($0, agreement).map { min($0, $1) } } ?? agreement
+        line += "   batch(\(batch.rows)) \(format(run, rows: batch.rows))"
+    }
+    print(line + "   (\(batchedFirst ? "batched" : "single") first)")
     #endif
     Memory.clearCache()
 }
-#if SINGLE_ONLY
 print(
-    String(
-        format: "median  single %.2f tok/s (ttft %.0f ms)", median(single),
-        1000 * median(singleFirst)))
-#else
-print(
-    String(
-        format:
-            "median  single %.2f tok/s (ttft %.0f ms)   batch(1) %.2f tok/s (ttft %.0f ms)   "
-            + "batch(4) %.2f tok/s per row, %.2f total (ttft %.0f ms)",
-        median(single), 1000 * median(singleFirst), median(batchOfOne),
-        1000 * median(batchOfOneFirst), median(batchOfFour), 4 * median(batchOfFour),
-        1000 * median(batchOfFourFirst)))
-print(
-    "single and batch(1) agree on the first \(agreement.min() ?? 0) of \(decodeTokens + 1) tokens; "
-        + "batch(1) and row 0 of batch(4) on the first \(rowAgreement.min() ?? 0)")
+    "median  single "
+        + format(
+            Run(tokensPerSecond: median(single), firstToken: median(singleFirst), tokens: []),
+            rows: 1))
+#if !SINGLE_ONLY
+for batch in batches {
+    let run = Run(
+        tokensPerSecond: median(batchRates[batch.rows]!),
+        firstToken: median(batchFirst[batch.rows]!), tokens: [])
+    print("median  batch(\(batch.rows)) " + format(run, rows: batch.rows))
+}
+for batch in batches {
+    let agreement = rowAgreement[batch.rows]!
+    print(
+        "batch(\(batch.rows)) rows agree with their single runs on the first "
+            + "\(agreement.min()!) of \(decodeTokens + 1) tokens"
+            + (batch.rows == 1 ? "" : "; per row \(agreement)"))
+}
+if samplerName != "greedy" {
+    print("(a batch draws every row from one random stream, so rows can part ways at once)")
+}
 #endif
 print(
     "each path repeats its tokens in every round: \(mismatchedRounds.isEmpty)"
