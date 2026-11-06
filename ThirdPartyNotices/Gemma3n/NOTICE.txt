@@ -1,0 +1,12 @@
+Gemma3n Swift implementation
+
+Vision, audio and multimodal embedding modules are adapted from:
+https://github.com/Blaizzy/mlx-vlm/tree/4693cd0eaf022ae7ef61c6fdb55e17e6399879a7/mlx_vlm/models/gemma3n
+Copyright © 2025 Prince Canuma. MIT License; see MLX-VLM-LICENSE.txt.
+
+Audio feature extraction is adapted from Google's Gemma3n implementation in
+Hugging Face Transformers:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3n/feature_extraction_gemma3n.py
+Copyright 2025 Google LLC. Apache License, Version 2.0;
+see Transformers-LICENSE.txt. The Swift translation replaces NumPy operations
+with MLX and integrates the existing UserInput audio decoder.
