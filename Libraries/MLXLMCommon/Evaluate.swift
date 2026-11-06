@@ -1815,7 +1815,7 @@ private struct SynchronousGenerationLoopResult {
     let reasoningTokenCount: Int?
 }
 
-private func buildStopTokenIds(
+func buildStopTokenIds(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer
 ) -> Set<Int> {
