@@ -12,6 +12,8 @@ struct KVCacheLeaf {
         case batched(BatchKVCache)
         /// Full-precision rows of a batch, each a sliding window.
         case batchedRotating(BatchRotatingKVCache)
+        /// Packed affine rows of a batch; never rewritten to another strategy.
+        case batchedAffine
         case affine(QuantizedKVCache)
         case turboQuant(TurboQuantKVCache)
         case varianceNormalized(VarianceNormalizedKVCache)
@@ -31,6 +33,7 @@ struct KVCacheLeaf {
         case let cache as KVCacheSimple: .simple(cache)
         case let cache as BatchKVCache: .batched(cache)
         case let cache as BatchRotatingKVCache: .batchedRotating(cache)
+        case is BatchQuantizedKVCache: .batchedAffine
         default: .unsupported
         }
     }
@@ -51,7 +54,7 @@ struct KVCacheLeaf {
 
     var isCompressed: Bool {
         switch kind {
-        case .affine, .turboQuant, .varianceNormalized: true
+        case .affine, .batchedAffine, .turboQuant, .varianceNormalized: true
         default: false
         }
     }
@@ -66,7 +69,8 @@ struct KVCacheLeaf {
     var participatesInTurboQuantBoundaryProtection: Bool {
         switch kind {
         case .simple, .affine, .turboQuant: true
-        case .recurrent, .rotating, .batched, .batchedRotating, .varianceNormalized, .unsupported:
+        case .recurrent, .rotating, .batched, .batchedRotating, .batchedAffine,
+            .varianceNormalized, .unsupported:
             false
         }
     }
@@ -112,6 +116,8 @@ struct KVCacheLeaf {
         case .affine:
             return strategy == .affine
                 || (strategy == .turboQuant && protectedPaths.contains(path))
+        case .batchedAffine:
+            return strategy == .affine
         case .turboQuant:
             return strategy == .turboQuant
         case .varianceNormalized:
