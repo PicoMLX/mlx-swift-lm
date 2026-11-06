@@ -109,6 +109,9 @@ public enum VLMTypeRegistry {
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
+        "minicpmo": create(MiniCPMConfiguration.self, MiniCPM.init),
+        "minicpmv4_6": create(MiniCPMConfiguration.self, MiniCPM.init),
+        "minicpmv4_7": create(MiniCPMConfiguration.self, MiniCPM.init),
     ])
 }
 
@@ -116,6 +119,15 @@ public enum VLMProcessorTypeRegistry {
 
     /// Shared instance with default processor types.
     public static let shared: ProcessorTypeRegistry = .init(creators: [
+        "MiniCPMOProcessor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmo") }),
+        "MiniCPMVProcessor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmv4_6") }),
+        "MiniCPMV4_7Processor": create(
+            MiniCPMProcessorConfiguration.self,
+            { MiniCPMProcessor($0, tokenizer: $1, modelType: "minicpmv4_7") }),
         "PaliGemmaProcessor": create(
             PaliGemmaProcessorConfiguration.self, PaliGemmaProcessor.init),
         "Qwen2VLProcessor": create(
@@ -395,7 +407,6 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
-        try configuration.refuseTensorParallelism()
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -426,6 +437,12 @@ public final class VLMModelFactory: GenericModelFactory {
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
         var eosTokenIds = baseConfig.effectiveEOSTokenIds
+        // MiniCPM-V's turn-end marker takes precedence over its generic end-of-text ID.
+        if ["minicpmv4_6", "minicpmv4_7"].contains(baseConfig.modelType),
+            eosTokenIds.contains(248046)
+        {
+            eosTokenIds = [248046]
+        }
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -481,11 +498,18 @@ public final class VLMModelFactory: GenericModelFactory {
             context: processorLoadingContext,
             registry: processorLoadingRegistry)
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+        if let group = configuration.tensorParallelGroup {
+            try await loadVLMShardedWeights(
+                modelDirectory: modelDirectory, model: model, group: group,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection,
+                excludedComponents: configuration.excludedComponents)
+        }
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration
@@ -519,7 +543,7 @@ public final class VLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -530,11 +554,29 @@ public final class VLMModelFactory: GenericModelFactory {
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
 
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
+
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
     }
 
+}
+
+/// Keep the temporary sharding existential inside the loader's isolation region.
+private func loadVLMShardedWeights(
+    modelDirectory: URL, model: any LanguageModel, group: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+    weightFileSelection: WeightFileSelection
+) async throws {
+    guard let shardable = model as? any (BaseLanguageModel & TensorParallelModel) else {
+        throw ModelFactoryError.invalidConfiguration(
+            "\(type(of: model)) models cannot be split across a distributed group")
+    }
+    try await loadShardedWeights(
+        modelDirectory: modelDirectory, model: shardable, group: group,
+        perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection)
 }
 
 /// Error wrapper that includes the filename for better error messages.

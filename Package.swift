@@ -93,14 +93,14 @@ let package = Package(
         .target(
             name: "MLXVLM",
             dependencies: [
-                "MLXLMCommon",
+                "MLXLMCommon", "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
             ],
             path: "Libraries/MLXVLM",
             exclude: [
-                "README.md"
+                "README.md", "MiniCPM.md", "MiniCPM-LICENSE", "MiniCPM-Canvas-LICENSE",
             ]
         ),
         .target(
@@ -185,6 +185,19 @@ let package = Package(
             path: "Tests/ShardedDecodeParity",
             exclude: ["run.sh"]
         ),
+        .executableTarget(
+            name: "MiniCPMDistributedParity",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ], path: "Tests/MiniCPMDistributedParity", exclude: ["run.sh"]),
+        .executableTarget(
+            name: "MiniCPMCheckpointSmoke",
+            dependencies: [
+                "MLXLMCommon", "MLXVLM", .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MiniCPMCheckpointSmoke", exclude: ["prepare.py", "run.sh"]),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -200,9 +213,18 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "Resources/generate_minicpm_reference.py",
+                "README.md",
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/minicpmo-reference.safetensors"),
+                .copy("Resources/minicpmo-reference.json"),
+                .copy("Resources/minicpmv4_6-reference.safetensors"),
+                .copy("Resources/minicpmv4_6-reference.json"),
+                .copy("Resources/minicpmv4_7-reference.safetensors"),
+                .copy("Resources/minicpmv4_7-reference.json"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

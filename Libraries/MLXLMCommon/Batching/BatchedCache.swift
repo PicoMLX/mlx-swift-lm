@@ -73,6 +73,21 @@ public func mergeCaches(_ caches: [any KVCache]) throws -> any BatchedCache {
     }
 }
 
+/// Copy a prepared single-sequence cache into its continuous-batching representation.
+///
+/// Uses the same exact-type and topology checks as ``mergeCaches(_:)``. The source
+/// remains independently usable; unsupported cache types return `nil`.
+public func makeBatchedCache(from cache: any KVCache) -> (any BatchedCache)? {
+    try? mergeCaches([cache])
+}
+
+/// Convert every layer of a prepared row, or reject its complete topology.
+/// No source cache is mutated if a later layer cannot be represented.
+public func makeBatchedCaches(from caches: [any KVCache]) -> [any BatchedCache]? {
+    guard !caches.isEmpty else { return nil }
+    return try? caches.map { try mergeCaches([$0]) }
+}
+
 // MARK: - Recurrent caches
 
 extension ArraysCache: BatchedCache {
