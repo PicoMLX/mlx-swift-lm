@@ -350,6 +350,98 @@ struct BatchQuantizedKVCacheTests {
     }
 
     @Test(
+        "Packed staged rounds refuse writes before every row consumes its padding",
+        arguments: [4, 8])
+    func paddedRoundIsRefused(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            for written in [0, 2] {
+                let cache = BatchQuantizedKVCache(leftPadding: [3, 0], bits: bits)
+                if written > 0 {
+                    let prefix = quantizedTestKV(positions: 0 ..< written, salt: 1, batchSize: 2)
+                    _ = cache.updateQuantized(keys: prefix.0, values: prefix.1)
+                }
+                let state = cache.state.map { $0[.ellipsis] }
+                let storage = KVCacheStorage([cache], plan: .disabled)
+                #expect(cache.isTrimmable)
+                #expect(!cache.isTrimmable(after: -1))
+                for width in [1, 2, 5] {
+                    #expect(!cache.isTrimmable(after: width))
+                    let refused = storage.beginRound(maximumPositions: width)
+                    #expect(refused == nil)
+                    // Old code admits the round. Write nothing so its rollback is still safe.
+                    if let refused { storage.rollback(refused) }
+                }
+                #expect(cache.offset == written)
+                #expect(storage.processedTokenCount == written)
+                #expect(storage.nativeAttentionOffsetsAreAligned)
+                try expectQuantizedRoundState(cache.state, equals: state)
+
+                #expect(cache.isTrimmable(after: 0))
+                let empty = try #require(storage.beginRound(maximumPositions: 0))
+                storage.rollback(empty)
+                #expect(storage.nativeAttentionOffsetsAreAligned)
+                try expectQuantizedRoundState(cache.state, equals: state)
+            }
+        }
+    }
+
+    @Test("Zero-row packed batches allow only empty staged rounds", arguments: [4, 8])
+    func zeroRowRoundIsRefused(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let cache = BatchQuantizedKVCache(leftPadding: [], bits: bits)
+            let state = cache.state.map { $0[.ellipsis] }
+            let storage = KVCacheStorage([cache], plan: .disabled)
+            #expect(!cache.isTrimmable(after: -1))
+            for width in [1, 2] {
+                #expect(!cache.isTrimmable(after: width))
+                let refused = storage.beginRound(maximumPositions: width)
+                #expect(refused == nil)
+                if let refused { storage.rollback(refused) }
+            }
+            #expect(cache.isTrimmable(after: 0))
+            let empty = try #require(storage.beginRound(maximumPositions: 0))
+            storage.rollback(empty)
+            #expect(cache.offset == 0)
+            #expect(cache.batchSize == 0)
+            #expect(storage.processedTokenCount == 0)
+            #expect(storage.nativeAttentionOffsetsAreAligned)
+            try expectQuantizedRoundState(cache.state, equals: state)
+        }
+    }
+
+    @Test(
+        "Packed staged rounds commit exactly once every row consumes its padding",
+        arguments: [4, 8], [0, 1])
+    func roundAfterPaddingCommitsExactly(bits: Int, retaining: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let cache = BatchQuantizedKVCache(leftPadding: [3, 0], bits: bits)
+            let prefix = quantizedTestKV(positions: 0 ..< 3, salt: 1, batchSize: 2)
+            _ = cache.updateQuantized(keys: prefix.0, values: prefix.1)
+            let storage = KVCacheStorage([cache], plan: .disabled)
+            #expect(cache.isTrimmable(after: 2))
+            #expect(!cache.isTrimmable(after: -1))
+            let round = try #require(storage.beginRound(maximumPositions: 2))
+            let staged = try #require(round.caches[0] as? BatchQuantizedKVCache)
+            let proposed = quantizedTestKV(positions: 3 ..< 5, salt: 1, batchSize: 2)
+            _ = staged.updateQuantized(keys: proposed.0, values: proposed.1)
+            let result = storage.commit(round, retaining: retaining)
+
+            #expect(result.committedPositions == retaining)
+            #expect(result.discardedPositions == 2 - retaining)
+            #expect(cache.offset == 3 + retaining)
+            #expect(cache.leftPadding.asArray(Int32.self) == [3, 0])
+            #expect(
+                cache.batchOffset.asArray(Int32.self) == [Int32(retaining), Int32(3 + retaining)])
+            #expect(storage.processedTokenCount == 3 + retaining)
+            #expect(storage.nativeAttentionOffsetsAreAligned)
+            let expected = QuantizedKVCache(bits: bits)
+            let kept = quantizedTestKV(positions: 0 ..< 3 + retaining, salt: 1, batchSize: 2)
+            _ = expected.updateQuantized(keys: kept.0, values: kept.1)
+            try expectQuantizedRoundState(Array(cache.state.dropLast(2)), equals: expected.state)
+        }
+    }
+
+    @Test(
         "Copy, state round trip and extracted rows do not share mutable packed storage",
         arguments: [4, 8])
     func copyAndStateIsolation(bits: Int) throws {
@@ -613,6 +705,18 @@ private func quantizedTestKV(
         return MLXArray(data).reshaped([batchSize, heads, positions.count, dim])
     }
     return (tensor(dim: keyDim, phase: 0), tensor(dim: valueDim, phase: 0.7))
+}
+
+private func expectQuantizedRoundState(
+    _ actual: [MLXArray], equals expected: [MLXArray],
+    sourceLocation: SourceLocation = #_sourceLocation
+) throws {
+    try #require(actual.count == expected.count, sourceLocation: sourceLocation)
+    for (actual, expected) in zip(actual, expected) {
+        try #require(actual.shape == expected.shape, sourceLocation: sourceLocation)
+        #expect(actual.dtype == expected.dtype, sourceLocation: sourceLocation)
+        #expect(all(actual .== expected).item(Bool.self), sourceLocation: sourceLocation)
+    }
 }
 
 private func expectPackedQuantizedRow(_ actual: any KVCache, equals expected: QuantizedKVCache)
