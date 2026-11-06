@@ -45,7 +45,7 @@ public enum BatchGenerationError: Error, LocalizedError, Equatable {
 }
 
 /// Streams raw token events from a fixed batch. For cancellation and deterministic MLX
-/// cleanup, use ``batchGenerateTokensTask(model:prompts:tokenizer:modelConfiguration:caches:maxTokens:stopTokens:sampler:processor:prefill:includeStopToken:wiredMemoryTicket:)``.
+/// cleanup, use ``batchGenerateTokensTask(model:prompts:tokenizer:modelConfiguration:caches:maxTokens:stopTokens:sampler:processor:prefill:includeStopToken:wiredMemoryTicket:cacheEvaluationPolicy:)``.
 ///
 /// Events are buffered without dropping tokens. Consume the stream to completion or cancel
 /// its consumer; a plain `break` does not reliably terminate an `AsyncThrowingStream`.
@@ -54,13 +54,15 @@ public func batchGenerateTokens(
     modelConfiguration: ModelConfiguration, caches: [[KVCache]?]? = nil,
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
     processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
-    includeStopToken: Bool = false, wiredMemoryTicket: WiredMemoryTicket? = nil
+    includeStopToken: Bool = false, wiredMemoryTicket: WiredMemoryTicket? = nil,
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
 ) throws -> AsyncThrowingStream<BatchGenerationEvent<TokenGeneration>, Error> {
     try batchGenerateTokensTask(
         model: model, prompts: prompts, tokenizer: tokenizer,
         modelConfiguration: modelConfiguration, caches: caches, maxTokens: maxTokens,
         stopTokens: stopTokens, sampler: sampler, processor: processor, prefill: prefill,
-        includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket
+        includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket,
+        cacheEvaluationPolicy: cacheEvaluationPolicy
     ).0
 }
 
@@ -71,12 +73,15 @@ public func batchGenerateTokens(
 /// model/cache errors terminate the stream with that error. Await `task.value` after cancelling
 /// to wait for GPU work and cache cleanup. The model and supplied caches must not be used
 /// concurrently until the task completes. Admission, prefix reuse and budgets remain caller-owned.
+/// ``KVCacheEvaluationPolicy/attentionDependencies`` requires the caller's model to consume
+/// its attention-cache updates in the token computation.
 public func batchGenerateTokensTask(
     model: any LanguageModel, prompts: [[Int]], tokenizer: Tokenizer,
     modelConfiguration: ModelConfiguration, caches: [[KVCache]?]? = nil,
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
     processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
-    includeStopToken: Bool = false, wiredMemoryTicket: WiredMemoryTicket? = nil
+    includeStopToken: Bool = false, wiredMemoryTicket: WiredMemoryTicket? = nil,
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
 ) throws -> (
     AsyncThrowingStream<BatchGenerationEvent<TokenGeneration>, Error>, Task<Void, Never>
 ) {
@@ -85,6 +90,7 @@ public func batchGenerateTokensTask(
         modelConfiguration: modelConfiguration, caches: caches, maxTokens: maxTokens,
         stopTokens: stopTokens, sampler: sampler, processor: processor, prefill: prefill,
         includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket,
+        cacheEvaluationPolicy: cacheEvaluationPolicy,
         handlers: prompts.map { _ in RawTokenLoopHandler() })
 }
 
@@ -98,13 +104,15 @@ public func batchGenerateText(
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
     processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
     tools: [[String: any Sendable]]? = nil, toolCallPolicy: ToolCallPolicy = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
 ) throws -> AsyncThrowingStream<BatchGenerationEvent<Generation>, Error> {
     try batchGenerateTextTask(
         model: model, prompts: prompts, tokenizer: tokenizer,
         modelConfiguration: modelConfiguration, caches: caches, maxTokens: maxTokens,
         stopTokens: stopTokens, sampler: sampler, processor: processor, prefill: prefill,
-        tools: tools, toolCallPolicy: toolCallPolicy, wiredMemoryTicket: wiredMemoryTicket
+        tools: tools, toolCallPolicy: toolCallPolicy, wiredMemoryTicket: wiredMemoryTicket,
+        cacheEvaluationPolicy: cacheEvaluationPolicy
     ).0
 }
 
@@ -119,7 +127,8 @@ public func batchGenerateTextTask(
     maxTokens: Int = 128, stopTokens: Set<Int> = [], sampler: LogitSampler = ArgMaxSampler(),
     processor: LogitProcessor? = nil, prefill: PrefillParameters = .init(),
     tools: [[String: any Sendable]]? = nil, toolCallPolicy: ToolCallPolicy = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy = .allState
 ) throws -> (AsyncThrowingStream<BatchGenerationEvent<Generation>, Error>, Task<Void, Never>) {
     let handlers = prompts.map { prompt in
         TextToolTokenLoopHandler(
@@ -138,7 +147,8 @@ public func batchGenerateTextTask(
         model: model, prompts: prompts, tokenizer: tokenizer,
         modelConfiguration: modelConfiguration, caches: caches, maxTokens: maxTokens,
         stopTokens: stopTokens, sampler: sampler, processor: processor, prefill: prefill,
-        includeStopToken: false, wiredMemoryTicket: wiredMemoryTicket, handlers: handlers)
+        includeStopToken: false, wiredMemoryTicket: wiredMemoryTicket,
+        cacheEvaluationPolicy: cacheEvaluationPolicy, handlers: handlers)
 }
 
 private struct BatchStreamRow {
@@ -152,6 +162,7 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
     modelConfiguration: ModelConfiguration, caches: [[KVCache]?]?, maxTokens: Int,
     stopTokens: Set<Int>, sampler: LogitSampler, processor: LogitProcessor?,
     prefill: PrefillParameters, includeStopToken: Bool, wiredMemoryTicket: WiredMemoryTicket?,
+    cacheEvaluationPolicy: KVCacheEvaluationPolicy,
     handlers: consuming [Handler]
 ) throws -> (AsyncThrowingStream<BatchGenerationEvent<Handler.Output>, Error>, Task<Void, Never>) {
     if let index = prompts.firstIndex(where: { $0.isEmpty }) {
@@ -181,7 +192,8 @@ private func batchGenerationTask<Handler: TokenLoopHandler>(
             var iterator = BatchTokenIterator(
                 model: model, sampler: sampler, processor: processor,
                 stopTokens: iteratorStopTokens,
-                maxTokens: maxTokens, prefill: prefill)
+                maxTokens: maxTokens, prefill: prefill, cacheEvaluationPolicy: cacheEvaluationPolicy
+            )
             if !Task.isCancelled { _ = iterator.insert(prompts: prompts, caches: caches) }
             var rows = prompts.map { _ in BatchStreamRow() }
             func elapsed() -> TimeInterval {
