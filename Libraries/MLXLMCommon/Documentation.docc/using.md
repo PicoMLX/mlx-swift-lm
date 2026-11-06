@@ -233,3 +233,58 @@ You can use the <doc:#MLXHuggingFace-Macros> like this:
         .product(name: "Tokenizers", package: "swift-transformers"),
     ]),
 ```
+
+
+## Fixed-batch streaming
+
+`batchGenerateTokens` streams raw token events for a fixed set of tokenized prompts.
+`batchGenerateText` streams decoded text, reasoning and tool-call events, with an
+independent decoder for each prompt. Both reuse ``BatchTokenIterator``.
+Their task variants return the stream and its producer task:
+
+```swift
+let context: ModelContext = ...
+let prompts: [[Int]] = ...
+
+let (stream, task) = try batchGenerateTextTask(
+    model: context.model,
+    prompts: prompts,
+    tokenizer: context.tokenizer,
+    modelConfiguration: context.configuration,
+    maxTokens: 128
+)
+
+for try await event in stream {
+    switch event {
+    case .output(let uid, let output):
+        if case .chunk(let text) = output {
+            print("request \(uid): \(text)")
+        }
+    case .info(let uid, let info):
+        print("request \(uid) finished: \(info.stopReason)")
+    }
+}
+await task.value
+```
+
+The UID is the prompt's zero-based index. A stop string or response-protocol
+boundary finishes only its matching row. Completion arrives in the outer
+`BatchGenerationEvent.info(uid:_:)` case; the output does not contain an
+embedded `Generation.info` or `TokenGeneration.info`.
+
+``BatchCompletionInfo`` reports that row's prompt count, emitted token count,
+stop reason, time to its first model token and elapsed time. Time to first token
+includes the fixed batch's sequential prefills and first batched forward; it is
+not an isolated per-row prefill measurement. It is nil if cancellation occurs
+before the row's first token. The completion does not infer cache evictions,
+log probabilities or reasoning-token counts.
+
+Use `batchGenerateTokensTask` or `batchGenerateTextTask` when consumption may stop
+early. Cancel the returned task and await `task.value` before reusing the model or
+caches. A plain `break` does not reliably terminate an `AsyncThrowingStream`.
+Cancelling the producer cancels the whole fixed batch; model and cache errors
+are delivered through the throwing stream. Output is buffered without dropping
+events.
+
+These APIs consume a fixed set of prompts. Request queues, admission order,
+prefix reuse, prompt-cache ownership and memory budgets remain caller-owned.
