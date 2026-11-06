@@ -50,6 +50,11 @@ public struct PrefillParameters: Sendable {
     /// The closure is retained like ``progress``.
     public var prefix: (@Sendable (_ positions: Int) -> Void)?
 
+    /// Replaces the task cancellation check before each prefill chunk.
+    /// Distributed callers use this to make every rank stop before the same collective.
+    /// The callback must check cancellation itself; `nil` uses `Task.checkCancellation()`.
+    public var cancellationCheck: (@Sendable () throws -> Void)? = nil
+
     /// Strategy dividing the prompt into prefill forwards.
     public enum Chunking: Sendable {
         /// The fewest equal chunks that respect the step-size ceiling, so no
@@ -154,7 +159,11 @@ public struct PrefillParameters: Sendable {
         let slack = min(reserving, 1)
         var processed = 0
         while total - processed > reserving {
-            try Task.checkCancellation()
+            if let cancellationCheck {
+                try cancellationCheck()
+            } else {
+                try Task.checkCancellation()
+            }
             autoreleasepool {
                 let n = min(chunkLength, total - processed - slack)
                 body(processed ..< processed + n)

@@ -108,6 +108,8 @@ public enum VLMTypeRegistry {
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
+        "deepseekocr": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
+        "deepseekocr_2": create(DeepSeekOCRConfiguration.self, DeepSeekOCR.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
     ])
 }
@@ -154,6 +156,10 @@ public enum VLMProcessorTypeRegistry {
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
             MuseGlimmerProcessorConfiguration.self, MuseGlimmerProcessor.init),
+        "DeepSeekOCRProcessor": create(
+            DeepSeekOCRProcessorConfiguration.self, DeepSeekOCRProcessor.init),
+        "DeepSeekOCR2Processor": create(
+            DeepSeekOCRProcessorConfiguration.self, DeepSeekOCR2Processor.init),
     ])
 }
 
@@ -395,7 +401,6 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
-        try configuration.refuseTensorParallelism()
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -481,11 +486,18 @@ public final class VLMModelFactory: GenericModelFactory {
             context: processorLoadingContext,
             registry: processorLoadingRegistry)
 
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection,
-            excludedComponents: configuration.excludedComponents)
+        if let group = configuration.tensorParallelGroup {
+            try await loadVLMShardedWeights(
+                modelDirectory: modelDirectory, model: model, group: group,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection)
+        } else {
+            try await loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization,
+                weightFileSelection: configuration.weightFileSelection,
+                excludedComponents: configuration.excludedComponents)
+        }
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration
@@ -519,7 +531,7 @@ public final class VLMModelFactory: GenericModelFactory {
             configuration.tokenizerDirectory == modelDirectory
             ? nil
             : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
+        var modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
             defaultPrompt: configuration.defaultPrompt,
@@ -530,11 +542,29 @@ public final class VLMModelFactory: GenericModelFactory {
             reasoningConfig: mutableConfiguration.reasoningConfig,
             messageGenerator: mutableConfiguration.messageGenerator)
 
+        modelConfig.tensorParallelGroup = configuration.tensorParallelGroup
+
         return .init(
             configuration: modelConfig, model: model, processor: processor,
             tokenizer: tokenizer)
     }
 
+}
+
+/// Keep the temporary sharding existential inside the loader's isolation region.
+private func loadVLMShardedWeights(
+    modelDirectory: URL, model: any LanguageModel, group: MLXDistributed.Group,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?,
+    weightFileSelection: WeightFileSelection
+) async throws {
+    guard let shardable = model as? any (BaseLanguageModel & TensorParallelModel) else {
+        throw ModelFactoryError.invalidConfiguration(
+            "\(type(of: model)) models cannot be split across a distributed group")
+    }
+    try await loadShardedWeights(
+        modelDirectory: modelDirectory, model: shardable, group: group,
+        perLayerQuantization: perLayerQuantization,
+        weightFileSelection: weightFileSelection)
 }
 
 /// Error wrapper that includes the filename for better error messages.

@@ -182,13 +182,17 @@ public struct LMInput {
         public let positionIds: MLXArray?
         /// Time, height, and width of the images
         public let frames: [THW]?
+        /// Optional local image crops, kept at their encoder's native resolution.
+        public let crops: MLXArray?
 
         public init(
-            pixels: MLXArray, positionIds: MLXArray? = nil, frames: [THW]? = nil
+            pixels: MLXArray, positionIds: MLXArray? = nil, frames: [THW]? = nil,
+            crops: MLXArray? = nil
         ) {
             self.pixels = pixels
             self.positionIds = positionIds
             self.frames = frames
+            self.crops = crops
         }
     }
 
