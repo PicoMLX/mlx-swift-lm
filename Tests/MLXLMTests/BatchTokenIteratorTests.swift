@@ -404,6 +404,66 @@ struct BatchTokenIteratorTests {
         }
     }
 
+    @Test("Supplied quantized prompt caches preserve greedy token streams", arguments: [4, 8])
+    func quantizedGreedy(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            func caches() -> [any KVCache] {
+                (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+            }
+            let expected = try Self.prompts.map { prompt in
+                try generateAlone(
+                    model, prompt: prompt, cache: caches(), sampler: ArgMaxSampler(), maxTokens: 6)
+            }
+            let actual = try batchGenerate(
+                model: model, prompts: Self.prompts, caches: Self.prompts.map { _ in caches() },
+                maxTokens: 6)
+            #expect(actual == expected)
+        }
+    }
+
+    @Test(
+        "Quantized rows keep their seeded sampler streams when another row joins",
+        arguments: [4, 8])
+    func quantizedSeededAdmission(bits: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = tinyQuantizedIteratorLlama()
+            let limits = [6, 5, 4]
+            func caches() -> [any KVCache] {
+                (0 ..< 2).map { _ in QuantizedKVCache(groupSize: 64, bits: bits) }
+            }
+            func sampler(_ index: Int) -> TopPSampler {
+                TopPSampler(temperature: 0.8, topP: 0.9, seed: UInt64(17 + index))
+            }
+            let expected = try Self.prompts.indices.map { index in
+                try generateAlone(
+                    model, prompt: Self.prompts[index], cache: caches(), sampler: sampler(index),
+                    maxTokens: limits[index])
+            }
+            var iterator = BatchTokenIterator(model: model)
+            var uids = iterator.insert(
+                prompts: Array(Self.prompts.prefix(2)), maxTokens: Array(limits.prefix(2)),
+                caches: [caches(), caches()], samplers: [sampler(0), sampler(1)])
+            var output = [Int: [Int]]()
+            for _ in 0 ..< 2 {
+                for response in try iterator.next() {
+                    output[response.uid, default: []].append(response.token)
+                }
+            }
+            uids += iterator.insert(
+                prompts: [Self.prompts[2]], maxTokens: [limits[2]], caches: [caches()],
+                samplers: [sampler(2)])
+            while true {
+                let responses = try iterator.next()
+                if responses.isEmpty { break }
+                for response in responses {
+                    output[response.uid, default: []].append(response.token)
+                }
+            }
+            #expect(uids.map { output[$0] ?? [] } == expected)
+        }
+    }
+
     @Test("The controlled top-p boundary distinguishes float16 from promoted logits")
     func topPPrecisionBoundary() {
         Device.withDefaultDevice(.cpu) {
@@ -805,6 +865,17 @@ struct BatchTokenIteratorTests {
         #expect(
             sampler.sample(logProbabilities: logSoftmax(batch, axis: -1)).asArray(Int.self)
                 == [1, 0])
+    }
+}
+
+private func tinyQuantizedIteratorLlama() -> LlamaModel {
+    withRandomState(MLXRandom.RandomState(seed: 907)) {
+        let model = LlamaModel(
+            LlamaConfiguration(
+                hiddenSize: 128, hiddenLayers: 2, intermediateSize: 128, attentionHeads: 2,
+                rmsNormEps: 1e-5, vocabularySize: 32, kvHeads: 1))
+        eval(model)
+        return model
     }
 }
 

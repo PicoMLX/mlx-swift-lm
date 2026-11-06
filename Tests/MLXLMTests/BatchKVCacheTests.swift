@@ -2049,9 +2049,10 @@ struct BatchedHybridCacheTests {
     func protocolSurface() throws {
         #expect(try mergeCaches([MambaCache()]) is MambaCache)
         #expect(try mergeCaches([CacheList(KVCacheSimple(), MambaCache())]) is CacheList)
-        #expect(throws: KVCacheError.self) { _ = try mergeCaches([QuantizedKVCache()]) }
+        #expect(try mergeCaches([QuantizedKVCache()]) is BatchQuantizedKVCache)
         #expect(throws: KVCacheError.self) { _ = try mergeCaches([ChunkedKVCache(chunkSize: 4)]) }
         #expect(!(QuantizedKVCache() as any KVCache is any BatchableKVCache))
+        #expect(try QuantizedKVCache.merge([QuantizedKVCache()]) is BatchQuantizedKVCache)
     }
 }
 
