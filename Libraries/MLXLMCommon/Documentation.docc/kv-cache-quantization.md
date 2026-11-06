@@ -40,6 +40,28 @@ Prefill is unaffected: the cache stores raw fp16 during prompt processing,
 compresses on the first decode step, and encodes each new token incrementally
 afterwards. Compressed caches round-trip through prompt-cache save/restore.
 
+## Continuous batching
+
+``BatchTokenIterator`` and `batchGenerate` accept caller-supplied prompt caches
+containing ``QuantizedKVCache``. Pass one cache array per prompt through `caches`,
+with affine 4-bit or 8-bit caches in the full-attention slots. Each layer's rows
+must use the same bit width, group size, and affine mode. Fresh prompts without
+supplied caches retain the model's default cache layout.
+
+``mergeCaches(_:)`` merges these rows into ``BatchQuantizedKVCache``. Keys and
+values stay packed while rows join, leave, or are extracted; the existing
+quantized attention path consumes the packed storage. Per-row positions and
+padding allow prompts of different lengths to decode together. ``CacheList``
+can combine quantized attention with supported recurrent or rotating children.
+
+The model must already support quantized attention. Models that call
+``KVCache/update(keys:values:)`` directly do not gain quantized support from the
+batched cache. This path does not apply dynamic compression thresholds or
+convert batches to TurboQuant. Rotating caches remain unquantized.
+
+Extract a row before saving a prompt cache: batched caches are not registered
+for prompt-cache file serialization.
+
 ## Capacity and compatibility
 
 A capacity creates rotating caches for model cache factories that support the
