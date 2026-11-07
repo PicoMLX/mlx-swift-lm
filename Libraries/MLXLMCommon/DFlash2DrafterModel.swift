@@ -109,7 +109,7 @@ public protocol DFlash2DrafterModel: BaseLanguageModel {
     var targetLayerIds: [Int] { get }
     /// The target shape the drafter was distilled for.
     var targetGeometry: DFlash2Geometry { get }
-    /// Target hidden rows the drafter's context keeps.
+    /// Target hidden rows the drafter's context keeps; `Int.max` keeps them all.
     var contextWindow: Int { get }
 
     func makeState() -> DFlash2DrafterState
@@ -335,7 +335,8 @@ extension KVCacheSimple {
 /// known, so rows enter as placeholders with explicit positions and
 /// `resolve(newest:valid:)` commits the accepted prefix. Rows are compacted to
 /// the newest valid `window` rows once every few hundred appends; until then
-/// the attention mask hides placeholders and rows past the window.
+/// the attention mask hides placeholders and rows past the window. A window of
+/// `Int.max` keeps every valid row, for a full-attention layer.
 public final class DFlash2ContextCache {
     public let window: Int
 
@@ -343,6 +344,12 @@ public final class DFlash2ContextCache {
     private var valueStore: MLXArray?
     private var storedCount = 0
     private let compactionSlack = 256
+
+    private var bounded: Bool { window < Int.max - compactionSlack }
+    /// Rows to allocate beyond `kept`, so appends stay cheap between compactions.
+    private func capacity(keeping kept: Int, reserving n: Int) -> Int {
+        bounded ? Swift.max(window + compactionSlack, kept + n) : kept + n + compactionSlack
+    }
 
     /// Absolute position of each stored row.
     package private(set) var rowPositions: [Int32] = []
@@ -369,14 +376,15 @@ public final class DFlash2ContextCache {
         let n = newKeys.dim(2)
         precondition(positions.count == n, "one position per appended row")
         if keyStore == nil {
-            let capacity = Swift.max(n, window + compactionSlack)
+            let capacity = capacity(keeping: 0, reserving: n)
             keyStore = MLXArray.zeros(
                 [newKeys.dim(0), newKeys.dim(1), capacity, newKeys.dim(3)], dtype: newKeys.dtype)
             valueStore = MLXArray.zeros(
                 [newValues.dim(0), newValues.dim(1), capacity, newValues.dim(3)],
                 dtype: newValues.dtype)
         }
-        if storedCount + n > keyStore!.dim(2) || storedCount > window + compactionSlack {
+        if storedCount + n > keyStore!.dim(2) || (bounded && storedCount > window + compactionSlack)
+        {
             compact(reserving: n)
         }
         keyStore![.ellipsis, storedCount ..< (storedCount + n), 0...] = newKeys
@@ -403,7 +411,7 @@ public final class DFlash2ContextCache {
         let gather = MLXArray(kept.map { Int32($0) })
         let keptKeys = MLX.take(keyStore!, gather, axis: 2)
         let keptValues = MLX.take(valueStore!, gather, axis: 2)
-        let capacity = Swift.max(window + compactionSlack, kept.count + n)
+        let capacity = capacity(keeping: kept.count, reserving: n)
         let padK = [keptKeys.dim(0), keptKeys.dim(1), capacity - kept.count, keptKeys.dim(3)]
         let padV = [
             keptValues.dim(0), keptValues.dim(1), capacity - kept.count, keptValues.dim(3),
