@@ -2666,6 +2666,9 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    // Read the prompt before the iterator queues its prefill, which this would wait for.
+    let reasoningPrimedInside = promptPrimesReasoning(
+        input: input, modelConfiguration: context.configuration, tokenizer: context.tokenizer)
     let iterator = try DFlash2SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2686,7 +2689,10 @@ public func generate(
             stopStrings: context.configuration.effectiveStopStrings,
             format: context.configuration.toolCallFormat ?? .json,
             tools: tools,
-            toolCallPolicy: parameters.toolCallPolicy
+            toolCallPolicy: parameters.toolCallPolicy,
+            reasoning: context.configuration.reasoningConfig.map {
+                (config: $0, primedInside: reasoningPrimedInside)
+            }
         )
     )
     return stream
