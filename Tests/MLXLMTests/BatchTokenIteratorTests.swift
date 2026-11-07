@@ -1810,6 +1810,7 @@ private struct BatchStreamTextResult {
             case .toolCall(let call): calls[uid, default: []].append(call.function)
             case .rejectedToolCall: Issue.record("a valid tool call was rejected")
             case .info: Issue.record("completion belongs in the outer batch event")
+            case .steering: Issue.record("batch streams take no steering")
             }
         case .info(let uid, let completion):
             #expect(info[uid] == nil, "each row completes once")
