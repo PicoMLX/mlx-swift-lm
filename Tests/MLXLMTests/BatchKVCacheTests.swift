@@ -1114,3 +1114,1198 @@ private func expectIdeficsChunk(
             "row \(row) must use its own rotary positions", sourceLocation: sourceLocation)
     }
 }
+
+@Suite(.serialized)
+struct BatchedHybridCacheTests {
+
+    @Test("Recurrent merge refuses populated rows with different slot counts")
+    func recurrentMergeRejectsSlotCountMismatch() {
+        Device.withDefaultDevice(.cpu) {
+            let two = ArraysCache(size: 2)
+            two[0] = MLXArray([Float(1), 2, 3, 4])[.newAxis]
+            two[1] = MLXArray([Float(5), 6, 7, 8])[.newAxis]
+            let one = ArraysCache(size: 1)
+            one[0] = MLXArray([Float(9), 10, 11, 12])[.newAxis]
+            expectRejectedMerge([two, one])
+            expectRejectedMerge([one, two], nested: true)
+        }
+    }
+
+    @Test(
+        "Recurrent merge validates sparse slots and each row's metadata",
+        arguments: MergeLayoutIssue.allCases)
+    func recurrentMergeRejectsMalformedRows(issue: MergeLayoutIssue) {
+        Device.withDefaultDevice(.cpu) {
+            expectRejectedMerge(malformedRows(issue))
+        }
+    }
+
+    @Test("Typed and erased recurrent merges preserve prepared sparse rows")
+    func recurrentMergePreservesPreparedSparseRows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let first = MambaCache(leftPadding: [2, 4])
+            first[1] = MLXArray([Float(5), 6, 7, 8, 9, 10]).reshaped([2, 3])
+            first.prepare(lengths: [5, 7])
+            first.offset = 7
+            let second = MambaCache()
+            second[0] = MLXArray([Float(1), 2, 3, 4])[.newAxis]
+            second.offset = 3
+            let typed = ArraysCache.merge([first, second])
+            let erased = try #require(try mergeCaches([first, second]) as? MambaCache)
+            for merged in [typed, erased] {
+                #expect(merged.offset == 7)
+                #expect(merged.leftPaddingValues == [2, 4, 0])
+                #expect(merged.lengthsValues == [5, 7, 0])
+                #expect(try #require(merged[0]).shape == [3, 4])
+                #expect(try #require(merged[1]).shape == [3, 3])
+                #expect(
+                    try #require(merged[0]).asArray(Float.self)
+                        == [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4])
+                #expect(
+                    try #require(merged[1]).asArray(Float.self) == [5, 6, 7, 8, 9, 10, 0, 0, 0])
+            }
+            #expect(first.offset == 7)
+            #expect(first.leftPaddingValues == [2, 4])
+            #expect(first.lengthsValues == [5, 7])
+            #expect(second.offset == 3)
+            #expect(second[1] == nil)
+            #expect(throws: KVCacheError.self) {
+                _ = try ArraysCache.merge([any KVCache]())
+            }
+        }
+    }
+
+    enum MergeLayoutIssue: CaseIterable, Sendable {
+        case emptySlotCounts
+        case emptyTemplateSlotCounts
+        case sparseShapes
+        case sparseDtypes
+        case scalarState
+        case slotRowCounts
+        case paddingRowCounts
+        case lengthRowCounts
+        case lengthRank
+    }
+
+    private func malformedRows(_ issue: MergeLayoutIssue) -> [ArraysCache] {
+        let first = ArraysCache(size: 2)
+        switch issue {
+        case .emptySlotCounts:
+            return [first, ArraysCache(size: 1)]
+        case .emptyTemplateSlotCounts:
+            let second = ArraysCache(size: 1)
+            second[0] = MLXArray.ones([1, 4])
+            return [first, second]
+        case .sparseShapes, .sparseDtypes:
+            let second = ArraysCache(size: 2)
+            let third = ArraysCache(size: 2)
+            second[1] = MLXArray.ones([1, 4])
+            third[1] =
+                issue == .sparseShapes
+                ? MLXArray.ones([1, 8]) : MLXArray.ones([1, 4], dtype: .float16)
+            return [first, second, third]
+        case .scalarState:
+            first[0] = MLXArray(Float(1))
+        case .slotRowCounts:
+            first[0] = MLXArray.ones([2, 4])
+            first[1] = MLXArray.ones([1, 4])
+        case .paddingRowCounts:
+            let padded = ArraysCache(size: 2, leftPadding: [0])
+            padded[0] = MLXArray.ones([2, 4])
+            return [padded]
+        case .lengthRowCounts:
+            first[0] = MLXArray.ones([2, 4])
+            first.prepare(lengths: [1])
+        case .lengthRank:
+            first[0] = MLXArray.ones([2, 4])
+            first.prepare(lengths: MLXArray([Int32(1), 2]).reshaped([1, 2]))
+        }
+        return [first]
+    }
+
+    private func expectRejectedMerge(_ rows: [ArraysCache], nested: Bool = false) {
+        let before = rows.map { row in
+            (
+                offset: row.offset, metadata: row.metaState,
+                shapes: row.state.map(\.shape), dtypes: row.state.map(\.dtype),
+                values: row.state.map { $0.asType(.float32).asArray(Float.self) }
+            )
+        }
+        let metadataShapes = rows.map { [$0.leftPadding?.shape, $0.lengths?.shape] }
+        let caches: [KVCache] = rows.map { row -> KVCache in
+            if nested { return CacheList(KVCacheSimple(), CacheList(row)) }
+            return row
+        }
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches(caches) }
+        for (row, snapshot) in zip(rows, before) {
+            #expect(row.offset == snapshot.offset)
+            #expect(row.metaState == snapshot.metadata)
+            #expect(row.state.map(\.shape) == snapshot.shapes)
+            #expect(row.state.map(\.dtype) == snapshot.dtypes)
+            #expect(row.state.map { $0.asType(.float32).asArray(Float.self) } == snapshot.values)
+        }
+        #expect(rows.map { [$0.leftPadding?.shape, $0.lengths?.shape] } == metadataShapes)
+    }
+
+    @Test("Recurrent extension checks refuse incompatible state and custom subclasses")
+    func extensionValidation() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let recurrent = ArraysCache(size: 2)
+            recurrent[0] = MLXArray.zeros([1, 4])
+            let wrongSlots = ArraysCache(size: 1)
+            #expect(throws: KVCacheError.self) {
+                try recurrent.validateExtension(other: wrongSlots)
+            }
+            let wrongState = ArraysCache(size: 2)
+            wrongState[0] = MLXArray.zeros([1, 8])
+            #expect(throws: KVCacheError.self) {
+                try recurrent.validateExtension(other: wrongState)
+            }
+            let empty = ArraysCache(size: 2)
+            try recurrent.validateExtension(other: empty)
+            recurrent.extend(other: empty)
+            #expect(recurrent[0]?.shape == [2, 4])
+
+            class CustomArraysCache: ArraysCache {}
+            let custom = CustomArraysCache(size: 2)
+            #expect(throws: KVCacheError.self) { try custom.validateExtension(other: custom) }
+            #expect(throws: KVCacheError.self) { _ = try mergeCaches([custom]) }
+        }
+    }
+
+    @Test(
+        "Zero-row recurrent caches cannot be saved, including nested and metadata-only batches",
+        arguments: [false, true], [false, true])
+    func zeroRowsAreRefused(mamba: Bool, populated: Bool) {
+        Device.withDefaultDevice(.cpu) {
+            let recurrent: ArraysCache = mamba ? MambaCache() : ArraysCache(size: 2)
+            if populated { recurrent[0] = MLXArray.ones([2, 4]) }
+            recurrent.filter(batchIndices: MLXArray([Int32]()))
+            #expect(recurrent.batchSize == 0)
+            let caches: [KVCache] = [
+                recurrent, CacheList(recurrent), CacheList(KVCacheSimple(), CacheList(recurrent)),
+            ]
+            for cache in caches {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("zero-rows-\(UUID().uuidString).safetensors")
+                defer { try? FileManager.default.removeItem(at: url) }
+                #expect(throws: KVCacheError.self) {
+                    try savePromptCache(url: url, cache: [cache])
+                }
+                #expect(FileManager.default.fileExists(atPath: url.path) == false)
+            }
+        }
+    }
+
+    @Test("An unpopulated single-row recurrent cache still saves and restores")
+    func emptySingleRowCanBeSaved() throws {
+        try Device.withDefaultDevice(.cpu) {
+            for cache in [ArraysCache(size: 2), MambaCache()] {
+                #expect(cache.batchSize == 1)
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("empty-row-\(UUID().uuidString).safetensors")
+                defer { try? FileManager.default.removeItem(at: url) }
+                try savePromptCache(url: url, cache: [cache])
+                let loaded = try loadPromptCache(url: url)
+                let restored = try #require(loaded.0.first as? ArraysCache)
+                #expect(type(of: restored) == type(of: cache))
+                #expect(restored.batchSize == 1)
+            }
+        }
+    }
+
+    @Test(
+        "Saving refuses only a recurrent batch whose rows nothing records, also in a list",
+        arguments: [false, true])
+    func unrecordedRecurrentRowsAreRefused(mamba: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            func row(leftPadding: [Int]? = nil) -> ArraysCache {
+                mamba
+                    ? MambaCache(leftPadding: leftPadding)
+                    : ArraysCache(size: 2, leftPadding: leftPadding)
+            }
+            func roundTrip(_ cache: KVCache) throws -> KVCache? {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("recurrent-rows-\(UUID().uuidString).safetensors")
+                defer { try? FileManager.default.removeItem(at: url) }
+                try savePromptCache(url: url, cache: [cache])
+                return try loadPromptCache(url: url).0.first
+            }
+
+            // Two empty rows: no array, padding or length in the file would record the second.
+            let empty = ArraysCache.merge([row(), row()])
+            #expect(empty.batchSize == 2)
+            let holders: [KVCache] = [
+                empty, CacheList(KVCacheSimple(), empty), CacheList(CacheList(empty)),
+            ]
+            for cache in holders {
+                #expect(throws: KVCacheError.self) { _ = try roundTrip(cache) }
+            }
+
+            // Padding records the rows of a batch without state.
+            let padded = try #require(try roundTrip(row(leftPadding: [0, 1])) as? ArraysCache)
+            #expect(padded.batchSize == 2)
+            #expect(padded.leftPadding?.asArray(Int.self) == [0, 1])
+
+            // State arrays record the rows of a populated batch.
+            let populated = row()
+            populated[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+            let restored = try #require(try roundTrip(populated) as? ArraysCache)
+            #expect(type(of: restored) == type(of: populated))
+            #expect(restored.batchSize == 2)
+            #expect(restored[0]?.asArray(Float.self) == (0 ..< 8).map(Float.init))
+        }
+    }
+
+    @Test("A file with four-field recurrent metadata loads", arguments: [false, true])
+    func fourFieldRecurrentMetadataLoads(mamba: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let cache: ArraysCache =
+                mamba
+                ? MambaCache(leftPadding: [1, 0]) : ArraysCache(size: 2, leftPadding: [1, 0])
+            cache[1] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+            cache.prepare(lengths: [2, 3])
+            // [slotCount, presentSlots, leftPadding, lengths], the format `main` writes.
+            #expect(cache.metaState == ["2", "1", "1,0", "2,3"])
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("four-field-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            try savePromptCache(url: url, cache: [cache])
+            let restored = try #require(try loadPromptCache(url: url).0.first as? ArraysCache)
+            #expect(type(of: restored) == type(of: cache))
+            #expect(restored.metaState == cache.metaState)
+            #expect(restored.batchSize == 2)
+            #expect(restored[0] == nil)
+            #expect(restored[1]?.asArray(Float.self) == (0 ..< 8).map(Float.init))
+            #expect(restored.leftPadding?.asArray(Int.self) == [1, 0])
+            #expect(restored.lengthsValues == [2, 3])
+        }
+    }
+
+    @Test(
+        "Empty recurrent batches keep every row through later joins, and refuse to save",
+        arguments: [false, true], [2, 3])
+    func emptyBatchRowsSurviveJoinsButNotSaving(mamba: Bool, rowCount: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            func emptyRow() -> ArraysCache { mamba ? MambaCache() : ArraysCache(size: 2) }
+            for finalized in [false, true] {
+                let batch = ArraysCache.merge((0 ..< rowCount).map { _ in emptyRow() })
+                if finalized {
+                    batch.prepare(lengths: Array(1 ... rowCount))
+                    batch.finalize()
+                }
+                // No array, padding or length records the rows, so no file could restore them.
+                #expect(batch.metaState == ["2", ""])
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("empty-batch-\(UUID().uuidString).safetensors")
+                defer { try? FileManager.default.removeItem(at: url) }
+                #expect(throws: KVCacheError.self) {
+                    try savePromptCache(url: url, cache: [batch])
+                }
+                #expect(FileManager.default.fileExists(atPath: url.path) == false)
+                #expect(batch.batchSize == rowCount)
+                #expect(batch.slotCount == 2)
+                #expect(batch.state.isEmpty)
+                #expect(batch.leftPadding == nil)
+                #expect(batch.lengths == nil)
+
+                let populated = emptyRow()
+                populated[0] = MLXArray.ones([1, 4])
+                let joined = try #require(try mergeCaches([batch, populated]) as? ArraysCache)
+                #expect(joined[0]?.shape == [rowCount + 1, 4])
+                #expect(
+                    joined[0]?.asArray(Float.self)
+                        == Array(repeating: Float(0), count: rowCount * 4)
+                        + Array(repeating: 1, count: 4))
+                batch.extend(other: emptyRow())
+                #expect(batch.batchSize == rowCount + 1)
+                batch.prepare(lengths: Array(1 ... rowCount + 1))
+                #expect(batch.leftPadding == nil)
+                let mask = try #require(batch.makeMask(N: rowCount + 1))
+                #expect(mask.shape == [rowCount + 1, rowCount + 1])
+                #expect(
+                    mask.asArray(Bool.self)
+                        == (1 ... rowCount + 1).flatMap { length in
+                            (0 ... rowCount).map { $0 < length }
+                        })
+            }
+        }
+    }
+
+    @Test(
+        "Nested lists keep empty recurrent rows through joins, and refuse to save",
+        arguments: [2, 3])
+    func nestedEmptyRecurrentRowsSurviveJoinsButNotSaving(rowCount: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            func emptyRow() -> CacheList {
+                CacheList(ArraysCache(size: 3), CacheList(MambaCache()))
+            }
+            let batch = try CacheList.merge((0 ..< rowCount).map { _ in emptyRow() })
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nested-empty-batch-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: url) }
+            #expect(throws: KVCacheError.self) {
+                try savePromptCache(url: url, cache: [batch])
+            }
+            #expect(FileManager.default.fileExists(atPath: url.path) == false)
+            let arrays = try #require(batch[0] as? ArraysCache)
+            let nested = try #require(batch[1] as? CacheList)
+            let mamba = try #require(nested[0] as? MambaCache)
+            #expect(arrays.batchSize == rowCount)
+            #expect(arrays.slotCount == 3)
+            #expect(mamba.batchSize == rowCount)
+            #expect(mamba.slotCount == 2)
+
+            let populated = emptyRow()
+            let populatedArrays = try #require(populated[0] as? ArraysCache)
+            let populatedNested = try #require(populated[1] as? CacheList)
+            let populatedMamba = try #require(populatedNested[0] as? MambaCache)
+            populatedArrays[1] = MLXArray.ones([1, 4])
+            populatedMamba[0] = MLXArray.ones([1, 8])
+            let joined = try CacheList.merge([batch, populated])
+            let joinedArrays = try #require(joined[0] as? ArraysCache)
+            let joinedNested = try #require(joined[1] as? CacheList)
+            let joinedMamba = try #require(joinedNested[0] as? MambaCache)
+            #expect(joinedArrays[1]?.shape == [rowCount + 1, 4])
+            #expect(joinedMamba[0]?.shape == [rowCount + 1, 8])
+            batch.extend(other: emptyRow())
+            #expect(arrays.batchSize == rowCount + 1)
+            #expect(mamba.batchSize == rowCount + 1)
+        }
+    }
+
+    @Test("Recurrent restore keeps legacy metadata and signed masks", arguments: [false, true])
+    func recurrentRowCountMetadataCompatibility(mamba: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let cacheType: ArraysCache.Type = mamba ? MambaCache.self : ArraysCache.self
+            let legacy = try #require(
+                try cacheType.restore(state: [MLXArray.ones([2, 4])], metaState: [""])
+                    as? ArraysCache)
+            #expect(type(of: legacy) == cacheType)
+            #expect(legacy.batchSize == 2)
+            #expect(legacy.slotCount == 1)
+            for metadata in [
+                ["2", ""], ["2", "", "-1,1"], ["2", "", "", "1,3"],
+                ["2", "", "-1,1", "1,3"],
+            ] {
+                let restored = try #require(
+                    try cacheType.restore(state: [], metaState: metadata) as? ArraysCache)
+                #expect(restored.metaState == metadata)
+                #expect(restored.batchSize == (metadata.count == 2 ? 1 : 2))
+            }
+            let populated = try #require(
+                try cacheType.restore(state: [MLXArray.ones([2, 4])], metaState: ["2", "0"])
+                    as? ArraysCache)
+            #expect(populated.metaState == ["2", "0"])
+            #expect(populated.batchSize == 2)
+            let lengthsOnly = try #require(
+                try cacheType.restore(state: [], metaState: ["2", "", "", "-1,2"])
+                    as? ArraysCache)
+            #expect(lengthsOnly.leftPadding == nil)
+            #expect(lengthsOnly.lengthsValues == [-1, 2])
+            #expect(
+                lengthsOnly.makeMask(N: 3)?.asArray(Bool.self) == [
+                    false, false, false, true, true, false,
+                ])
+            lengthsOnly.finalize()
+            // Finalized, the rows are kept in memory but no saved field records them.
+            #expect(lengthsOnly.metaState == ["2", ""])
+            #expect(lengthsOnly.batchSize == 2)
+            let withPadding = try #require(
+                try cacheType.restore(
+                    state: [MLXArray.ones([2, 4])],
+                    metaState: ["2", "0", "-1,1", "-1,2"]) as? ArraysCache)
+            #expect(
+                withPadding.makeMask(N: 3)?.asArray(Bool.self) == [
+                    true, true, true, false, true, true,
+                ])
+        }
+    }
+
+    @Test(
+        "Recurrent restore rejects invalid encoded row counts and layouts",
+        arguments: [false, true])
+    func corruptRecurrentRowCountMetadataIsRejected(mamba: Bool) throws {
+        try Device.withDefaultDevice(.cpu) { () throws -> Void in
+            let cacheType: ArraysCache.Type = mamba ? MambaCache.self : ArraysCache.self
+            for count in ["", "0", "-1", "two", "999999999999999999999999"] {
+                #expect(throws: KVCacheError.self) {
+                    try cacheType.restore(state: [], metaState: ["2", "", "", "", count])
+                }
+            }
+            let malformed: [([MLXArray], [String])] = [
+                ([], ["2", "", "", "", "2", "extra"]),
+                ([], ["-1", "", "", "", "2"]),
+                ([], ["invalid", "", "", "", "2"]),
+                ([], ["2", "", "0", "", "2"]),
+                ([], ["2", "", "", "1,2,3", "2"]),
+                ([], ["2", "", "", "1,bad", "2"]),
+                ([MLXArray.ones([1, 4])], ["2", "0", "", "", "2"]),
+                ([MLXArray(Float(1))], ["2", "0", "", "", "2"]),
+                ([MLXArray.ones([2, 4])], ["2", "-1", "", "", "2"]),
+                ([MLXArray.ones([2, 4])], ["2", "2", "", "", "2"]),
+                ([MLXArray.ones([2, 4])], ["2", "bad", "", "", "2"]),
+                ([MLXArray.ones([2, 4])], ["2", "0,0", "", "", "2"]),
+                ([], ["2", "0", "", "", "2"]),
+            ]
+            for (state, metadata) in malformed {
+                #expect(throws: KVCacheError.self) {
+                    try cacheType.restore(state: state, metaState: metadata)
+                }
+            }
+        }
+    }
+
+    @Test("A recurrent cache prepares, finalizes and filters its rows")
+    func recurrentLifecycle() throws {
+        let mamba = MambaCache(leftPadding: [0, 0])
+        mamba[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        mamba[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
+
+        mamba.prepare(lengths: [3, 5])
+        #expect(mamba.lengths != nil)
+        mamba.finalize()
+        #expect(mamba.lengths == nil)
+
+        mamba.filter(batchIndices: batchRows(0))
+        #expect(mamba.batchSize == 1)
+        #expect(
+            maxAbsDifference(
+                try #require(mamba[0]), MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])) == 0)
+        #expect(
+            maxAbsDifference(
+                try #require(mamba[1]), MLXArray(8 ..< 12).asType(.float32).reshaped([1, 4])) == 0)
+    }
+
+    @Test("A merged empty recurrent batch masks by the prepared lengths")
+    func mergedRecurrentMasksByLengths() throws {
+        let cache = try #require(ArraysCache.merge([MambaCache(), MambaCache()]) as? MambaCache)
+        #expect(cache.leftPadding == nil, "empty rows carry no padding that would hide lengths")
+        #expect(cache.batchSize == 2)
+        cache.prepare(lengths: [1, 2])
+        #expect(cache.batchSize == 2)
+
+        let mask = try #require(cache.makeMask(N: 2))
+        #expect(mask.shape == [2, 2])
+        #expect(mask.asArray(Bool.self) == [true, false, true, true])
+    }
+
+    @Test("merge keeps every empty recurrent row ahead of a populated one")
+    func mergeKeepsEmptyRecurrentRows() throws {
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        populated[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
+
+        let merged = try #require(
+            ArraysCache.merge([MambaCache(), MambaCache(), populated]) as? MambaCache)
+        #expect(merged.batchSize == 4)
+        let first = try #require(merged[0])
+        #expect(first.shape == [4, 4])
+        #expect(first[0 ..< 2].sum().item(Float.self) == 0, "empty rows hold zero state")
+        #expect(maxAbsDifference(first[2 ..< 4], try #require(populated[0])) == 0)
+        #expect(maxAbsDifference(try #require(merged[1])[2 ..< 4], try #require(populated[1])) == 0)
+
+        // A hybrid list merged the same way keeps its children's rows aligned:
+        // two empty sequences and one with recurrent state make three rows.
+        let one = MambaCache()
+        one[0] = MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4])
+        let list = try CacheList.merge([
+            CacheList(KVCacheSimple(), MambaCache()), CacheList(KVCacheSimple(), MambaCache()),
+            CacheList(KVCacheSimple(), one),
+        ])
+        #expect((list[0] as? BatchKVCache)?.batchSize == 3)
+        #expect((list[1] as? MambaCache)?.batchSize == 3)
+    }
+
+    @Test(
+        "Extending a recurrent batch keeps the longest row's offset, as merge does",
+        arguments: [(3, 7), (7, 3)])
+    func recurrentExtensionKeepsLongestOffset(offsets: (Int, Int)) throws {
+        try Device.withDefaultDevice(.cpu) {
+            func row(_ offset: Int) -> ArraysCache {
+                let cache = ArraysCache(size: 2)
+                cache[0] = MLXArray([Float(offset)]).reshaped([1, 1])
+                cache.offset = offset
+                return cache
+            }
+            let active = row(offsets.0)
+            let joined = row(offsets.1)
+            try active.validateExtension(other: joined)
+            active.extend(other: joined)
+            #expect(active.batchSize == 2)
+            #expect(active.offset == 7)
+            #expect(joined.offset == offsets.1)
+
+            // Through the protocol, as admission extends an active layer.
+            let erased: any BatchableKVCache = row(offsets.0)
+            erased.extend(other: row(offsets.1))
+            #expect(erased.offset == 7)
+
+            // A side with no rows contributes no position.
+            func noRows() -> ArraysCache {
+                let cache = ArraysCache(size: 2)
+                cache.filter(batchIndices: MLXArray([Int32]()))
+                cache.offset = 9
+                return cache
+            }
+            let fromEmpty = noRows()
+            fromEmpty.extend(other: row(offsets.1))
+            #expect(fromEmpty.offset == offsets.1)
+            let withEmpty = row(offsets.0)
+            withEmpty.extend(other: noRows())
+            #expect(withEmpty.offset == offsets.0)
+        }
+    }
+
+    @Test("A recurrent batch with zero rows stays empty until extended")
+    func recurrentZeroRows() throws {
+        let empty = MambaCache(leftPadding: [])
+        #expect(empty.batchSize == 0)
+        #expect(empty.leftPaddingValues == [])
+        #expect(empty.lengths == nil)
+
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        empty.extend(other: populated)
+        #expect(empty.batchSize == 2)
+        #expect(maxAbsDifference(try #require(empty[0]), try #require(populated[0])) == 0)
+    }
+
+    @Test("extract returns the requested row and keeps the MambaCache type")
+    func extractKeepsMambaCache() throws {
+        let mamba = MambaCache(leftPadding: [0, 0])
+        mamba[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+        mamba[1] = MLXArray(8 ..< 16).asType(.float32).reshaped([2, 4])
+
+        for row in 0 ..< 2 {
+            let extracted = try #require(mamba.extract(row) as? MambaCache)
+            #expect(
+                maxAbsDifference(
+                    try #require(extracted[0]),
+                    MLXArray((row * 4) ..< (row * 4 + 4)).asType(.float32).reshaped([1, 4]))
+                    == 0)
+            #expect(
+                maxAbsDifference(
+                    try #require(extracted[1]),
+                    MLXArray((8 + row * 4) ..< (12 + row * 4)).asType(.float32).reshaped([1, 4]))
+                    == 0)
+        }
+    }
+
+    @Test("CacheList.merge batches each child position on its own type")
+    func compositeMerge() throws {
+        let list = try CacheList.merge([
+            CacheList(KVCacheSimple(), MambaCache(), RotatingKVCache(maxSize: 16)),
+            CacheList(KVCacheSimple(), MambaCache(), RotatingKVCache(maxSize: 16)),
+        ])
+        try #require(list.children.count == 3)
+        #expect(list[0] is BatchKVCache)
+        #expect(list[1] is MambaCache)
+        #expect(list[2] is BatchRotatingKVCache)
+        #expect((list[0] as? BatchKVCache)?.batchSize == 2)
+        #expect((list[0] as? BatchKVCache)?.offset == 0)
+        #expect((list[2] as? BatchRotatingKVCache)?.batchSize == 2)
+        #expect((list[2] as? BatchRotatingKVCache)?.maxSize == 16)
+
+        #expect(throws: KVCacheError.self) {
+            _ = try CacheList.merge([
+                CacheList(KVCacheSimple(), TurboQuantKVCache(bits: 4, keyBits: 0, valueBits: 4))
+            ])
+        }
+        #expect(throws: KVCacheError.self) {
+            _ = try CacheList.merge([
+                CacheList(KVCacheSimple(), MambaCache()), CacheList(KVCacheSimple()),
+            ])
+        }
+        for cache in [
+            RotatingKVCache(maxSize: 16, keep: 4), RotatingKVCache(maxSize: 16, rewindCapacity: 4),
+        ] {
+            #expect(throws: KVCacheError.self) {
+                _ = try CacheList.merge([CacheList(KVCacheSimple(), cache)])
+            }
+        }
+    }
+
+    @Test("mergeCaches refuses caches without a batched form and rows of mixed types")
+    func mergeCachesRefusals() throws {
+        #expect(throws: KVCacheError.self) {
+            _ = try mergeCaches([TurboQuantKVCache(bits: 4, keyBits: 0, valueBits: 4)])
+        }
+        #expect(throws: KVCacheError.self) {
+            _ = try mergeCaches([ChunkedKVCache(chunkSize: 16)])
+        }
+        #expect(throws: KVCacheError.self) {
+            _ = try mergeCaches([KVCacheSimple(), RotatingKVCache(maxSize: 4)])
+        }
+        #expect(throws: KVCacheError.self) {
+            _ = try mergeCaches([])
+        }
+        #expect(try mergeCaches([KVCacheSimple(), KVCacheSimple()]) is BatchKVCache)
+        #expect(try mergeCaches([MambaCache(), MambaCache()]) is MambaCache)
+    }
+
+    @Test("Recurrent and composite caches are their own batches; a row-form child is refused")
+    func batchableConformance() throws {
+        let own: [any KVCache] = [
+            ArraysCache(size: 2), MambaCache(), CacheList(KVCacheSimple(), MambaCache()),
+        ]
+        for cache in own {
+            #expect(cache is any BatchableKVCache, "\(type(of: cache))")
+        }
+        // A CacheList made from rows holds a KVCacheSimple child, which is not a batch, so
+        // its extension check throws; a merged CacheList's children are all batches.
+        let rows = CacheList(KVCacheSimple(), MambaCache())
+        let merged = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        #expect(merged.children.allSatisfy { $0 is any BatchableKVCache })
+        #expect(throws: KVCacheError.self) { try rows.validateExtension(other: merged) }
+        let added = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        try merged.validateExtension(other: added)
+    }
+
+    @Test("A merged CacheList filters, extends and extracts every child")
+    func compositeLifecycle() throws {
+        func composite() -> CacheList { CacheList(KVCacheSimple(), MambaCache()) }
+        let list = try CacheList.merge([composite(), composite()])
+        #expect(list.children.count == 2)
+        let attention = try #require(list[0] as? BatchKVCache)
+        #expect(attention.batchSize == 2)
+        let recurrent = try #require(list[1] as? MambaCache)
+        let (keys, values) = makeDistinctKV(batchSize: 2, heads: 2, seqLen: 3, headDim: 4)
+        _ = attention.update(keys: keys, values: values)
+        recurrent[0] = MLXArray(0 ..< 8).asType(.float32).reshaped([2, 4])
+
+        list.filter(batchIndices: batchRows(1))
+        #expect(attention.batchSize == 1)
+        #expect(recurrent.batchSize == 1)
+
+        let added = try CacheList.merge([composite()])
+        #expect(added.children.count == 2)
+        let addedKV = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
+        _ = try #require(added[0] as? BatchKVCache).update(keys: addedKV.0, values: addedKV.1)
+        let addedRecurrent = try #require(added[1] as? MambaCache)
+        addedRecurrent[0] = MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4])
+        list.extend(other: added)
+        #expect(attention.batchSize == 2)
+        #expect(recurrent.batchSize == 2)
+
+        let first = try #require(list.extract(0) as? CacheList)
+        let firstAttention = try #require(first[0] as? KVCacheSimple)
+        let firstKeys = try #require(firstAttention.state.first)
+        #expect(maxAbsDifference(firstKeys, MLXArray.ones(firstKeys.shape) * 2) == 0)
+        let second = try #require(list.extract(1) as? CacheList)
+        let secondAttention = try #require(second[0] as? KVCacheSimple)
+        let secondKeys = try #require(secondAttention.state.first)
+        #expect(maxAbsDifference(secondKeys, addedKV.0) == 0)
+        let secondRecurrent = try #require(second[1] as? MambaCache)
+        let secondState = try #require(secondRecurrent[0])
+        #expect(
+            maxAbsDifference(secondState, MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4]))
+                == 0)
+    }
+
+    @Test("An all-empty merge keeps its row count through a later merge and extension")
+    func allEmptyMergeKeepsRows() throws {
+        let empty = try #require(ArraysCache.merge([MambaCache(), MambaCache()]) as? MambaCache)
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])
+        let merged = try #require(ArraysCache.merge([empty, populated]) as? MambaCache)
+        #expect(merged.batchSize == 3)
+        #expect(try #require(merged[0]).shape == [3, 4])
+
+        // An all-empty composite batch takes prefilled rows with its children aligned.
+        let list = try CacheList.merge([
+            CacheList(KVCacheSimple(), MambaCache()), CacheList(KVCacheSimple(), MambaCache()),
+        ])
+        let added = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let kv = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+        _ = try #require(added[0] as? BatchKVCache).update(keys: kv.0, values: kv.1)
+        try #require(added[1] as? MambaCache)[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([
+            1, 4,
+        ])
+        list.extend(other: added)
+        #expect((list[0] as? BatchKVCache)?.batchSize == 3)
+        #expect((list[1] as? MambaCache)?.batchSize == 3)
+        #expect(try #require((list[1] as? MambaCache)?[0]).shape == [3, 4])
+    }
+
+    @Test(
+        "Late padding or lengths preserve every preceding empty recurrent row",
+        arguments: [false, true])
+    func lateRecurrentMetadataKeepsRows(usePadding: Bool) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let last = MambaCache(leftPadding: usePadding ? [0] : nil)
+            if !usePadding { last.prepare(lengths: [5]) }
+            let merged = try #require(
+                ArraysCache.merge([MambaCache(), MambaCache(), last]) as? MambaCache)
+            try #require(merged.batchSize == 3)
+            #expect(merged.leftPaddingValues == (usePadding ? [0, 0, 0] : nil))
+            #expect(merged.lengthsValues == (usePadding ? nil : [0, 0, 5]))
+
+            merged.finalize()
+            #expect(merged.batchSize == 3)
+            #expect(merged.makeMask(N: 2) == nil)
+            let nested = try #require(ArraysCache.merge([merged, MambaCache()]) as? MambaCache)
+            try #require(nested.batchSize == 4)
+            #expect(nested.leftPadding == nil)
+
+            let populated = MambaCache()
+            populated[0] = MLXArray([Float(1), 2, 3, 4]).reshaped([1, 4])
+            let admitted = try #require(ArraysCache.merge([nested, populated]) as? MambaCache)
+            try #require(admitted.batchSize == 5)
+            let state = try #require(admitted[0])
+            #expect(state.shape == [5, 4])
+            #expect(state[0 ..< 4].sum().item(Float.self) == 0)
+            #expect(maxAbsDifference(state[4 ..< 5], try #require(populated[0])) == 0)
+
+            admitted.filter(batchIndices: batchRows(4, 2))
+            #expect(admitted.batchSize == 2)
+            #expect(
+                maxAbsDifference(try #require(admitted[0])[0 ..< 1], try #require(populated[0]))
+                    == 0)
+            #expect(try #require(admitted[0])[1 ..< 2].sum().item(Float.self) == 0)
+        }
+    }
+
+    @Test(
+        "Recurrent merge and generic extend preserve mixed metadata in every order",
+        arguments: 0 ..< 3)
+    func recurrentMetadataOrderKeepsRows(metadataIndex: Int) throws {
+        try Device.withDefaultDevice(.cpu) {
+            let metadata = MambaCache(leftPadding: [2, 4])
+            metadata.prepare(lengths: [5, 7])
+            var rows = [MambaCache(), MambaCache()]
+            rows.insert(metadata, at: metadataIndex)
+            let padding =
+                Array(repeating: 0, count: metadataIndex) + [2, 4]
+                + Array(repeating: 0, count: 2 - metadataIndex)
+            let lengths =
+                Array(repeating: 0, count: metadataIndex) + [5, 7]
+                + Array(repeating: 0, count: 2 - metadataIndex)
+            let merged = ArraysCache.merge(rows)
+            let extended = try #require(rows[0].copy() as? any BatchableKVCache)
+            for row in rows.dropFirst() { extended.extend(other: row) }
+
+            for cache in [merged, try #require(extended as? ArraysCache)] {
+                try #require(cache.batchSize == 4)
+                #expect(cache.leftPaddingValues == padding)
+                #expect(cache.lengthsValues == lengths)
+                let mask = try #require(cache.makeMask(N: 3))
+                #expect(
+                    mask.asArray(Bool.self)
+                        == padding.flatMap { start in
+                            (0 ..< 3).map { $0 >= start }
+                        })
+                cache.filter(batchIndices: batchRows(3, 1))
+                #expect(cache.leftPaddingValues == [padding[3], padding[1]])
+                #expect(cache.lengthsValues == [lengths[3], lengths[1]])
+                cache.finalize()
+                #expect(cache.batchSize == 2)
+                #expect(cache.makeMask(N: 3) == nil)
+            }
+        }
+    }
+
+    @Test("Empty recurrent filtering and composite admission keep their rows aligned")
+    func emptyRecurrentFilterAndCompositeAdmissionKeepRows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let unpadded: any BatchableKVCache = MambaCache()
+            unpadded.extend(other: MambaCache())
+            let recurrent = try #require(unpadded as? MambaCache)
+            #expect(recurrent.batchSize == 2)
+            #expect(recurrent.leftPadding == nil)
+            #expect(recurrent.makeMask(N: 2) == nil)
+            recurrent.prepare(lengths: [1, 2])
+            #expect(recurrent.batchSize == 2)
+            #expect(
+                try #require(recurrent.makeMask(N: 2)).asArray(Bool.self) == [
+                    true, false, true, true,
+                ])
+            recurrent.finalize()
+            #expect(recurrent.batchSize == 2)
+            #expect(recurrent.makeMask(N: 2) == nil)
+            recurrent.filter(batchIndices: batchRows())
+            #expect(recurrent.batchSize == 0)
+            recurrent.extend(other: MambaCache())
+            #expect(recurrent.batchSize == 1)
+
+            let untouched = MambaCache()
+            untouched.filter(batchIndices: batchRows())
+            #expect(untouched.batchSize == 0)
+
+            let list = try CacheList.merge([
+                CacheList(KVCacheSimple(), MambaCache()),
+                CacheList(KVCacheSimple(), MambaCache()),
+                CacheList(KVCacheSimple(), MambaCache(leftPadding: [0])),
+            ])
+            let attention = try #require(list[0] as? BatchKVCache)
+            let state = try #require(list[1] as? MambaCache)
+            try #require(attention.batchSize == 3)
+            try #require(state.batchSize == 3)
+            list.filter(batchIndices: batchRows(2, 0))
+            list.finalize()
+            #expect(state.batchSize == 2)
+            #expect(state.leftPadding == nil)
+
+            let populated = MambaCache()
+            populated[0] = MLXArray([Float(10), 11, 12, 13]).reshaped([1, 4])
+            let kv = KVCacheSimple()
+            let values = makePositionKV(positions: 0 ..< 2, heads: 2, headDim: 4)
+            _ = kv.update(keys: values.0, values: values.1)
+            let added = try CacheList.merge([CacheList(kv, populated)])
+            list.extend(other: added)
+            #expect(attention.batchSize == 3)
+            #expect(state.batchSize == 3)
+            let arrays = try #require(state[0])
+            #expect(arrays.shape == [3, 4])
+            #expect(arrays[0 ..< 2].sum().item(Float.self) == 0)
+            #expect(maxAbsDifference(arrays[2 ..< 3], try #require(populated[0])) == 0)
+        }
+    }
+
+    @Test("merge gives an empty input's rows zero state, however many it stands for")
+    func mergeKeepsEmptyInputRows() throws {
+        let populated = MambaCache()
+        populated[0] = MLXArray(0 ..< 4).asType(.float32).reshaped([1, 4])
+        let merged = try #require(
+            ArraysCache.merge([MambaCache(leftPadding: [0, 0]), populated]) as? MambaCache)
+        #expect(merged.batchSize == 3)
+        #expect(try #require(merged[0]).shape == [3, 4])
+        #expect(merged.leftPadding?.shape == [3])
+        #expect(maxAbsDifference(try #require(merged[0])[2 ..< 3], try #require(populated[0])) == 0)
+
+        let none = try #require(
+            ArraysCache.merge([MambaCache(leftPadding: []), populated]) as? MambaCache)
+        #expect(none.batchSize == 1)
+        #expect(try #require(none[0]).shape == [1, 4])
+    }
+
+    @Test("Extending an empty composite batch with prefilled rows keeps its children aligned")
+    func extendEmptyCompositeRows() throws {
+        let list = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let added = try CacheList.merge([CacheList(KVCacheSimple(), MambaCache())])
+        let kv = makePositionKV(positions: 0 ..< 3, heads: 2, headDim: 4)
+        _ = try #require(added[0] as? BatchKVCache).update(keys: kv.0, values: kv.1)
+        try #require(added[1] as? MambaCache)[0] = MLXArray(20 ..< 24).asType(.float32).reshaped([
+            1, 4,
+        ])
+        list.extend(other: added)
+
+        let attention = try #require(list[0] as? BatchKVCache)
+        let recurrent = try #require(list[1] as? MambaCache)
+        #expect(attention.batchSize == 2)
+        #expect(recurrent.batchSize == 2)
+        #expect(attention.leftPadding.asArray(Int32.self) == [3, 0])
+        #expect(try #require(recurrent[0]).shape == [2, 4])
+        #expect(try #require(recurrent[0])[0 ..< 1].sum().item(Float.self) == 0)
+        list.filter(batchIndices: batchRows(1))
+        #expect(attention.batchSize == 1)
+        #expect(recurrent.batchSize == 1)
+        #expect(
+            maxAbsDifference(
+                try #require(recurrent[0]), MLXArray(20 ..< 24).asType(.float32).reshaped([1, 4]))
+                == 0)
+    }
+
+    @Test("A nested CacheList masks with its batched attention descendant")
+    func nestedCompositeMask() throws {
+        let longer = KVCacheSimple()
+        let kv = makePositionKV(positions: 0 ..< 1, heads: 2, headDim: 4)
+        _ = longer.update(keys: kv.0, values: kv.1)
+        let list = try CacheList.merge([
+            CacheList(MambaCache(), CacheList(KVCacheSimple())),
+            CacheList(MambaCache(), CacheList(longer)),
+        ])
+        guard case .array(let mask) = list.makeMask(n: 1, windowSize: nil, returnArray: false)
+        else {
+            Issue.record("A nested batched CacheList must use its attention descendant's mask")
+            return
+        }
+        #expect(mask.dim(0) == 2)
+        #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+        #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
+    }
+
+    @Test("A merged CacheList masks with its attention child's left padding")
+    func compositeMask() throws {
+        // Row 1 holds one token, row 0 none, so the merge pads row 0 by one.
+        let longer = KVCacheSimple()
+        let kv = makePositionKV(positions: 0 ..< 1, heads: 2, headDim: 4)
+        _ = longer.update(keys: kv.0, values: kv.1)
+        let list = try CacheList.merge([
+            CacheList(MambaCache(), KVCacheSimple()), CacheList(MambaCache(), longer),
+        ])
+        #expect((list[1] as? BatchKVCache)?.leftPadding.asArray(Int32.self) == [1, 0])
+        guard case .array(let mask) = list.makeMask(n: 1, windowSize: nil, returnArray: false)
+        else {
+            Issue.record("A batched CacheList must use its attention child's mask")
+            return
+        }
+        #expect(mask.dim(0) == 2)
+        #expect(mask[0, 0, 0, 0].item(Bool.self) == false)
+        #expect(mask[1, 0, 0, 0].item(Bool.self) == true)
+    }
+
+    @Test("The row methods and merge dispatch through the BatchableKVCache type")
+    func protocolSurface() throws {
+        #expect(try mergeCaches([MambaCache()]) is MambaCache)
+        #expect(try mergeCaches([CacheList(KVCacheSimple(), MambaCache())]) is CacheList)
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches([QuantizedKVCache()]) }
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches([ChunkedKVCache(chunkSize: 4)]) }
+        #expect(!(QuantizedKVCache() as any KVCache is any BatchableKVCache))
+    }
+}
+
+/// Recurrent and composite batched caches must give every row the logits it gets on its own.
+///
+/// The rows are prefilled one at a time and then merged: a right-padded prefill of these
+/// models is not exact yet, because their state-space scans do not honour the prepared
+/// lengths. The scans run as Metal kernels, so the tests stay on the default device, where a
+/// one-row and a two-row forward differ by the matmul precision (see ``MatmulPrecision``).
+@Suite(.serialized)
+struct BatchedRecurrentParityTests {
+
+    @Test("Merged Mamba 2 prompts decode like separate sequences")
+    func mamba2() throws {
+        let model = try tinyMamba2()
+        try expectMergedRowsMatchSingles(model, layers: { $0 is MambaCache })
+    }
+
+    @Test("Merged Falcon H1 prompts decode like separate sequences")
+    func falconH1() throws {
+        let model = try tinyFalconH1()
+        try expectMergedRowsMatchSingles(model, layers: { $0 is CacheList })
+    }
+
+    /// Convolution and full-attention layers only: this file's row helpers do not cover the
+    /// rotating caches of LFM3's sliding layers, which `BatchRotatingKVCacheTests` tests.
+    @Test("Merged LFM3 prompts decode like separate sequences")
+    func lfm3() throws {
+        let model = try tinyLFM3()
+        try expectMergedRowsMatchSingles(model, layers: { $0 is MambaCache })
+    }
+
+    /// LFM2's convolution layers keep a rewind history whose length depends on the prompt, in
+    /// a `MambaCache` subclass. Merging it as a plain recurrent cache would stack histories of
+    /// different lengths, so its rows are refused until it has a batched form of its own.
+    @Test("LFM2's rewindable convolution rows are refused, not merged as plain recurrent state")
+    func lfm2ConvolutionRowsAreRefused() throws {
+        let model = try tinyLFM2()
+        let rows = try [[Int32(1), 2, 3], [4, 5, 6, 7, 8]].map { prompt in
+            let cache = try model.newCache(parameters: nil)
+            eval(model(MLXArray(prompt).reshaped([1, prompt.count]), cache: cache))
+            return cache
+        }
+        let convolution = try rows.map { try #require($0[0] as? RewindableConvolutionCache) }
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches(convolution) }
+        #expect(throws: KVCacheError.self) {
+            try convolution[0].validateExtension(other: convolution[1])
+        }
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches([MambaCache(), convolution[0]]) }
+        #expect(throws: KVCacheError.self) {
+            try MambaCache().validateExtension(other: convolution[0])
+        }
+    }
+}
+
+private func tinyLFM3() throws -> LFM3Model {
+    let configuration = try JSONDecoder().decode(
+        LFM3Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "lfm3", "vocab_size": 64, "hidden_size": 32, "intermediate_size": 48,
+              "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+              "head_dim": 16, "norm_eps": 1e-5, "conv_L_cache": 3, "conv_bias": false,
+              "sliding_window": 4, "use_sandwich_norm": true, "tie_word_embeddings": true,
+              "layer_types": ["conv", "full_attention", "conv"],
+              "rope_parameters": {
+                "full_attention": {
+                  "rope_type": "default", "rope_theta": 1000000.0, "partial_rotary_factor": 0.5
+                },
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}
+              }
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 603)) {
+        let model = LFM3Model(configuration)
+        eval(model)
+        return model
+    }
+}
+
+private func tinyLFM2() throws -> LFM2Model {
+    let configuration = try JSONDecoder().decode(
+        LFM2Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "lfm2", "vocab_size": 32, "hidden_size": 8, "num_hidden_layers": 2,
+              "num_attention_heads": 2, "num_key_value_heads": 1, "max_position_embeddings": 128,
+              "norm_eps": 1e-5, "conv_bias": false, "conv_L_cache": 3, "block_dim": 8,
+              "intermediate_size": 24, "block_multiple_of": 8, "block_ffn_dim_multiplier": 1.0,
+              "block_auto_adjust_ff_dim": false, "layer_types": ["conv", "full_attention"],
+              "rope_parameters": { "rope_theta": 10000000.0 }
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 604)) {
+        let model = LFM2Model(configuration)
+        eval(model)
+        return model
+    }
+}
+
+private func tinyMamba2() throws -> Mamba2Model {
+    let configuration = try JSONDecoder().decode(
+        Mamba2Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "mamba2", "num_heads": 4, "head_dim": 4, "vocab_size": 32,
+              "hidden_size": 16, "state_size": 8, "num_hidden_layers": 2,
+              "layer_norm_epsilon": 1e-5, "conv_kernel": 4, "n_groups": 1, "use_bias": false,
+              "use_conv_bias": true, "tie_word_embeddings": false, "time_step_limit": [0.0, 100.0]
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 601)) {
+        let model = Mamba2Model(configuration)
+        eval(model)
+        return model
+    }
+}
+
+private func tinyFalconH1() throws -> FalconH1Model {
+    let configuration = try JSONDecoder().decode(
+        FalconH1Configuration.self,
+        from: Data(
+            """
+            {
+              "model_type": "falcon_h1", "hidden_size": 32, "num_hidden_layers": 2,
+              "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+              "vocab_size": 100, "mamba_d_ssm": 16, "mamba_d_state": 8, "mamba_d_head": 8,
+              "mamba_n_heads": 2, "mamba_n_groups": 1, "mamba_d_conv": 4, "mamba_chunk_size": 64,
+              "attention_in_multiplier": 2.0, "key_multiplier": 0.5
+            }
+            """.utf8))
+    return withRandomState(MLXRandom.RandomState(seed: 602)) {
+        let model = FalconH1Model(configuration)
+        eval(model)
+        return model
+    }
+}
+
+/// Prefills two prompts of different lengths alone, merges the prefilled caches, decodes four
+/// tokens and drops a row, comparing every row's logits with the prompt continued alone and
+/// every extracted row's state with its single cache.
+private func expectMergedRowsMatchSingles(
+    _ model: any LanguageModel, layers: (any KVCache) -> Bool
+) throws {
+    let prompts: [[Int32]] = [[1, 2, 3], [4, 5, 6, 7, 8]]
+
+    var singles: [[any KVCache]] = []
+    var rows: [[any KVCache]] = []
+    for prompt in prompts {
+        let single = try model.newCache(parameters: nil)
+        eval(model(MLXArray(prompt).reshaped([1, prompt.count]), cache: single))
+        singles.append(single)
+        let row = try model.newCache(parameters: nil)
+        eval(model(MLXArray(prompt).reshaped([1, prompt.count]), cache: row))
+        rows.append(row)
+    }
+    let hasExpectedLayers = singles[0].contains(where: layers)
+    #expect(hasExpectedLayers)
+
+    let batched = try rows[0].indices.map { layer in
+        try mergeCaches(rows.map { $0[layer] })
+    }
+    for cache in batched {
+        if let attention = cache as? BatchKVCache {
+            #expect(attention.batchOffset.asArray(Int.self) == prompts.map(\.count))
+        }
+        if let list = cache as? CacheList, let attention = list[1] as? BatchKVCache {
+            #expect(attention.batchOffset.asArray(Int.self) == prompts.map(\.count))
+        }
+    }
+    try expectExtractedRowsMatch(batched, singles)
+
+    for step in 0 ..< 4 {
+        let token = Int32(10 + step)
+        let output = model(MLXArray([token, token]).reshaped([2, 1]), cache: batched)
+        for row in prompts.indices {
+            let single = model(MLXArray([token]).reshaped([1, 1]), cache: singles[row])
+            #expect(
+                maxAbsDifference(output[row ..< row + 1], single) < MatmulPrecision.splitTolerance,
+                "step \(step), row \(row)")
+        }
+    }
+    try expectExtractedRowsContinueLikeSingles(model, batched, singles)
+
+    batched.forEach { filterRows($0, keeping: batchRows(1)) }
+    let output = model(MLXArray([Int32(14)]).reshaped([1, 1]), cache: batched)
+    let single = model(MLXArray([Int32(14)]).reshaped([1, 1]), cache: singles[1])
+    #expect(maxAbsDifference(output, single) < MatmulPrecision.splitTolerance, "after filtering")
+    try expectExtractedRowsContinueLikeSingles(model, batched, [singles[1]])
+}
+
+/// Every row extracted from `batch` decodes the next token like its single cache. The
+/// recurrent state arrays themselves are not compared after a decode: a one-row and a two-row
+/// scan leave them in different numerical form even for copies of one row.
+private func expectExtractedRowsContinueLikeSingles(
+    _ model: any LanguageModel, _ batch: [any KVCache], _ singles: [[any KVCache]]
+) throws {
+    for (row, caches) in singles.enumerated() {
+        let extracted = try batch.map { try extractRow($0, row) }
+        for (layer, cache) in extracted.enumerated() where !(cache is ArraysCache) {
+            #expect(cache.offset == caches[layer].offset, "row \(row), layer \(layer)")
+        }
+        let token = MLXArray([Int32(20 + row)]).reshaped([1, 1])
+        let actual = model(token, cache: extracted)
+        let expected = model(token, cache: caches.map { $0.copy() })
+        #expect(
+            maxAbsDifference(actual, expected) < MatmulPrecision.splitTolerance,
+            "extracted row \(row)")
+    }
+}
+
+private func filterRows(_ cache: any KVCache, keeping indices: MLXArray) {
+    switch cache {
+    case let batch as CacheList: batch.filter(batchIndices: indices)
+    case let batch as ArraysCache: batch.filter(batchIndices: indices)
+    case let batch as BatchKVCache: batch.filter(batchIndices: indices)
+    default: Issue.record("not a batched cache: \(type(of: cache))")
+    }
+}
+
+private func extractRow(_ cache: any KVCache, _ index: Int) throws -> any KVCache {
+    switch cache {
+    case let batch as CacheList: return batch.extract(index)
+    case let batch as ArraysCache: return batch.extract(index)
+    case let batch as BatchKVCache: return batch.extract(index)
+    default: throw KVCacheError(message: "not a batched cache: \(type(of: cache))")
+    }
+}
+
+/// Every row extracted from `batch` holds the state of its single cache, and the offset of
+/// an attention cache. Recurrent state keeps one offset for the whole batch.
+private func expectExtractedRowsMatch(_ batch: [any KVCache], _ singles: [[any KVCache]])
+    throws
+{
+    for (row, caches) in singles.enumerated() {
+        try #require(caches.count == batch.count)
+        for layer in batch.indices {
+            let actual = try extractRow(batch[layer], row)
+            if !(actual is ArraysCache) {
+                #expect(actual.offset == caches[layer].offset, "row \(row), layer \(layer)")
+            }
+            let a = actual.state
+            let b = caches[layer].state
+            try #require(a.count == b.count, "row \(row), layer \(layer)")
+            for (actualArray, expectedArray) in zip(a, b) {
+                try #require(actualArray.shape == expectedArray.shape, "row \(row), layer \(layer)")
+                // Recurrent state grows with the sequence, so the bound is relative.
+                let mismatch = MatmulPrecision.mismatch(
+                    actualArray, expectedArray, rtol: 1e-2, atol: 1e-4, reducedAtol: 2e-2)
+                #expect(mismatch == nil, "row \(row), layer \(layer): \(mismatch ?? "")")
+            }
+        }
+    }
+}
