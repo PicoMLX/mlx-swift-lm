@@ -39,7 +39,8 @@ public protocol BatchableKVCache: KVCache {
 ///
 /// Port of mlx-lm's `_merge_caches` for one layer. A cache that is its own batch
 /// (``ArraysCache`` and ``MambaCache``, ``CacheList``) merges through its own class; a ``KVCacheSimple`` row merges into a ``BatchKVCache`` and a
-/// ``RotatingKVCache`` row into a ``BatchRotatingKVCache``. Each batch
+/// ``RotatingKVCache`` row into a ``BatchRotatingKVCache`` and a ``QuantizedKVCache`` row
+/// into a ``BatchQuantizedKVCache``. Each batch
 /// takes rows of exactly its class, so a `ChunkedKVCache` or an unsupported compressed cache
 /// is refused rather than treated as the class it subclasses. Empty caches merge into an
 /// empty batch with one row each.
@@ -58,6 +59,7 @@ public func mergeCaches(_ caches: [any KVCache]) throws -> any BatchableKVCache 
     case let own as any BatchableKVCache: batch = type(of: own)
     case is KVCacheSimple: batch = BatchKVCache.self
     case is RotatingKVCache: batch = BatchRotatingKVCache.self
+    case is QuantizedKVCache: batch = BatchQuantizedKVCache.self
     default: throw KVCacheError(message: "\(type(of: first)) has no batched form")
     }
     return try batch.merge(caches)
