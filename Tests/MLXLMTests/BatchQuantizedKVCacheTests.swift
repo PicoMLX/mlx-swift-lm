@@ -527,6 +527,29 @@ struct BatchQuantizedKVCacheTests {
         #expect(throws: KVCacheError.self) { _ = try mergeCaches([batch]) }
     }
 
+    @Test("extract refuses a ragged prefill before finalize")
+    func extractBeforeFinalize() async throws {
+        let result = try await #require(
+            processExitsWith: .failure, observing: [\.standardErrorContent]
+        ) {
+            Device.withDefaultDevice(.cpu) {
+                let batch = BatchQuantizedKVCache(leftPadding: [0, 0], bits: 4)
+                batch.prepare(lengths: [2, 3])
+                let rawRows = [
+                    quantizedTestKV(positions: 0 ..< 3, salt: 1),
+                    quantizedTestKV(positions: 0 ..< 3, salt: 2),
+                ]
+                _ = batch.updateQuantized(
+                    keys: concatenated(rawRows.map { $0.0 }),
+                    values: concatenated(rawRows.map { $0.1 }))
+                _ = batch.extract(0)
+            }
+        }
+        #expect(
+            String(decoding: result.standardErrorContent, as: UTF8.self).contains(
+                "BatchQuantizedKVCache.extract takes finalized rows"))
+    }
+
     @Test("Extension validation accepts empty rows and packed ragged batches", arguments: [4, 8])
     func extensionValidationAcceptsCompatibleRows(bits: Int) throws {
         try Device.withDefaultDevice(.cpu) {

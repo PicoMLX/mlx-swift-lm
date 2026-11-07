@@ -294,6 +294,9 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
 
     public func extract(_ index: Int) -> any KVCache {
         precondition(positions.indices.contains(index), "Batch row index out of range")
+        precondition(
+            rightPaddingValues == nil,
+            "BatchQuantizedKVCache.extract takes finalized rows; finalize a ragged prefill first")
         let row = QuantizedKVCache(groupSize: groupSize, bits: bits)
         let padding = Int(leftPaddingValues[index])
         guard padding < offset else { return row }
