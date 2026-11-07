@@ -18,6 +18,7 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var draftBlockCallCount = 0
     var draftedTokenValue: Int32
     let requiresGreedySampling: Bool
+    let compatibilityError: MTPDrafterCompatibilityError?
     /// Per-call record of what the iterator handed `draftBlock`: the
     /// sequence-axis span of each sharedKV entry, and the query offset.
     /// Lets tests assert the state the drafter conditions on, not just the
@@ -27,13 +28,22 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var receivedPositionDeltaValues: [Int?] = []
     private(set) var receivedCacheOffsets: [Int?] = []
 
-    init(draftedTokenValue: Int32 = 7, requiresGreedySampling: Bool = false) {
+    init(
+        draftedTokenValue: Int32 = 7,
+        requiresGreedySampling: Bool = false,
+        compatibilityError: MTPDrafterCompatibilityError? = nil
+    ) {
         self.draftedTokenValue = draftedTokenValue
         self.requiresGreedySampling = requiresGreedySampling
+        self.compatibilityError = compatibilityError
         super.init()
     }
 
-    func isCompatible(with target: any LanguageModel) -> Bool { true }
+    func validateCompatibility(with _: any LanguageModel) throws {
+        if let compatibilityError {
+            throw compatibilityError
+        }
+    }
 
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: [CountingKVCache()])
@@ -304,6 +314,62 @@ private final class PrefixLog: @unchecked Sendable {
     var positions: [Int] = []
 }
 
+// MARK: - The prompt is read before the prefill
+
+/// Hands the target model to a tokenizer so a decode can record how many forward
+/// passes the target had run by then.
+private final class TargetProbe: @unchecked Sendable {
+    let target: MockMainModel
+    var forwardCountsAtDecode: [Int] = []
+    init(target: MockMainModel) { self.target = target }
+}
+
+private struct ProbeTokenizer: Tokenizer {
+    let probe: TargetProbe
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        probe.forwardCountsAtDecode.append(probe.target.callCount)
+        return tokenIds.map { "t\($0)" }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+private struct FixedProcessor: UserInputProcessor {
+    func prepare(input: UserInput) throws -> LMInput { LMInput(tokens: MLXArray([Int32(1)])) }
+}
+
+@Suite("MTP generate reads the prompt first")
+struct MTPGenerateReadsPromptTests {
+    /// Reading the prompt tail out of its `MLXArray` after the iterator is built waits
+    /// for the prefill it queued, so the reasoning scanner's seed is read first.
+    @Test("the MTP generate overload decodes the prompt before the first forward pass")
+    func readsPromptBeforePrefill() async throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7, 7, 7, 7, 9])
+        let probe = TargetProbe(target: main)
+        let context = ModelContext(
+            configuration: ModelConfiguration(
+                id: "mtp", eosTokenIds: [9], reasoningConfig: .alwaysOnThinking),
+            model: main, processor: FixedProcessor(), tokenizer: ProbeTokenizer(probe: probe))
+
+        let stream = try generate(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0), context: context,
+            mtpDrafter: MockDrafter(draftedTokenValue: 7), blockSize: 4)
+        for await _ in stream {}
+
+        #expect(probe.forwardCountsAtDecode.first == 0)
+        #expect(main.callCount > 0)
+    }
+}
+
 @Suite("MTP prefill reporting")
 struct MTPPrefillReportingTests {
     @Test("the main cache's prefix is reported once")
@@ -332,6 +398,67 @@ struct MTPPrefillReportingTests {
 
 @Suite("MTP KV-cache configuration")
 struct MTPKVCacheConfigurationTests {
+    @Test func incompatibleTargetThrowsBeforePrefill() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let error = MTPDrafterCompatibilityError.incompatibleTarget(
+            drafter: "MockDrafter",
+            expected: "MockMainModelWithMTPState",
+            actual: "MockMainModel"
+        )
+        let drafter = MockDrafter(compatibilityError: error)
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+
+        #expect(throws: error) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: input,
+                mainModel: main,
+                drafter: drafter,
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                blockSize: 2)
+        }
+        #expect(main.callCount == 0)
+    }
+
+    @Test func invalidBlockSizeThrowsInsteadOfTrapping() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+
+        #expect(throws: KVCacheError.self) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: input,
+                mainModel: main,
+                drafter: MockDrafter(draftedTokenValue: 7),
+                parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                blockSize: 1)
+        }
+    }
+
+    @Test func packageInitializerPreservesCanonicalStorage() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let drafter = MockDrafter(draftedTokenValue: 7)
+        let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+        let storage = KVCacheStorage(
+            main.newCache(parameters: parameters),
+            plan: try parameters.kvCachePlan())
+
+        let iterator = try MTPSpeculativeTokenIterator(
+            input: input,
+            mainModel: main,
+            drafter: drafter,
+            mainCacheStorage: storage,
+            parameters: parameters,
+            blockSize: 2)
+
+        #expect(iterator.mainCacheStorage === storage)
+
+        let replacement = CountingKVCache()
+        replacement.offset = storage.processedTokenCount
+        storage.replace(with: [replacement])
+
+        #expect(iterator.mainCache.first as AnyObject === replacement as AnyObject)
+    }
+
     @Test func legacyTurboSchemeUsesTypedDispatcher() throws {
         let main = MockMainModel(nextLogitTokens: [0, 0, 7])
         let drafter = MockDrafter(draftedTokenValue: 7)
@@ -673,7 +800,8 @@ func testQwenStyleMTPRequiresGreedySampling() throws {
     #expect(drafter.draftBlockCallCount == 0)
     #expect(
         iter.passthroughReason
-            == "Qwen MTP currently requires temperature == 0; generating without speculation")
+            == "the selected block drafter requires temperature == 0; generating without speculation"
+    )
 }
 
 // MARK: - sharedKV span across partial acceptance
@@ -790,6 +918,7 @@ func testMTPCarriesMainStateThroughPrimeAndVerify() throws {
     ]
     let main = MockMainModel(nextLogitTokens: mainLogitTokens)
     main.prepareLogitsStateValue = 42
+    main.emittedPositionDelta = 9
     let drafter = MockDrafter(draftedTokenValue: 5)
     let cache = CountingKVCache()
     let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
@@ -808,6 +937,14 @@ func testMTPCarriesMainStateThroughPrimeAndVerify() throws {
     _ = iter.next()
 
     #expect(main.incomingPreservedStateValues == [42, 42])
+    let exportedState = try #require(iter.state)
+    #expect(exportedState[preservedStateKey] == 42)
+    #expect(exportedState[mtpEmitFlagKey] == nil)
+    #expect(exportedState[mtpLastHiddenStatesKey] == nil)
+    #expect(exportedState[mtpSharedKVStatesKey] == nil)
+    #expect(exportedState[mtpSharedKVSourceIndicesKey] == nil)
+    #expect(exportedState[mtpSharedKVOffsetsKey] == nil)
+    #expect(exportedState[mtpPositionDeltasKey] == nil)
 }
 
 @Test
@@ -1325,7 +1462,7 @@ func testDrafterSeesExactlyTheWindowItCanAttendOver() throws {
 func testMTPIteratorRejectsACacheItCannotStage() {
     let model = PositionScriptedMainModel(
         script: mixedAcceptanceScript(drafted: 7), slidingWindow: 8)
-    #expect(throws: KVCacheError.self) {
+    #expect(throws: MTPInitializationError.self) {
         _ = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
             mainModel: model,
