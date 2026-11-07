@@ -1050,6 +1050,58 @@ func testDFlash2FirstTokenAndDraftsDrawDifferentKeys() throws {
     #expect(repeats < 4)
 }
 
+/// Decodes each token id to a fixed fragment; unknown ids decode to nothing.
+private struct FragmentTokenizer: MLXLMCommon.Tokenizer {
+    let decoding: [Int: String]
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map { decoding[$0] ?? "" }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { decoding[id] }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+private struct NoInputProcessor: UserInputProcessor {
+    func prepare(input: UserInput) throws -> LMInput { LMInput(tokens: MLXArray([Int32(1)])) }
+}
+
+@Test
+func testDFlash2GenerateRoutesReasoning() async throws {
+    // The prompt ends in a prefilled `<think>`, so the stream opens inside a
+    // thought. MockTarget follows `transition`: 3 -> 24 -> 43 -> 48 -> 83 -> 72.
+    let tokenizer = FragmentTokenizer(decoding: [
+        1: "Q ", 3: "<think>", 24: "weigh ", 43: "it", 48: "</think>", 83: "Ans", 72: "wer",
+    ])
+    let context = ModelContext(
+        configuration: ModelConfiguration(
+            id: "dflash2", eosTokenIds: [127], reasoningConfig: .alwaysOnThinking),
+        model: MockTarget(), processor: NoInputProcessor(), tokenizer: tokenizer)
+    var parameters = GenerateParameters(maxTokens: 5)
+    parameters.temperature = 0
+
+    let stream = try generate(
+        input: LMInput(tokens: MLXArray([Int32(1), 1, 3])), parameters: parameters,
+        context: context, dflash2Drafter: MockDrafter())
+    var reasoning = ""
+    var response = ""
+    for await event in stream {
+        switch event {
+        case .reasoning(let text): reasoning += text
+        case .chunk(let text): response += text
+        default: break
+        }
+    }
+    #expect(reasoning == "weigh it")
+    #expect(response == "Answer")
+}
+
 @Test
 func testDFlash2IteratorFinalizeRewindsUndrainedDrafts() throws {
     let script: [Int32] = [1, 1, 10, 20, 21, 55, 0, 30, 77, 0, 0, 77, 77, 77, 77]
