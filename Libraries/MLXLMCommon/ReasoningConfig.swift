@@ -136,6 +136,22 @@ public struct ReasoningChannel: Sendable, Equatable {
 /// like ``ToolCallFormat``.
 public struct ReasoningConfig: Sendable, Equatable {
 
+    /// Controls where a generated response may open reasoning.
+    public enum StartPolicy: Sendable, Equatable {
+        /// Recognize reasoning delimiters throughout the generated response.
+        case anywhere
+        /// Recognize one reasoning span only when it opens at the response start.
+        case responseStart
+    }
+
+    /// Controls the whitespace removed with reasoning delimiters.
+    public enum WhitespacePolicy: Sendable, Equatable {
+        /// Trim whitespace around reasoning delimiters.
+        case trim
+        /// Remove one framing newline after each delimiter and before the closing delimiter.
+        case singleNewline
+    }
+
     /// The marker that opens a reasoning span (e.g. `<think>`).
     public var startDelimiter: String
 
@@ -144,6 +160,12 @@ public struct ReasoningConfig: Sendable, Equatable {
 
     /// How a thinking on / off preference is expressed to the chat template.
     public var promptStrategy: ReasoningPromptStrategy
+
+    /// Where generated text may open a reasoning span.
+    public var startPolicy: StartPolicy
+
+    /// How delimiter framing is removed from routed text.
+    public var whitespacePolicy: WhitespacePolicy
 
     /// Markers that implicitly leave reasoning without emitting ``endDelimiter``.
     ///
@@ -174,7 +196,9 @@ public struct ReasoningConfig: Sendable, Equatable {
         isSpecialToken: Bool = false,
         implicitEndDelimiters: [String] = [],
         budgetTransition: ReasoningBudgetTransition? = nil,
-        channel: ReasoningChannel? = nil
+        channel: ReasoningChannel? = nil,
+        startPolicy: StartPolicy = .anywhere,
+        whitespacePolicy: WhitespacePolicy = .trim
     ) {
         self.startDelimiter = startDelimiter
         self.endDelimiter = endDelimiter
@@ -183,6 +207,8 @@ public struct ReasoningConfig: Sendable, Equatable {
         self.implicitEndDelimiters = implicitEndDelimiters
         self.budgetTransition = budgetTransition
         self.channel = channel
+        self.startPolicy = startPolicy
+        self.whitespacePolicy = whitespacePolicy
     }
 
     // MARK: - Presets

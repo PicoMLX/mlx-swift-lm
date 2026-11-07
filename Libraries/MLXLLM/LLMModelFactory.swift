@@ -106,6 +106,7 @@ public enum LLMTypeRegistry {
         "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
         "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
         "mellum": create(MellumConfiguration.self, MellumModel.init),
+        "ricursive": create(RicursiveConfiguration.self, RicursiveModel.init),
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
@@ -578,6 +579,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Explain quaternions."
     )
 
+    static public let ripple_65b_preview_4bit = ModelConfiguration(
+        id: "frogggias/Ripple-65B-Preview-MLX-4bit",
+        defaultPrompt: "Write a Swift function that checks whether a string is a palindrome."
+    )
+
     private static func all() -> [ModelConfiguration] {
         [
             codeLlama13b4bit,
@@ -654,6 +660,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gpt_oss_20b_MXFP4_Q8,
             jamba_3b_4bit,
             nemotron_labs_diffusion_3b_4bit,
+            ripple_65b_preview_4bit,
         ]
     }
 
@@ -829,7 +836,10 @@ public final class LLMModelFactory: GenericModelFactory {
             weightFileSelection: configuration.weightFileSelection,
             excludedComponents: configuration.excludedComponents)
 
-        let tokenizer = try await tokenizerTask
+        let loadedTokenizer = try await tokenizerTask
+        let tokenizer: any Tokenizer =
+            baseConfig.modelType == "ricursive"
+            ? RicursiveTokenizer(loadedTokenizer) : loadedTokenizer
 
         let messageGenerator: any MessageGenerator
         if let configuredMessageGenerator = mutableConfiguration.messageGenerator {
