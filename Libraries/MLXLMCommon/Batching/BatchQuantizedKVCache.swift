@@ -4,7 +4,7 @@ import MLX
 
 /// Left-padded rows of affine 4-bit or 8-bit KV state, kept packed while rows join and leave.
 public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
-    QuantizedKVCacheProtocol
+    BatchableKVCache, QuantizedKVCacheProtocol
 {
     private var storage: QuantizedKVCache
     private var positions: [Int32]
@@ -163,7 +163,7 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
         rightPaddingValues = nil
     }
 
-    public override func filter(batchIndices: MLXArray) {
+    public func filter(batchIndices: MLXArray) {
         let rows = batchIndices.asArray(Int32.self).map { Int($0) }
         guard !rows.isEmpty else {
             replaceStorage([], offset: 0)
@@ -188,14 +188,14 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
         setLeftPadding(padding)
     }
 
-    public override func extend(other: any KVCache) {
+    public func extend(other: any KVCache) {
         guard let other = other as? BatchQuantizedKVCache else {
             preconditionFailure("A BatchQuantizedKVCache needs another BatchQuantizedKVCache")
         }
         extend(other: other)
     }
 
-    public override func validateExtension(other: any KVCache) throws {
+    public func validateExtension(other: any KVCache) throws {
         guard let other = other as? BatchQuantizedKVCache,
             groupSize == other.groupSize && bits == other.bits && mode == other.mode
         else {
@@ -292,7 +292,7 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
                 + other.leftPaddingValues.map { $0 + addedShift })
     }
 
-    public override func extract(_ index: Int) -> any KVCache {
+    public func extract(_ index: Int) -> any KVCache {
         precondition(positions.indices.contains(index), "Batch row index out of range")
         let row = QuantizedKVCache(groupSize: groupSize, bits: bits)
         let padding = Int(leftPaddingValues[index])
@@ -305,6 +305,12 @@ public final class BatchQuantizedKVCache: BaseKVCache, BatchPositionedKVCache,
             row.offset = offset - padding
         }
         return row
+    }
+
+    /// The rows of `caches`, exactly `QuantizedKVCache` rows, as one batch. See
+    /// ``QuantizedKVCache/merge(_:)``.
+    public static func merge(_ caches: [any KVCache]) throws -> any BatchableKVCache {
+        try QuantizedKVCache.merge(try batchRows(caches, of: QuantizedKVCache.self))
     }
 
     public override func copy() -> any KVCache {
