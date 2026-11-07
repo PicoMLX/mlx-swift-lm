@@ -317,8 +317,9 @@ private struct EvaluationBudgetTokenizer: Tokenizer {
     ) throws -> [Int] { [] }
 }
 
-/// Its extra state is deliberately absent from the token's dependency graph.
-private final class EvaluationCustomCache: KVCacheSimple {
+/// Its extra state is deliberately absent from the token's dependency graph. It is its own
+/// one-row batch, so `mergeCaches` merges it through its own class.
+private final class EvaluationCustomCache: KVCacheSimple, BatchableKVCache {
     var auxiliary = MLXArray.zeros([1, 4])
 
     override var state: [MLXArray] {
@@ -338,11 +339,31 @@ private final class EvaluationCustomCache: KVCacheSimple {
         return copy
     }
 
-    override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
-        guard caches.count == 1, let cache = caches.first as? EvaluationCustomCache else {
+    static func merge(_ caches: [any KVCache]) throws -> any BatchableKVCache {
+        guard caches.count == 1, let cache = caches.first as? EvaluationCustomCache,
+            let copy = cache.copy() as? EvaluationCustomCache
+        else {
             throw KVCacheError(message: "The test custom cache supports one row")
         }
-        return cache.copy()
+        return copy
+    }
+
+    func filter(batchIndices: MLXArray) {
+        precondition(
+            batchIndices.asArray(Int32.self) == [0], "The test custom cache holds one row")
+    }
+
+    func extend(other: any KVCache) {
+        preconditionFailure("The test custom cache holds one row")
+    }
+
+    func validateExtension(other: any KVCache) throws {
+        throw KVCacheError(message: "The test custom cache holds one row")
+    }
+
+    func extract(_ index: Int) -> any KVCache {
+        precondition(index == 0, "The test custom cache holds one row")
+        return copy()
     }
 }
 
