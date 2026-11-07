@@ -1435,11 +1435,6 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         return trimmed
     }
 
-    /// Merges exactly matching affine quantized rows into a packed batched cache.
-    public override class func merge(_ caches: [any KVCache]) throws -> any KVCache {
-        try merge(try batchRows(caches, of: QuantizedKVCache.self))
-    }
-
     public override func copy() -> any KVCache {
         let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
         let s = self.state

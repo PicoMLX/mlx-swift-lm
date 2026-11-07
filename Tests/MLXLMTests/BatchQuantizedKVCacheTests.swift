@@ -515,6 +515,18 @@ struct BatchQuantizedKVCacheTests {
         #expect(throws: KVCacheError.self) { _ = try QuantizedKVCache.merge([]) }
     }
 
+    @Test("A quantized row takes no row operations; its packed batch does")
+    func batchableConformance() throws {
+        #expect(!(QuantizedKVCache() as any KVCache is any BatchableKVCache))
+        let batch = try BatchQuantizedKVCache.merge([QuantizedKVCache()])
+        #expect(batch is BatchQuantizedKVCache)
+        #expect(throws: KVCacheError.self) { _ = try BatchQuantizedKVCache.merge([any KVCache]()) }
+        #expect(throws: KVCacheError.self) {
+            _ = try BatchQuantizedKVCache.merge([QuantizedCacheSubclass()])
+        }
+        #expect(throws: KVCacheError.self) { _ = try mergeCaches([batch]) }
+    }
+
     @Test("Extension validation accepts empty rows and packed ragged batches", arguments: [4, 8])
     func extensionValidationAcceptsCompatibleRows(bits: Int) throws {
         try Device.withDefaultDevice(.cpu) {
@@ -524,7 +536,7 @@ struct BatchQuantizedKVCacheTests {
             let added = try QuantizedKVCache.merge([
                 quantizedTestRow(count: 7, salt: 2, bits: bits)
             ])
-            let original = batch.copy()
+            let original = try #require(batch.copy() as? BatchQuantizedKVCache)
             try batch.validateExtension(other: added)
             #expect(batch.batchSize == 2)
             #expect(batch.offset == original.offset)
